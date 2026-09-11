@@ -32,3 +32,9 @@ projects/
 
 # Local secrets (PPT_MASTER_SKILL_DIR overrides, etc.)
 .env
+
+# Debug / scratch artifacts from MCP stdio captures (NEVER commit).
+debug_stderr.txt
+debug_stdin.json
+debug_stdout.txt
+debug_*.*

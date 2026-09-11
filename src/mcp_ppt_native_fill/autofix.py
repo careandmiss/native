@@ -667,10 +667,16 @@ def _detect_overflow_by_slide(
 # Bulk workspace XML repair.
 # ---------------------------------------------------------------------------
 
-def repair_workspace_svgs(authoring_dir: Path) -> int:
+def repair_workspace_svgs(
+    authoring_dir: Path, *, only_files: set[str] | None = None
+) -> int:
     """Walk ``authoring_dir`` and persist the in-memory XML repairs
     (escape inner attribute quotes, dedupe duplicate attributes) for every
     SVG that needs them. Returns the number of files actually repaired.
+
+    ``only_files`` (Phase A) restricts the walk to a set of filenames —
+    used by ``phase2_6_realize_planner_output`` to repair just the
+    freshly-cloned skeleton copies without touching the originals.
 
     Call this once, right after ``pptx_to_svg.py`` produces the round-trip
     workspace and *before* any vendor tool (``svg_quality_checker``,
@@ -680,6 +686,8 @@ def repair_workspace_svgs(authoring_dir: Path) -> int:
     """
     repaired = 0
     for svg_path in sorted(authoring_dir.glob("*.svg")):
+        if only_files is not None and svg_path.name not in only_files:
+            continue
         try:
             raw = io_utils.read_utf8(svg_path)
         except OSError:

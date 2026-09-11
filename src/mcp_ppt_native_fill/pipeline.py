@@ -134,9 +134,11 @@ def phase2_5_llm_plan(
     """Optional LLM-driven content planning phase.
 
     Runs after phase2 (workspace exists) and before phase3 (edits). Asks
-    the configured LLM to derive ``content_mapping`` from the markdown
-    + workspace summary. Caller-supplied entries WIN on conflict — the
-    LLM only fills gaps where the caller didn't provide text.
+    the configured LLM to derive a PlannerResult from the markdown + SVG
+    shape_index + skeleton_index. Caller-supplied entries WIN on conflict
+    in the content_mapping merge. The full PlannerResult (with
+    page_plan_additions / new_blocks / skeleton_kind) is stashed in
+    ``state.context["planner_result"]`` for phase2_6 to materialize.
     """
     state.stage = "llm_plan"
     workspace = state.workspace
@@ -145,7 +147,7 @@ def phase2_5_llm_plan(
     from . import llm_planner  # late import to avoid pulling HTTP deps
 
     try:
-        llm_mapping = llm_planner.plan_content_mapping(
+        planner_result = llm_planner.plan_content_mapping(
             md_path=content_markdown,
             workspace=workspace,
         )
@@ -158,6 +160,9 @@ def phase2_5_llm_plan(
         state.errors.append(f"llm_plan: {type(exc).__name__}: {exc}")
         return state
 
+    # Legacy path: PlannerResult's dict-like shim makes the merge logic
+    # work without caring about the new fields.
+    llm_mapping = planner_result.content_mapping
     if not llm_mapping:
         state.warnings.append(
             "llm_plan: model returned an empty mapping; "
@@ -166,24 +171,423 @@ def phase2_5_llm_plan(
         merged = dict(caller_mapping)
     else:
         merged: dict[str, dict[str, str]] = {}
-        # Iterate the union of keys to preserve caller-only and LLM-only entries.
         for svg in set(caller_mapping) | set(llm_mapping):
             cm = caller_mapping.get(svg) or {}
             lm = llm_mapping.get(svg) or {}
             merged[svg] = {**lm, **cm}  # caller wins on key collision
 
         log.info(
-            "llm_plan: caller slides=%d, llm slides=%d, merged slides=%d",
+            "llm_plan: caller slides=%d, llm slides=%d, merged slides=%d, "
+            "page_plan_additions=%d, new_blocks=%d",
             len(caller_mapping),
             len(llm_mapping),
             len(merged),
+            len(planner_result.page_plan_additions),
+            len(planner_result.new_blocks),
         )
         state.warnings.append(
             f"llm_plan: derived {sum(len(v) for v in llm_mapping.values())} "
-            f"shape edit(s) from {content_markdown.name}"
+            f"shape edit(s) + {len(planner_result.page_plan_additions)} "
+            f"page addition(s) + {len(planner_result.new_blocks)} "
+            f"new block(s) from {content_markdown.name}"
         )
 
     state.context["content_mapping"] = merged
+    state.context["planner_result"] = planner_result
+    state.stage = "imported"
+    return state
+
+
+def _fill_missing_content_blocks(
+    *,
+    cloned_svgs: list[str],
+    final_new_blocks: dict[str, dict[str, dict[str, Any]]],
+    state: PipelineState,
+) -> None:
+    """Synthesize a default 3-column-cards new_block per cloned
+    ``*_content.svg`` that doesn't yet have one.
+
+    The cloned content skeleton (slide_04) only ships a title bar
+    (shape-17) and a corner tagline (shape-22). The body rectangle
+    (shape-3, 1124×530) is empty by design — the LLM is supposed to
+    populate it via ``new_blocks``. When the LLM forgets, this
+    fallback pulls paragraphs from the source markdown (if loaded) or
+    just emits a placeholder card so the page is not blank.
+
+    Bounds match the body rectangle of slide_04: ``x=120, y=130,
+    w=1060, h=480`` — leaves a comfortable margin inside the body.
+    """
+    if not cloned_svgs:
+        return
+
+    md_text: str = ""
+    md_path = state.context.get("content_markdown")
+    if isinstance(md_path, Path) and md_path.is_file():
+        try:
+            md_text = md_path.read_text(encoding="utf-8")
+        except OSError:
+            md_text = ""
+
+    # Parse out the markdown into H1 / paragraph sections so the
+    # fallback can pick the section whose title matches the cloned
+    # content SVG's stem (slide_part02_content.svg → part02 → "PART 02").
+    sections = _split_markdown_sections(md_text) if md_text else []
+
+    bounds = "120 130 1060 480"
+    fallback_count = 0
+    for svg_name in cloned_svgs:
+        existing = final_new_blocks.get(svg_name) or {}
+        if existing:
+            continue
+        stem = svg_name.replace("slide_", "").replace(".svg", "")
+        # Try to find a matching section by stem number (e.g. part02 → section 2)
+        cards = _cards_for_section(sections, stem)
+        if not cards:
+            cards = [{"title": "本节要点", "color": "#1D2CAB",
+                      "items": ["(待补充)"]}]
+            fallback_count += 1
+        final_new_blocks.setdefault(svg_name, {})["content-body"] = {
+            "bounds": bounds,
+            "layout": "3-column-cards",
+            "spec": {"cards": cards},
+        }
+        log.info(
+            "phase2.6: synthesized default 3-column-cards for %s (%d cards)",
+            svg_name, len(cards),
+        )
+    if fallback_count:
+        log.warning(
+            "phase2.6: %d cloned content slide(s) had no matching markdown "
+            "section; emitted placeholder cards",
+            fallback_count,
+        )
+
+
+def _split_markdown_sections(md_text: str) -> list[dict[str, str]]:
+    """Split a Chinese procurement policy markdown into
+    ``[{title, body}]`` sections keyed on `# 一、` / `# 二、` etc."""
+    sections: list[dict[str, str]] = []
+    head_re = re.compile(r"^#\s+(.+)$", re.MULTILINE)
+    matches = list(head_re.finditer(md_text))
+    for i, m in enumerate(matches):
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(md_text)
+        body = md_text[start:end].strip()
+        sections.append({"title": m.group(1).strip(), "body": body})
+    return sections
+
+
+def _cards_for_section(
+    sections: list[dict[str, str]],
+    stem: str,
+) -> list[dict[str, Any]]:
+    """Pull 2-3 cards from the section matching ``stem`` (e.g. ``part02``).
+
+    Mapping heuristic:
+      - stem ``partNN`` → H1 with leading CN numeral ``一/二/三/...`` whose
+        ordinal matches ``NN`` (so part02 → 二、目的) or just picks the
+        ``NN``-th section if there are that many.
+    cn_numerals = "一二三四五六七八九十"
+    """
+    if not sections:
+        return []
+    m = re.match(r"part(\d+)$", stem)
+    if not m:
+        return _cards_from_body(sections[0]["body"]) if sections else []
+    idx = int(m.group(1)) - 1  # part02 → section[1]
+    if idx < 0 or idx >= len(sections):
+        return []
+    section = sections[idx]
+    return _cards_from_body(section["body"]) or [
+        {"title": section["title"][:10], "color": "#1D2CAB",
+         "items": [section["body"][:60] + ("…" if len(section["body"]) > 60 else "")]}
+    ]
+
+
+def _cards_from_body(body: str) -> list[dict[str, Any]]:
+    """Convert a markdown body into 2-3 cards: one ``要点`` card from
+    the first paragraph, then split any ``1. xxx / 2. yyy`` numbered
+    list into additional cards. Truncate each item to a sane length."""
+    if not body:
+        return []
+    cards: list[dict[str, Any]] = []
+    colors = ["#1D2CAB", "#EE822F", "#75BD42"]
+
+    # First card: first paragraph (≥ 1 line, ≤ 60 chars).
+    paragraphs = [p.strip() for p in body.split("\n\n") if p.strip()]
+    if paragraphs:
+        first = paragraphs[0]
+        # Strip leading "# " / leading numbered list prefix.
+        first = re.sub(r"^#\s+", "", first)
+        first = re.sub(r"^[\d一二三四五六七八九十]+[、.]\s*", "", first)
+        cards.append({
+            "title": "要点",
+            "color": colors[0],
+            "items": [first[:60] + ("…" if len(first) > 60 else "")],
+        })
+
+    # Additional cards: numbered list ``1. xxx`` items.
+    list_re = re.compile(r"^([\d]+)[、.]\s*(.+)$")
+    list_items: list[str] = []
+    for p in paragraphs[1:]:
+        for line in p.splitlines():
+            line = line.strip()
+            lm = list_re.match(line)
+            if lm:
+                list_items.append(lm.group(2).strip())
+    if list_items:
+        # Group into 2 cards (cap at 4 items per card).
+        half = max(1, (len(list_items) + 1) // 2)
+        cards.append({
+            "title": "子项",
+            "color": colors[1],
+            "items": [it[:30] + ("…" if len(it) > 30 else "")
+                      for it in list_items[:half]],
+        })
+        if len(list_items) > half:
+            cards.append({
+                "title": "补充",
+                "color": colors[2],
+                "items": [it[:30] + ("…" if len(it) > 30 else "")
+                          for it in list_items[half:half + 4]],
+            })
+
+    # Trim to 3 cards max (renderer supports 1-4, but 3 keeps visual balance).
+    return cards[:3]
+
+
+def _seed_original_roster(
+    authoring_dir: Path,
+    *,
+    exclude: frozenset[str] = frozenset(),
+) -> list[dict[str, Any]]:
+    """Build a page_plan from the original ``slide_NN.svg`` skeletons.
+
+    Used by ``phase2_6_realize_planner_output`` when no caller-supplied
+    ``page_plan`` was given AND/OR the planner only emitted
+    ``page_plan_additions``. Returns one entry per
+    ``slide_NN.svg`` ordered by ``NN`` (cover first), skipping any
+    names in ``exclude`` (the LLM's cloned PART_* files).
+
+    The pipeline must register the original cover/toc/divider/ending
+    pages — otherwise they vanish from the export and the user sees
+    "no cover, blank content".
+    """
+    roster: list[dict[str, Any]] = []
+    if not authoring_dir.is_dir():
+        return roster
+    pattern = re.compile(r"^slide_(\d+)\.svg$")
+    candidates: list[tuple[int, str]] = []
+    for path in authoring_dir.iterdir():
+        if not path.is_file():
+            continue
+        m = pattern.match(path.name)
+        if not m:
+            continue
+        if path.name in exclude:
+            continue
+        candidates.append((int(m.group(1)), path.name))
+    candidates.sort(key=lambda item: item[0])
+    for source_slide, name in candidates:
+        roster.append({"source_slide": source_slide, "svg": name})
+    return roster
+
+
+def phase2_6_realize_planner_output(
+    state: PipelineState,
+    *,
+    caller_page_plan: list[dict] | None = None,
+    caller_new_blocks: dict[str, dict[str, dict[str, Any]]] | None = None,
+) -> PipelineState:
+    """Phase 2.6: materialize LLM planner output (Phase A expansion).
+
+    For each ``page_plan_addition`` the planner returned:
+      1. Copy the skeleton SVG (per ``source_slide``) to the new filename.
+      2. Apply text edits to the copy via ``svg_edits.apply_text_edits``.
+      3. Register the copy in the final ``page_plan_pages`` list with
+         ``source_slide`` pointing at the skeleton.
+
+    For each ``new_block`` the planner returned:
+      1. Append to the working ``new_content_blocks`` dict (caller keys
+         win on collision).
+
+    Errors are non-fatal — collected as warnings so the pipeline can
+    still complete (export will surface the missing page later if any).
+    """
+    state.stage = "plan_realize"
+    workspace = state.workspace
+    assert workspace is not None
+    authoring_dir = workspace / "authoring-svg-flat"
+    planner_result = state.context.get("planner_result")
+    if planner_result is None:
+        # No planner ran (caller-only path) — nothing to realize.
+        # If the caller did not supply a page_plan, still seed with the
+        # original workspace roster (cover/toc/divider/content/ending)
+        # so the export at least mirrors the source PPTX.
+        if caller_page_plan:
+            seeded: list[dict[str, Any]] = list(caller_page_plan)
+        else:
+            seeded = _seed_original_roster(authoring_dir)
+        state.context.setdefault("page_plan_pages", seeded)
+        state.context.setdefault(
+            "new_content_blocks",
+            {k: dict(v) for k, v in (caller_new_blocks or {}).items()},
+        )
+        state.stage = "imported"
+        return state
+
+    # Resolve which source slide each skeleton comes from. We trust the
+    # planner's source_slide field, but fall back to the skeleton's own
+    # filename ordering (slide_NN.svg → N).
+    import shutil
+
+    final_pages: list[dict[str, Any]] = list(caller_page_plan or [])
+
+    # Bug #1 fix: when the caller did not supply a page_plan, the planner's
+    # ``page_plan_additions`` is the *only* source of pages. That drops the
+    # original cover/toc/divider/ending slides from the export (the user
+    # reports "no cover page"). Re-seed ``final_pages`` with every
+    # ``slide_NN.svg`` already present in the workspace that is not a
+    # newly-cloned PART_* file, preserving the original ordering by
+    # ``source_slide``.
+    if not caller_page_plan:
+        seeded = _seed_original_roster(authoring_dir, exclude=frozenset(
+            e.get("svg", "") for e in planner_result.page_plan_additions
+        ))
+        final_pages = list(seeded)
+        log.info(
+            "phase2.6: seeded %d original slide(s) into page_plan "
+            "(cover/toc/divider/ending)",
+            len(seeded),
+        )
+
+    seen_svgs: set[str] = {p.get("svg", "") for p in final_pages if p.get("svg")}
+    new_clones: list[Path] = []
+
+    for entry in planner_result.page_plan_additions:
+        new_svg_name = entry.get("svg")
+        source_slide = int(entry.get("source_slide", 0))
+        edits = entry.get("edits") or {}
+        if not new_svg_name or source_slide < 1:
+            state.warnings.append(
+                f"phase2.6: skipping malformed page_plan_addition: {entry!r}"
+            )
+            continue
+        if new_svg_name in seen_svgs:
+            state.warnings.append(
+                f"phase2.6: page_plan_additions references already-used "
+                f"svg {new_svg_name!r}; skipping"
+            )
+            continue
+        skeleton_path = authoring_dir / f"slide_{source_slide:02d}.svg"
+        new_path = authoring_dir / new_svg_name
+        if not skeleton_path.is_file():
+            state.warnings.append(
+                f"phase2.6: skeleton slide_{source_slide:02d}.svg missing "
+                f"for {new_svg_name!r}; skipping"
+            )
+            continue
+        try:
+            shutil.copy2(skeleton_path, new_path)
+        except OSError as exc:
+            state.warnings.append(
+                f"phase2.6: copy {skeleton_path.name} → {new_svg_name} "
+                f"failed: {exc}"
+            )
+            continue
+        if edits:
+            try:
+                audit = svg_edits.apply_text_edits(new_path, edits)
+                applied = sum(
+                    1 for a in audit if a.get("status") == "applied"
+                )
+                log.info(
+                    "phase2.6: cloned %s from slide_%02d.svg, "
+                    "applied %d/%d edit(s)",
+                    new_svg_name, source_slide, applied, len(edits),
+                )
+            except (ValueError, FileNotFoundError) as exc:
+                state.warnings.append(
+                    f"phase2.6: edits on {new_svg_name} failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        new_clones.append(new_path)
+        final_pages.append({
+            "source_slide": source_slide,
+            "svg": new_svg_name,
+        })
+        seen_svgs.add(new_svg_name)
+        # Also fold the new page's edits into the merged content_mapping
+        # so phase3 sees them.
+        merged_cm = state.context.setdefault("content_mapping", {})
+        merged_cm[new_svg_name] = edits
+
+    # new_blocks: planner's structural blocks override caller-supplied
+    # blocks on key collision (svg filename).
+    final_new_blocks: dict[str, dict[str, dict[str, Any]]] = {
+        k: dict(v) for k, v in (caller_new_blocks or {}).items()
+    }
+    for block in planner_result.new_blocks:
+        svg = block.get("svg")
+        block_id = block.get("id")
+        if not svg or not block_id:
+            continue
+        per_svg = final_new_blocks.setdefault(svg, {})
+        # Keep first block-id collision losing; the LLM should not emit
+        # two blocks with the same id on the same svg.
+        per_svg[block_id] = {
+            "bounds": block["bounds"],
+            "layout": block["layout"],
+            **({"spec": block["spec"]} if block.get("spec") else {}),
+        }
+
+    # Bug #2 fix (safety net): for every cloned content SVG that the LLM
+    # forgot to give a ``new_blocks`` entry, synthesize a default
+    # 3-column-cards block from the markdown text. Without this, the cloned
+    # content page renders as a giant blank rectangle (shape-3 in slide_04
+    # skeleton, 1124×530) because the skeleton only ships a title bar.
+    _fill_missing_content_blocks(
+        cloned_svgs=[
+            entry.get("svg", "")
+            for entry in planner_result.page_plan_additions
+            if entry.get("svg", "").endswith("_content.svg")
+        ],
+        final_new_blocks=final_new_blocks,
+        state=state,
+    )
+
+    state.context["page_plan_pages"] = final_pages
+    state.context["new_content_blocks"] = final_new_blocks
+    state.context["skeleton_kind"] = planner_result.skeleton_kind
+
+    # Pre-repair vendor XML quirks on freshly-cloned SVGs so phase3 edits
+    # don't trip on duplicate-attribute / unescaped-quote bugs the original
+    # skeletons had. Originals are already repaired by phase2 import (or
+    # phase4 entry); we re-repair everything here because (a) it's cheap
+    # and idempotent, and (b) it lets new_content_blocks apply to any
+    # SVG in the workspace without the caller having to think about it.
+    if new_clones or planner_result.new_blocks:
+        try:
+            repaired = autofix.repair_workspace_svgs(authoring_dir)
+            if repaired:
+                log.info(
+                    "phase2.6: pre-repaired %d SVG file(s) "
+                    "(new clones / blocks)",
+                    repaired,
+                )
+        except Exception as exc:
+            log.warning(
+                "phase2.6: clone repair failed: %s: %s",
+                type(exc).__name__, exc,
+            )
+
+    log.info(
+        "phase2.6: realized %d page addition(s) + %d new block(s); "
+        "total page_plan_pages=%d",
+        len(planner_result.page_plan_additions),
+        len(planner_result.new_blocks),
+        len(final_pages),
+    )
     state.stage = "imported"
     return state
 
@@ -580,8 +984,21 @@ def run_native_fill(
     else:
         merged_mapping = content_mapping
 
+    # Phase 2.6 — materialize LLM planner output (Phase A expansion):
+    # clone skeleton SVGs for page_plan_additions, register new_blocks.
+    # Falls through as a no-op when the planner did not run.
+    state = phase2_6_realize_planner_output(
+        state,
+        caller_page_plan=page_plan,
+        caller_new_blocks=new_content_blocks,
+    )
+    if state.stage == "failed":
+        return _finalize(state)
+    final_pages = state.context.get("page_plan_pages", page_plan)
+    final_blocks = state.context.get("new_content_blocks", new_content_blocks)
+
     # Phase 3
-    state = phase3_author(state, page_plan, merged_mapping, new_content_blocks)
+    state = phase3_author(state, final_pages, merged_mapping, final_blocks)
     if state.stage == "failed":
         return _finalize(state)
 
@@ -644,20 +1061,59 @@ def _finalize(state: PipelineState) -> dict[str, Any]:
 # Tiny helpers for new_content_blocks "layout" presets.
 # ---------------------------------------------------------------------------
 
+def _coerce_str_list(value: Any, sep: str = "; ") -> list[str]:
+    """Coerce an LLM-emitted field into a flat list[str].
+
+    The planner may return ``items`` / ``rows`` / etc. as either a list
+    of strings, a single string (treat as 1-item list), or a dict (treat
+    as key=value lines). This helper makes downstream rendering robust
+    against the variety of shapes the LLM emits.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        out: list[str] = []
+        for v in value:
+            if isinstance(v, (list, tuple)):
+                out.append(sep.join(str(x) for x in v))
+            elif isinstance(v, dict):
+                out.append(sep.join(f"{k}={val}" for k, val in v.items()))
+            else:
+                out.append(str(v))
+        return out
+    if isinstance(value, tuple):
+        return [str(v) for v in value]
+    if isinstance(value, dict):
+        return [sep.join(f"{k}={v}" for k, v in value.items())]
+    return [str(value)]
+
+
 def _render_new_block(spec: dict[str, Any]) -> str:
     """Render a ``new_content_block`` spec into raw SVG children.
 
-    Supports two layouts: ``"raw"`` (caller supplied SVG) and
-    ``"3-column-cards"`` (renders a tile row per spec). Anything else raises.
+    Supports four layouts: ``"raw"`` (caller supplied SVG),
+    ``"3-column-cards"`` (tile row), ``"flow-steps"`` (numbered
+    horizontal flow), and ``"revision-table"`` (header + rows). Anything
+    else raises.
+
+    Layout-specific spec keys are nested under ``spec["spec"]`` when the
+    caller uses the planner shape; the helper accepts both forms so
+    legacy callers passing spec.flat still work.
     """
     layout = spec.get("layout", "raw")
+    # Accept both {"layout":..., "cards":[...]} and
+    # {"layout":..., "spec": {"cards":[...]}} — Phase A planners use the
+    # latter; legacy test fixtures use the former.
+    nested = spec.get("spec") if isinstance(spec.get("spec"), dict) else {}
+    payload = nested if nested else spec
+
     if layout == "raw":
-        inner = spec.get("svg", "")
+        inner = payload.get("svg", "") or spec.get("svg", "")
         if not inner:
             raise ValueError("layout='raw' requires spec.svg")
         return inner
     if layout == "3-column-cards":
-        cards = spec.get("cards") or []
+        cards = payload.get("cards") or []
         if not 1 <= len(cards) <= 4:
             raise ValueError(
                 "3-column-cards supports 1-4 cards per row"
@@ -665,14 +1121,15 @@ def _render_new_block(spec: dict[str, Any]) -> str:
         parts: list[str] = []
         n = len(cards)
         # Geometry derived from bounds; we expect bounds "x y w h".
-        bx, by, bw, bh = (float(t) for t in spec["bounds"].split())
+        bounds = spec.get("bounds") or payload.get("bounds")
+        bx, by, bw, bh = (float(t) for t in bounds.split())
         gap = 16.0
         card_w = (bw - gap * (n - 1)) / n
         for i, card in enumerate(cards):
             cx = bx + i * (card_w + gap)
             color = card.get("color", "#1D2CAB")
             title = card.get("title", "")
-            items = card.get("items", [])
+            items = _coerce_str_list(card.get("items", []))
             parts.append(
                 f'<rect x="{cx:g}" y="{by:g}" width="{card_w:g}" '
                 f'height="{bh:g}" rx="8" fill="{color}" fill-opacity="0.12" '
@@ -688,6 +1145,108 @@ def _render_new_block(spec: dict[str, Any]) -> str:
                     f'<text x="{cx + 16:g}" y="{ty:g}" font-size="14" '
                     f'fill="#222">{_escape(item)}</text>'
                 )
+        return "\n".join(parts)
+    if layout == "flow-steps":
+        steps = payload.get("steps") or []
+        if not 2 <= len(steps) <= 5:
+            raise ValueError("flow-steps supports 2-5 steps per row")
+        bounds = spec.get("bounds") or payload.get("bounds")
+        bx, by, bw, bh = (float(t) for t in bounds.split())
+        parts: list[str] = []
+        n = len(steps)
+        gap = 16.0
+        step_w = (bw - gap * (n - 1)) / n
+        for i, step in enumerate(steps):
+            cx = bx + i * (step_w + gap)
+            color = step.get("color", "#1D2CAB")
+            title = step.get("title", f"Step {i + 1}")
+            items = _coerce_str_list(step.get("items", []))
+            parts.append(
+                f'<rect x="{cx:g}" y="{by:g}" width="{step_w:g}" '
+                f'height="{bh:g}" rx="6" fill="{color}" '
+                f'fill-opacity="0.08" stroke="{color}" stroke-width="1"/>'
+            )
+            # Numbered circle (no native tspan counting).
+            parts.append(
+                f'<circle cx="{cx + 24:g}" cy="{by + 28:g}" r="14" '
+                f'fill="{color}"/>'
+            )
+            parts.append(
+                f'<text x="{cx + 24:g}" y="{by + 33:g}" font-size="14" '
+                f'font-weight="bold" fill="#FFFFFF" text-anchor="middle">'
+                f'{i + 1}</text>'
+            )
+            parts.append(
+                f'<text x="{cx + 16:g}" y="{by + 64:g}" font-size="16" '
+                f'font-weight="bold" fill="{color}">{_escape(title)}</text>'
+            )
+            for j, item in enumerate(items):
+                ty = by + 92 + j * 22
+                parts.append(
+                    f'<text x="{cx + 16:g}" y="{ty:g}" font-size="13" '
+                    f'fill="#222">{_escape(item)}</text>'
+                )
+            # Connector arrow to next step — static filled triangle,
+            # not a <line marker-end="url(#arrow)">. The vendor's
+            # svg_to_pptx converter validates every marker reference
+            # against a direct <defs><marker> and rejects when missing,
+            # so we use a path-based arrow shape that doesn't need any
+            # defs entry.
+            if i < n - 1:
+                ax = cx + step_w + gap / 2
+                ay = by + 28
+                parts.append(
+                    f'<path d="M {ax - 5:g} {ay - 4:g} L {ax + 5:g} '
+                    f'{ay:g} L {ax - 5:g} {ay + 4:g} Z" '
+                    f'fill="{color}"/>'
+                )
+        return "\n".join(parts)
+    if layout == "revision-table":
+        rows = payload.get("rows") or []
+        if not rows:
+            raise ValueError("revision-table requires spec.rows")
+        bounds = spec.get("bounds") or payload.get("bounds")
+        bx, by, bw, bh = (float(t) for t in bounds.split())
+        # Columns: date / status / content / author (4 columns)
+        col_w = bw / 4
+        row_h = min(28.0, (bh - 32) / max(len(rows), 1))
+        parts: list[str] = []
+        # Header background.
+        parts.append(
+            f'<rect x="{bx:g}" y="{by:g}" width="{bw:g}" height="28" '
+            f'fill="#1D2CAB" fill-opacity="0.08"/>'
+        )
+        for j, header in enumerate(("日期", "状态", "内容", "修改人")):
+            parts.append(
+                f'<text x="{bx + j * col_w + 12:g}" y="{by + 19:g}" '
+                f'font-size="13" font-weight="bold" fill="#1D2CAB">'
+                f'{_escape(header)}</text>'
+            )
+        # Rows.
+        for i, row in enumerate(rows):
+            ry = by + 32 + i * row_h
+            if ry + row_h > by + bh:
+                break  # bounds budget exhausted
+            for j, key in enumerate(("date", "status", "content", "author")):
+                raw_val = row.get(key, "")
+                # Tolerate list / dict values emitted by the LLM (e.g.
+                # it may return ``content: ["item1", "item2"]`` instead
+                # of a flat string). Stringify into a single cell.
+                if isinstance(raw_val, (list, tuple)):
+                    cell_text = "; ".join(str(v) for v in raw_val)
+                elif isinstance(raw_val, dict):
+                    cell_text = "; ".join(f"{k}={v}" for k, v in raw_val.items())
+                else:
+                    cell_text = str(raw_val)
+                parts.append(
+                    f'<text x="{bx + j * col_w + 12:g}" y="{ry + 18:g}" '
+                    f'font-size="12" fill="#333">{_escape(cell_text)}</text>'
+                )
+            # Row separator.
+            parts.append(
+                f'<line x1="{bx:g}" y1="{ry + row_h:g}" x2="{bx + bw:g}" '
+                f'y2="{ry + row_h:g}" stroke="#E0E0E0" stroke-width="0.5"/>'
+            )
         return "\n".join(parts)
     raise ValueError(f"unsupported new_content_block layout: {layout!r}")
 

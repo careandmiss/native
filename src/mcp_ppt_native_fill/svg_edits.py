@@ -126,9 +126,12 @@ def apply_text_edits(
             text_elem.remove(tspan)
 
         if preserve_whitespace:
-            text_elem.set("xml:space", "preserve")
-            # ElementTree writes the bare attribute; "xml:space" is allowed in
-            # SVG/XML even when not declared in our tiny schema.
+            # Use the namespaced key so we *replace* any pre-existing
+            # ``xml:space`` rather than appending a duplicate bare
+            # ``xml:space`` attribute (which the strict downstream parser
+            # rejects as ``duplicate attribute: line N, column M``).
+            text_elem.set("{http://www.w3.org/XML/1998/namespace}space",
+                          "preserve")
 
         audit.append(
             {

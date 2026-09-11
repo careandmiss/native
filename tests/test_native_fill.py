@@ -137,6 +137,31 @@ class SvgEditsTests(unittest.TestCase):
             self.assertIn('data-pptx-object="group"', content)
             self.assertIn('data-pptx-frame="100 100 500 60"', content)
 
+    def test_apply_text_edits_does_not_duplicate_xml_space(self):
+        # Bug: apply_text_edits called with preserve_whitespace=True on a
+        # <text> that already has ``xml:space="preserve"`` used to set()
+        # the bare key, producing a *duplicate* ``xml:space`` attribute
+        # which the strict downstream svg_to_pptx parser rejects with
+        # ``duplicate attribute: line N, column M``. Verify the attribute
+        # appears exactly once after the edit.
+        sample = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<svg xmlns="http://www.w3.org/2000/svg" '
+            'viewBox="0 0 1280 720">'
+            '<g id="shape-1">'
+            '<text x="10" y="20" xml:space="preserve">old</text></g>'
+            '</svg>'
+        )
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            p = td / "slide.svg"
+            p.write_text(sample, encoding="utf-8")
+            svg_edits.apply_text_edits(p, {"shape-1": "new"},
+                                       preserve_whitespace=True)
+            text = p.read_text(encoding="utf-8")
+            self.assertEqual(text.count('xml:space="preserve"'), 1,
+                             "xml:space must not be duplicated")
+
     def test_unknown_shape_id_reported(self):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
@@ -1040,6 +1065,7 @@ class PipelineLLMPhaseTests(unittest.TestCase):
 
     def test_phase2_5_merges_caller_and_llm_mapping_caller_wins(self):
         from mcp_ppt_native_fill import pipeline
+        from mcp_ppt_native_fill.llm_planner import PlannerResult
         from unittest.mock import patch
 
         with tempfile.TemporaryDirectory() as td:
@@ -1050,12 +1076,12 @@ class PipelineLLMPhaseTests(unittest.TestCase):
             caller_mapping = {
                 "slide_01.svg": {"shape-23": "caller title"},  # conflict
             }
-            llm_mapping = {
+            llm_mapping = PlannerResult(content_mapping={
                 "slide_01.svg": {
                     "shape-23": "llm title",
                     "shape-24": "llm subtitle",  # new entry
                 },
-            }
+            })
             md = td / "content.md"
             md.write_text("x", encoding="utf-8")
 
@@ -1075,6 +1101,9 @@ class PipelineLLMPhaseTests(unittest.TestCase):
                     },
                 },
             )
+            # Phase-A: full PlannerResult must also be stashed in state for
+            # phase2_6 to materialize page_plan_additions + new_blocks.
+            self.assertIs(state.context["planner_result"], llm_mapping)
 
     def test_phase2_5_records_planner_error(self):
         from mcp_ppt_native_fill import pipeline, llm_planner
@@ -1116,6 +1145,7 @@ class PipelineLLMPhaseTests(unittest.TestCase):
 
     def test_phase2_5_handles_empty_llm_response(self):
         from mcp_ppt_native_fill import pipeline
+        from mcp_ppt_native_fill.llm_planner import PlannerResult
         from unittest.mock import patch
 
         with tempfile.TemporaryDirectory() as td:
@@ -1128,7 +1158,7 @@ class PipelineLLMPhaseTests(unittest.TestCase):
 
             with patch(
                 "mcp_ppt_native_fill.llm_planner.plan_content_mapping",
-                return_value={},
+                return_value=PlannerResult(),
             ):
                 state = pipeline.phase2_5_llm_plan(state, md, caller)
             self.assertNotEqual(state.stage, "failed")
@@ -1138,6 +1168,521 @@ class PipelineLLMPhaseTests(unittest.TestCase):
             self.assertTrue(
                 any("empty mapping" in w for w in state.warnings)
             )
+
+
+class SkeletonDetectionTests(unittest.TestCase):
+    """Verify _detect_skeleton_kind classifies each slide by its structure."""
+
+    def _make_workspace(self, td: Path):
+        flat = td / "authoring-svg-flat"
+        flat.mkdir(parents=True)
+        # 5 slides matching the boteng template shape:
+        # slide_01 cover (mixed font sizes, few text elements)
+        # slide_02 toc (most text elements)
+        # slide_03 divider (one big 80pt title)
+        # slide_04 content (small font body)
+        # slide_05 ending (THANK YOU etc.)
+        fixtures = {
+            "slide_01.svg": [
+                ("shape-23", 56, "山西柏腾"),  # title
+                ("shape-24", 37, "采购制度"),  # subtitle
+                ("shape-30", 21, "工业设备智能化服务商"),
+                ("shape-25", 21, "高效协同"),
+                ("shape-8",  27, "制定人"),
+                ("shape-9",  21, "2026.XX.XX"),
+            ],
+            "slide_02.svg": [
+                (f"shape-{60 + i}", 32 if i % 2 == 0 else 16,
+                 f"项目 {i}")
+                for i in range(13)
+            ],
+            "slide_03.svg": [
+                ("shape-4", 58, "PART 01"),
+                ("shape-5", 80, "前言"),
+                ("shape-70", 21, "公司规章制度是保障公司运营的工具"),
+                ("shape-25", 18, "高效协同"),
+            ],
+            "slide_04.svg": [
+                ("shape-17", 37, "采购制度内容"),
+                ("shape-22", 16, "高效协同 开放坦诚"),
+            ],
+            "slide_05.svg": [
+                ("shape-7",  106, "THANK  YOU"),
+                ("shape-9",  58, "感谢您的聆听"),
+                ("shape-11", 23, "山西柏腾"),
+                ("shape-15", 23, "山西柏腾"),
+                ("shape-16", 32, "采购部"),
+                ("shape-25", 18, "高效协同"),
+            ],
+        }
+        for name, shapes in fixtures.items():
+            body = "".join(
+                f'<g id="{sid}"><text x="10" y="20" '
+                f'font-size="{fs}">{text}</text></g>'
+                for sid, fs, text in shapes
+            )
+            (flat / name).write_text(
+                '<?xml version="1.0" encoding="utf-8"?>'
+                '<svg xmlns="http://www.w3.org/2000/svg" '
+                'viewBox="0 0 1280 720">'
+                f'{body}</svg>',
+                encoding="utf-8",
+            )
+        (flat / "authoring_summary.json").write_text(
+            json.dumps({"schema": "x", "documents": []}),
+            encoding="utf-8",
+        )
+        return td
+
+    def test_skeleton_detection_boteng_shape(self):
+        from mcp_ppt_native_fill.llm_planner import _detect_skeleton_kind
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ws = self._make_workspace(td)
+            r = _detect_skeleton_kind(ws)
+        # First slide → cover, last → ending, max-text → toc, big-font → divider, rest → content.
+        self.assertEqual(r["skeleton_kind"]["slide_01.svg"], "cover")
+        self.assertEqual(r["skeleton_kind"]["slide_02.svg"], "toc")
+        self.assertEqual(r["skeleton_kind"]["slide_03.svg"], "divider")
+        self.assertEqual(r["skeleton_kind"]["slide_04.svg"], "content")
+        self.assertEqual(r["skeleton_kind"]["slide_05.svg"], "ending")
+        self.assertEqual(r["divider_id"], 3)
+        self.assertEqual(r["content_id"], 4)
+
+
+class PlannerResultTests(unittest.TestCase):
+    """Phase-A planner response parsing + dict-like shim."""
+
+    def _shape_index(self):
+        return {
+            "slide_01.svg": {
+                "shape-23": {"placeholder": "title", "max_chars": 60},
+                "shape-24": {"placeholder": "subtitle", "max_chars": 60},
+            },
+            "slide_03.svg": {
+                "shape-4": {"placeholder": "PART NN", "max_chars": 20},
+                "shape-5": {"placeholder": "前言", "max_chars": 30},
+            },
+        }
+
+    def test_parse_legacy_dict_promotes_to_planner_result(self):
+        from mcp_ppt_native_fill.llm_planner import _parse_planner_response
+        raw = {"slide_01.svg": {"shape-23": "新标题"}}
+        result = _parse_planner_response(raw, self._shape_index())
+        self.assertEqual(
+            result.content_mapping, {"slide_01.svg": {"shape-23": "新标题"}}
+        )
+        # Dict-like shim lets the result compare equal to a plain dict.
+        self.assertEqual(result, {"slide_01.svg": {"shape-23": "新标题"}})
+        self.assertEqual(result["slide_01.svg"]["shape-23"], "新标题")
+        self.assertTrue(bool(result))
+        self.assertEqual(len(result), 1)
+
+    def test_parse_phase_a_four_key_shape(self):
+        from mcp_ppt_native_fill.llm_planner import _parse_planner_response
+        raw = {
+            "content_mapping": {"slide_01.svg": {"shape-23": "A"}},
+            "page_plan_additions": [
+                {"source_slide": 3, "svg": "slide_part02_div.svg",
+                 "edits": {"shape-4": "PART 02", "shape-5": "范围"}},
+                {"source_slide": 4, "svg": "slide_part02_content.svg",
+                 "edits": {"shape-17": "二、范围"}},
+            ],
+            "new_blocks": [
+                {"svg": "slide_part02_content.svg",
+                 "id": "content-body",
+                 "bounds": "120 130 1060 480",
+                 "layout": "3-column-cards",
+                 "spec": {"cards": [
+                     {"title": "基础", "color": "#1D2CAB",
+                      "items": ["a", "b"]},
+                     {"title": "销售", "color": "#EE822F",
+                      "items": ["c", "d"]},
+                     {"title": "采购", "color": "#75BD42",
+                      "items": ["e", "f"]},
+                 ]}},
+            ],
+            "skeleton_kind": {"slide_01.svg": "cover"},
+        }
+        result = _parse_planner_response(raw, self._shape_index())
+        self.assertEqual(len(result.page_plan_additions), 2)
+        self.assertEqual(len(result.new_blocks), 1)
+        self.assertEqual(result.skeleton_kind["slide_01.svg"], "cover")
+        # content_mapping still validated against shape_index.
+        self.assertEqual(result["slide_01.svg"]["shape-23"], "A")
+
+    def test_parse_drops_unsupported_layout(self):
+        from mcp_ppt_native_fill.llm_planner import _parse_planner_response
+        raw = {"new_blocks": [
+            {"svg": "slide_x.svg", "id": "b", "bounds": "0 0 100 100",
+             "layout": "totally-bogus", "spec": {}},
+        ]}
+        result = _parse_planner_response(raw, self._shape_index())
+        self.assertEqual(result.new_blocks, [])
+
+    def test_parse_drops_oversized_3_column_cards(self):
+        from mcp_ppt_native_fill.llm_planner import _parse_planner_response
+        raw = {"new_blocks": [
+            {"svg": "slide_x.svg", "id": "b", "bounds": "0 0 100 100",
+             "layout": "3-column-cards",
+             "spec": {"cards": [
+                 {"title": f"c{i}"} for i in range(6)
+             ]}},
+        ]}
+        result = _parse_planner_response(raw, self._shape_index())
+        self.assertEqual(result.new_blocks, [])
+
+    def test_parse_drops_duplicate_svg_in_page_plan(self):
+        from mcp_ppt_native_fill.llm_planner import _parse_planner_response
+        raw = {"page_plan_additions": [
+            {"source_slide": 3, "svg": "slide_x.svg", "edits": {}},
+            {"source_slide": 3, "svg": "slide_x.svg", "edits": {}},
+        ]}
+        result = _parse_planner_response(raw, self._shape_index())
+        self.assertEqual(len(result.page_plan_additions), 1)
+
+
+class PipelinePhase26Tests(unittest.TestCase):
+    """Phase-2.6 materialize LLM planner output (Phase A expansion)."""
+
+    def _make_workspace(self, td: Path):
+        flat = td / "authoring-svg-flat"
+        flat.mkdir(parents=True)
+        # 5 minimal slides — only slide_01 / slide_03 / slide_04 used here.
+        for n in (1, 2, 3, 4, 5):
+            (flat / f"slide_{n:02d}.svg").write_text(
+                '<?xml version="1.0" encoding="utf-8"?>'
+                '<svg xmlns="http://www.w3.org/2000/svg" '
+                'viewBox="0 0 1280 720">'
+                f'<g id="shape-{n}"><text x="10" y="20">orig-{n}</text></g>'
+                '</svg>',
+                encoding="utf-8",
+            )
+        return td
+
+    def test_phase2_6_clones_skeleton_and_applies_edits(self):
+        from mcp_ppt_native_fill import pipeline
+        from mcp_ppt_native_fill.llm_planner import PlannerResult
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ws = self._make_workspace(td)
+            state = pipeline.PipelineState(workspace=ws)
+            state.context["planner_result"] = PlannerResult(
+                content_mapping={},
+                page_plan_additions=[
+                    {"source_slide": 3,
+                     "svg": "slide_part02_div.svg",
+                     "edits": {"shape-3": "PART 02"}},
+                ],
+                new_blocks=[],
+                skeleton_kind={"slide_03.svg": "divider",
+                               "slide_part02_div.svg": "divider"},
+            )
+            state = pipeline.phase2_6_realize_planner_output(state)
+            self.assertNotEqual(state.stage, "failed")
+            clone = ws / "authoring-svg-flat" / "slide_part02_div.svg"
+            self.assertTrue(clone.is_file(),
+                            "phase2.6 must clone the skeleton SVG")
+            # Edit applied.
+            text = clone.read_text(encoding="utf-8")
+            self.assertIn("PART 02", text)
+            # page_plan_pages: originals (slide_01..05) seeded first,
+            # then the planner's page_plan_additions appended.
+            pages = state.context["page_plan_pages"]
+            seeded_svgs = [p["svg"] for p in pages
+                           if p["svg"].startswith("slide_") and
+                           not p["svg"].startswith("slide_part")]
+            self.assertEqual(
+                seeded_svgs,
+                ["slide_01.svg", "slide_02.svg",
+                 "slide_03.svg", "slide_04.svg", "slide_05.svg"],
+            )
+            self.assertIn(
+                {"source_slide": 3, "svg": "slide_part02_div.svg"},
+                pages,
+            )
+            # content_mapping picks up the new page's edits.
+            self.assertEqual(
+                state.context["content_mapping"]["slide_part02_div.svg"],
+                {"shape-3": "PART 02"},
+            )
+
+    def test_phase2_6_warns_on_missing_skeleton(self):
+        from mcp_ppt_native_fill import pipeline
+        from mcp_ppt_native_fill.llm_planner import PlannerResult
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ws = self._make_workspace(td)
+            state = pipeline.PipelineState(workspace=ws)
+            state.context["planner_result"] = PlannerResult(
+                page_plan_additions=[
+                    {"source_slide": 99,
+                     "svg": "slide_nope.svg",
+                     "edits": {}},
+                ],
+            )
+            state = pipeline.phase2_6_realize_planner_output(state)
+            self.assertTrue(
+                any("missing" in w for w in state.warnings),
+                "missing skeleton must surface as a warning",
+            )
+            # Originals still seeded (5 slides) even though the clone
+            # was rejected.
+            seeded_svgs = [p["svg"] for p in state.context["page_plan_pages"]]
+            self.assertEqual(seeded_svgs,
+                             ["slide_01.svg", "slide_02.svg",
+                              "slide_03.svg", "slide_04.svg",
+                              "slide_05.svg"])
+
+    def test_phase2_6_emits_new_blocks_into_state(self):
+        from mcp_ppt_native_fill import pipeline
+        from mcp_ppt_native_fill.llm_planner import PlannerResult
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ws = self._make_workspace(td)
+            state = pipeline.PipelineState(workspace=ws)
+            state.context["planner_result"] = PlannerResult(
+                new_blocks=[
+                    {"svg": "slide_part02_content.svg",
+                     "id": "content-body",
+                     "bounds": "120 130 1060 480",
+                     "layout": "3-column-cards",
+                     "spec": {"cards": [
+                         {"title": "A", "items": ["a"]},
+                         {"title": "B", "items": ["b"]},
+                         {"title": "C", "items": ["c"]},
+                     ]}},
+                ],
+            )
+            state = pipeline.phase2_6_realize_planner_output(state)
+            blocks = state.context["new_content_blocks"]
+            self.assertIn("slide_part02_content.svg", blocks)
+            self.assertEqual(
+                blocks["slide_part02_content.svg"]["content-body"]["layout"],
+                "3-column-cards",
+            )
+
+    def test_phase2_6_noop_when_planner_not_run(self):
+        from mcp_ppt_native_fill import pipeline
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ws = self._make_workspace(td)
+            state = pipeline.PipelineState(workspace=ws)
+            state = pipeline.phase2_6_realize_planner_output(
+                state,
+                caller_page_plan=[{"source_slide": 1}],
+                caller_new_blocks={"slide_01.svg": {"x": {"bounds": "0 0 1 1"}}},
+            )
+            # Caller-supplied page_plan + blocks pass through unchanged.
+            self.assertEqual(state.context["page_plan_pages"],
+                             [{"source_slide": 1}])
+            self.assertIn("slide_01.svg", state.context["new_content_blocks"])
+
+    def test_phase2_6_seeds_originals_when_no_caller_page_plan(self):
+        """Bug #1 fix: when caller passes no page_plan AND planner
+        returned page_plan_additions, originals (cover/toc/divider/
+        ending) must be seeded into page_plan_pages. Otherwise they
+        vanish from the export and the user sees 'no cover'."""
+        from mcp_ppt_native_fill import pipeline
+        from mcp_ppt_native_fill.llm_planner import PlannerResult
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ws = self._make_workspace(td)
+            state = pipeline.PipelineState(workspace=ws)
+            state.context["planner_result"] = PlannerResult(
+                content_mapping={},
+                page_plan_additions=[
+                    {"source_slide": 3,
+                     "svg": "slide_part02_div.svg",
+                     "edits": {"shape-3": "PART 02"}},
+                    {"source_slide": 4,
+                     "svg": "slide_part02_content.svg",
+                     "edits": {"shape-4": "body"}},
+                ],
+                new_blocks=[],
+            )
+            state = pipeline.phase2_6_realize_planner_output(state)
+            pages = state.context["page_plan_pages"]
+            svgs = [p["svg"] for p in pages]
+            # Cover, toc, divider, content, ending all present, in order.
+            self.assertEqual(svgs[:5],
+                             ["slide_01.svg", "slide_02.svg",
+                              "slide_03.svg", "slide_04.svg",
+                              "slide_05.svg"])
+            # Cloned PART_* appended after originals.
+            self.assertIn("slide_part02_div.svg", svgs)
+            self.assertIn("slide_part02_content.svg", svgs)
+            # Originals keep their source_slide.
+            self.assertEqual(pages[0], {"source_slide": 1,
+                                        "svg": "slide_01.svg"})
+
+    def test_phase2_6_no_planner_no_caller_seeds_only_originals(self):
+        """Path A: no planner ran, no caller page_plan. Originals
+        alone (5 slides) are exported — no cloned PART_*."""
+        from mcp_ppt_native_fill import pipeline
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ws = self._make_workspace(td)
+            state = pipeline.PipelineState(workspace=ws)
+            state = pipeline.phase2_6_realize_planner_output(state)
+            svgs = [p["svg"] for p in state.context["page_plan_pages"]]
+            self.assertEqual(svgs,
+                             ["slide_01.svg", "slide_02.svg",
+                              "slide_03.svg", "slide_04.svg",
+                              "slide_05.svg"])
+
+
+class ContentBlockFallbackTests(unittest.TestCase):
+    """Bug #2 fix: cloned content pages that the LLM forgot to fill
+    must get a synthesized 3-column-cards body block, otherwise the
+    page renders as a giant blank rectangle."""
+
+    def _make_md(self, td: Path) -> Path:
+        md = td / "doc.md"
+        md.write_text(
+            "# 一、目的\n\n"
+            "为了规范公司采购行为, 降低采购成本, 提高采购质量。\n\n"
+            "1. 采购原则\n2. 采购范围\n3. 采购职责\n\n"
+            "# 二、适用范围\n\n"
+            "适用于公司所有采购活动。\n\n"
+            "# 三、基本原则\n\n"
+            "公开透明、 公平竞争、 择优选择。\n",
+            encoding="utf-8",
+        )
+        return md
+
+    def test_fallback_synthesizes_three_cards_from_markdown(self):
+        from mcp_ppt_native_fill import pipeline
+        from mcp_ppt_native_fill.pipeline import PipelineState
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            md = self._make_md(td)
+            state = PipelineState(workspace=td)
+            state.context["content_markdown"] = md
+            final_blocks: dict = {}
+            pipeline._fill_missing_content_blocks(
+                cloned_svgs=["slide_part02_content.svg",
+                             "slide_part03_content.svg"],
+                final_new_blocks=final_blocks,
+                state=state,
+            )
+            # Both cloned content SVGs now have a content-body block.
+            self.assertIn("slide_part02_content.svg", final_blocks)
+            self.assertIn("slide_part03_content.svg", final_blocks)
+            for svg in ("slide_part02_content.svg",
+                        "slide_part03_content.svg"):
+                block = final_blocks[svg]["content-body"]
+                self.assertEqual(block["layout"], "3-column-cards")
+                self.assertEqual(block["bounds"], "120 130 1060 480")
+                # 1-3 cards per spec.
+                self.assertGreaterEqual(len(block["spec"]["cards"]), 1)
+                self.assertLessEqual(len(block["spec"]["cards"]), 3)
+
+    def test_fallback_skips_svg_that_already_has_blocks(self):
+        from mcp_ppt_native_fill import pipeline
+        from mcp_ppt_native_fill.pipeline import PipelineState
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            md = self._make_md(td)
+            state = PipelineState(workspace=td)
+            state.context["content_markdown"] = md
+            final_blocks = {
+                "slide_part02_content.svg": {
+                    "user-block": {"layout": "raw",
+                                   "bounds": "0 0 100 100"},
+                },
+            }
+            pipeline._fill_missing_content_blocks(
+                cloned_svgs=["slide_part02_content.svg"],
+                final_new_blocks=final_blocks,
+                state=state,
+            )
+            # Pre-existing block preserved; no overwrite / append.
+            self.assertEqual(list(final_blocks["slide_part02_content.svg"]
+                                  .keys()),
+                             ["user-block"])
+
+    def test_fallback_emits_placeholder_when_markdown_missing(self):
+        from mcp_ppt_native_fill import pipeline
+        from mcp_ppt_native_fill.pipeline import PipelineState
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            state = PipelineState(workspace=td)
+            # No content_markdown set at all.
+            final_blocks: dict = {}
+            pipeline._fill_missing_content_blocks(
+                cloned_svgs=["slide_part99_content.svg"],
+                final_new_blocks=final_blocks,
+                state=state,
+            )
+            self.assertIn("slide_part99_content.svg", final_blocks)
+            block = final_blocks["slide_part99_content.svg"]["content-body"]
+            self.assertEqual(block["layout"], "3-column-cards")
+            # At least 1 card emitted (the placeholder).
+            self.assertGreaterEqual(len(block["spec"]["cards"]), 1)
+
+
+class NewBlockLayoutTests(unittest.TestCase):
+    """Test the three new block layouts (3-column-cards, flow-steps, revision-table)."""
+
+    def test_3_column_cards_renders_with_spec_payload(self):
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        out = _render_new_block({
+            "layout": "3-column-cards",
+            "bounds": "0 0 600 200",
+            "spec": {"cards": [
+                {"title": "A", "color": "#1D2CAB", "items": ["a1", "a2"]},
+                {"title": "B", "color": "#EE822F", "items": ["b1"]},
+                {"title": "C", "color": "#75BD42", "items": ["c1", "c2"]},
+            ]},
+        })
+        self.assertIn("<rect", out)
+        self.assertIn("A", out)
+        self.assertIn("B", out)
+        self.assertIn("C", out)
+        self.assertIn("#1D2CAB", out)
+        self.assertIn("#EE822F", out)
+
+    def test_flow_steps_renders_with_arrows(self):
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        out = _render_new_block({
+            "layout": "flow-steps",
+            "bounds": "0 0 600 200",
+            "spec": {"steps": [
+                {"title": "申请", "items": ["提交"]},
+                {"title": "审批", "items": ["初审", "复审"]},
+                {"title": "采购", "items": ["下单", "到货"]},
+            ]},
+        })
+        # 3 step rects + 2 connector arrow paths (we use <path>, not
+        # <line marker-end="url(#arrow)">, because svg_to_pptx validates
+        # every marker reference against <defs>).
+        self.assertEqual(out.count("<rect"), 3)
+        self.assertEqual(out.count("<path"), 2)
+        self.assertIn("申请", out)
+        self.assertIn("审批", out)
+
+    def test_revision_table_renders_header_and_rows(self):
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        out = _render_new_block({
+            "layout": "revision-table",
+            "bounds": "0 0 800 200",
+            "spec": {"rows": [
+                {"date": "2026-09-01", "status": "草稿",
+                 "content": "初版", "author": "张三"},
+                {"date": "2026-09-05", "status": "发布",
+                 "content": "审批通过", "author": "李四"},
+            ]},
+        })
+        self.assertIn("2026-09-01", out)
+        self.assertIn("草稿", out)
+        self.assertIn("张三", out)
+        self.assertIn("日期", out)  # header label
+
+    def test_unsupported_layout_raises(self):
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        with self.assertRaises(ValueError):
+            _render_new_block({"layout": "made-up", "bounds": "0 0 1 1"})
 
 
 if __name__ == "__main__":

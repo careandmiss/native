@@ -40,8 +40,9 @@ def _run_via_stdin(arguments: dict) -> tuple[dict, str]:
         _json.dumps(r, ensure_ascii=False) for r in requests
     ) + "\n"
     proc = subprocess.run(
-        [sys.executable, "-m", "mcp_ppt_native_fill.server"],
+        [sys.executable, "-m", "mcp_ppt_native_fill"],
         input=stdin_payload, cwd=str(HERE.parent),
+        env={**__import__("os").environ, "PYTHONPATH": str(SRC)},
         capture_output=True, text=True, encoding="utf-8", timeout=300,
     )
     payload: dict = {}
