@@ -53,6 +53,13 @@ def _run_one(pptx: Path, repo_root: Path) -> dict:
     stem = _stem(pptx)
     workspace = repo_root / "projects" / f"{stem}_workspace"
     output = repo_root / "projects" / f"{stem}_out.pptx"
+    # If the user has PowerPoint open on a prior output file, our
+    # subprocess would race and lose. Append a run-counter suffix
+    # so each invocation writes to a fresh file.
+    counter = 1
+    while output.exists():
+        counter += 1
+        output = repo_root / "projects" / f"{stem}_out{counter}.pptx"
     expected_ending = _find_ending_svg(pptx)
     result: dict = {
         "template": pptx.name,

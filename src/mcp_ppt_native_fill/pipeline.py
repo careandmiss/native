@@ -198,6 +198,155 @@ def phase2_5_llm_plan(
     return state
 
 
+# Default TOC placeholder phrases that the LLM did NOT replace. When a
+# TOC slot's text still equals one of these, the slot is "unfilled" and
+# its <g> elements (accent bar + title + subtitle) are removed so the
+# rendered slide does not show template default text in empty rows.
+_TOC_PLACEHOLDER_PHRASES: frozenset[str] = frozenset({
+    "单击添加大标题", "点击添加大标题", "点击添加标题",
+    "click to add title", "click here to add title",
+    "单击添加", "chapter", "Chapter", "CHAPTER",
+    "",  # genuinely empty
+})
+
+
+def _is_toc_slot_placeholder(text: str) -> bool:
+    """True if the slot text is still template default (unfilled by LLM)."""
+    t = "".join(text.split())  # strip whitespace
+    if t in _TOC_PLACEHOLDER_PHRASES:
+        return True
+    # "单击添加小标题/标题英文" style boteng subtitle
+    if "添加" in t and "标题" in t:
+        return True
+    if t.startswith("添加"):
+        return True
+    return False
+
+
+def _remove_empty_toc_slots(
+    authoring_dir: Path,
+    state: PipelineState,
+) -> None:
+    """Remove unfilled TOC slot <g> elements from slide_02.svg (or any
+    slide detected as a TOC).
+
+    Heuristic: a TOC slot is a `<g id="shape-XX">` whose first `<text>`
+    text still matches a known placeholder phrase. We strip the entire
+    slot group (accent bar + title + subtitle) so the rendered slide
+    does not display template default text in empty rows.
+    """
+    from . import svg_edits  # local import to avoid top-of-file cycles
+
+    # Slide_02 is the boteng TOC; future templates may differ. Detect
+    # by max text_count + presence of "CONTENTS"/"目录" title.
+    candidate_slides: list[Path] = []
+    for path in authoring_dir.glob("slide_*.svg"):
+        try:
+            data = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if "目录" in data or "CONTENTS" in data.upper():
+            candidate_slides.append(path)
+    if not candidate_slides:
+        return
+
+    for toc_svg in candidate_slides:
+        original = toc_svg.read_text(encoding="utf-8")
+        # Pattern: <g id="shape-XX" ... data-pptx-frame="X Y W H" ...>
+        # (.*?) </g>  — capture inner content, then check first <text>.
+        slot_re = re.compile(
+            r'<g id="(shape-\d+)"[^>]*data-pptx-frame="([^"]+)"[^>]*>(.*?)</g>',
+            re.DOTALL,
+        )
+        slots: list[tuple[str, str, str]] = []  # (gid, frame, body)
+        for m in slot_re.finditer(original):
+            slots.append((m.group(1), m.group(2), m.group(3)))
+        if not slots:
+            continue
+        # Cluster slots by row (group of left+right pair at same y).
+        # Sort by y then x.
+        def _sort_key(item: tuple[str, str, str]) -> tuple[float, float]:
+            parts = item[1].split()
+            y = float(parts[1]) if len(parts) > 1 else 0.0
+            x = float(parts[0]) if parts else 0.0
+            return (y, x)
+        slots.sort(key=_sort_key)
+
+        # Group consecutive slots whose y-coords are within 5 px of each
+        # other. Each group is a "row". A row is empty iff all slot
+        # texts in that row are still placeholders.
+        rows: list[list[tuple[str, str, str]]] = []
+        for slot in slots:
+            y = _sort_key(slot)[0]
+            if rows and abs(_sort_key(rows[-1][0])[0] - y) < 5.0:
+                rows[-1].append(slot)
+            else:
+                rows.append([slot])
+
+        # Identify empty rows: every slot in the row has placeholder text.
+        empty_rows: list[list[tuple[str, str, str]]] = []
+        for row in rows:
+            slot_texts: list[str] = []
+            for _gid, _frame, body in row:
+                texts = re.findall(r'<text[^>]*>([^<]*)</text>|<tspan[^>]*>([^<]*)</tspan>', body)
+                flat = "".join(t[0] or t[1] or "" for t in texts).strip()
+                slot_texts.append(flat)
+            if all(_is_toc_slot_placeholder(t) for t in slot_texts):
+                empty_rows.append(row)
+        if not empty_rows:
+            continue
+
+        # Strip the empty rows' <g> elements. We rebuild the file by
+        # removing each matching <g> ... </g> block (only the outer
+        # <g id="shape-XX"> with frame; nested <g>s without a frame
+        # attribute are decoration, e.g. the title slot's circle icons,
+        # and we leave those alone).
+        gids_to_remove: set[str] = set()
+        for row in empty_rows:
+            for gid, _frame, _body in row:
+                gids_to_remove.add(gid)
+
+        patched = original
+        for gid in gids_to_remove:
+            # Match the *outer* <g id="gid" ...> ... </g> block — balance
+            # nested <g>...</g> so the regex does not stop at the first
+            # inner </g> (the slot may contain child <g>s for accent
+            # bar / title / subtitle).
+            start = re.search(
+                rf'<g id="{re.escape(gid)}"[^>]*>', patched
+            )
+            if not start:
+                continue
+            depth = 0
+            i = start.start()
+            end = None
+            for j in range(i, len(patched)):
+                if patched[j] == "<" and patched[j:j + 2] == "<g":
+                    depth += 1
+                elif patched[j] == "<" and patched[j:j + 4] == "</g>":
+                    depth -= 1
+                    if depth == 0:
+                        end = j + 4
+                        break
+            if end is None:
+                continue
+            patched = patched[:i] + patched[end:]
+
+        if patched != original:
+            toc_svg.write_text(patched, encoding="utf-8")
+            n_rows = len(empty_rows)
+            n_slots = sum(len(r) for r in empty_rows)
+            log.info(
+                "phase3: TOC cleanup — removed %d empty row(s) / %d slot(s) "
+                "from %s",
+                n_rows, n_slots, toc_svg.name,
+            )
+            state.warnings.append(
+                f"toc cleanup: removed {n_slots} unfilled slot(s) from "
+                f"{toc_svg.name}"
+            )
+
+
 def _fill_missing_content_blocks(
     *,
     cloned_svgs: list[str],
@@ -693,6 +842,11 @@ def phase3_author(
             state.errors.append(
                 f"edit failed svg={svg_name}: {type(exc).__name__}: {exc}"
             )
+
+    # Bug fix (Phase B+, post-Phase-A): remove unfilled TOC slot <g>
+    # elements so the TOC slide does not display template default
+    # placeholder text in empty rows. See _remove_empty_toc_slots.
+    _remove_empty_toc_slots(authoring_dir, state)
 
     for svg_name, blocks in (new_content_blocks or {}).items():
         svg_path = authoring_dir / svg_name
