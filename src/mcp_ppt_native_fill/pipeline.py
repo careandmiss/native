@@ -211,7 +211,17 @@ _TOC_PLACEHOLDER_PHRASES: frozenset[str] = frozenset({
 
 
 def _is_toc_slot_placeholder(text: str) -> bool:
-    """True if the slot text is still template default (unfilled by LLM)."""
+    """True if the slot text is still template default (unfilled by LLM).
+
+    Matched patterns:
+      * The original template default strings (Chinese: "单击添加大标题",
+        "点击添加大标题" etc.; English: "click to add title", "Chapter").
+      * Subtitle defaults (boteng: "单击添加小标题/标题英文 单价..." style).
+      * Boteng's default row labels: "第五章" / "第六章" / "Chapter N"
+        — these are template placeholders the LLM should have replaced
+        with a real chapter name. If still present, the row is unused.
+      * Empty string.
+    """
     t = "".join(text.split())  # strip whitespace
     if t in _TOC_PLACEHOLDER_PHRASES:
         return True
@@ -220,6 +230,15 @@ def _is_toc_slot_placeholder(text: str) -> bool:
         return True
     if t.startswith("添加"):
         return True
+    # Boteng's default row label "第N章" (e.g. "第五章", "第六章").
+    # The real chapter title in boteng is "第N章 / <chapter-name>" with
+    # content text, so a bare "第N章" with no associated content is
+    # the template default we want to remove.
+    if re.fullmatch(r"第[一二三四五六七八九十百千]+章", t):
+        return True
+    # "Chapter N" / "CHAPTER N" / "Chapter One" etc.
+    if re.fullmatch(r"[Cc]hapter\s*\d+", t):
+        return True
     return False
 
 
@@ -227,18 +246,30 @@ def _remove_empty_toc_slots(
     authoring_dir: Path,
     state: PipelineState,
 ) -> None:
-    """Remove unfilled TOC slot <g> elements from slide_02.svg (or any
-    slide detected as a TOC).
+    """Remove unfilled TOC slot <g> elements from the TOC slide.
 
-    Heuristic: a TOC slot is a `<g id="shape-XX">` whose first `<text>`
-    text still matches a known placeholder phrase. We strip the entire
-    slot group (accent bar + title + subtitle) so the rendered slide
-    does not display template default text in empty rows.
+    The TOC layout in the boteng template is a 3×2 grid of slots; each
+    slot has 3 stacked shapes (accent bar + title + subtitle) per
+    column. When the LLM fills fewer slots than the template
+    provides, the unfilled slots keep the template's default
+    placeholder text ("点击添加大标题" etc.) and look like an
+    unfinished page.
+
+    Strategy: cluster all shape-* `<g>`s into horizontal *bands* by
+    y-coordinate (the slot row spans y in [row_y, row_y + ~80]).
+    A band is "empty" iff both its left-column title and its
+    right-column title still contain a known placeholder phrase.
+    We then strip the band's entire set of shapes (accent bar +
+    title + subtitle for both columns + any decoration between).
+
+    Background shapes (page background rect, decorative diamonds,
+    separator lines, the page-level <g id="shape-61" container)
+    are kept because they have either no ``data-pptx-frame`` or a
+    frame outside the row band ranges. Our matcher only ever picks
+    up slot shapes.
     """
-    from . import svg_edits  # local import to avoid top-of-file cycles
-
     # Slide_02 is the boteng TOC; future templates may differ. Detect
-    # by max text_count + presence of "CONTENTS"/"目录" title.
+    # by presence of "目录" / "CONTENTS" text in the SVG body.
     candidate_slides: list[Path] = []
     for path in authoring_dir.glob("slide_*.svg"):
         try:
@@ -252,78 +283,116 @@ def _remove_empty_toc_slots(
 
     for toc_svg in candidate_slides:
         original = toc_svg.read_text(encoding="utf-8")
-        # Pattern: <g id="shape-XX" ... data-pptx-frame="X Y W H" ...>
-        # (.*?) </g>  — capture inner content, then check first <text>.
-        slot_re = re.compile(
+        # Find every shape-* with a frame; record (gid, y_top, y_bottom,
+        # x_left, x_right, body).
+        shape_re = re.compile(
             r'<g id="(shape-\d+)"[^>]*data-pptx-frame="([^"]+)"[^>]*>(.*?)</g>',
             re.DOTALL,
         )
-        slots: list[tuple[str, str, str]] = []  # (gid, frame, body)
-        for m in slot_re.finditer(original):
-            slots.append((m.group(1), m.group(2), m.group(3)))
-        if not slots:
+        items: list[tuple[str, float, float, float, float, str]] = []
+        for m in shape_re.finditer(original):
+            gid = m.group(1)
+            parts = m.group(2).split()
+            if len(parts) < 4:
+                continue
+            try:
+                x, y, w, h = (float(p) for p in parts[:4])
+            except ValueError:
+                continue
+            # Safety: never remove a shape whose body is a <image>
+            # (page background) or data-pptx-object="picture". These
+            # are decoration, not editable TOC text slots.
+            body = m.group(3)
+            if "<image" in body or 'data-pptx-object="picture"' in m.group(0):
+                continue
+            items.append((gid, y, y + h, x, x + w, body))
+        if not items:
             continue
-        # Cluster slots by row (group of left+right pair at same y).
-        # Sort by y then x.
-        def _sort_key(item: tuple[str, str, str]) -> tuple[float, float]:
-            parts = item[1].split()
-            y = float(parts[1]) if len(parts) > 1 else 0.0
-            x = float(parts[0]) if parts else 0.0
-            return (y, x)
-        slots.sort(key=_sort_key)
 
-        # Group consecutive slots whose y-coords are within 5 px of each
-        # other. Each group is a "row". A row is empty iff all slot
-        # texts in that row are still placeholders.
-        rows: list[list[tuple[str, str, str]]] = []
-        for slot in slots:
-            y = _sort_key(slot)[0]
-            if rows and abs(_sort_key(rows[-1][0])[0] - y) < 5.0:
-                rows[-1].append(slot)
-            else:
-                rows.append([slot])
+        # Extract first text inside each shape's body for the title-text
+        # check below.
+        def _text(body: str) -> str:
+            return "".join(
+                (t[0] or t[1] or "")
+                for t in re.findall(
+                    r'<text[^>]*>([^<]*)</text>|<tspan[^>]*>([^<]*)</tspan>',
+                    body,
+                )
+            ).strip()
 
-        # Identify empty rows: every slot in the row has placeholder text.
-        empty_rows: list[list[tuple[str, str, str]]] = []
-        for row in rows:
-            slot_texts: list[str] = []
-            for _gid, _frame, body in row:
-                texts = re.findall(r'<text[^>]*>([^<]*)</text>|<tspan[^>]*>([^<]*)</tspan>', body)
-                flat = "".join(t[0] or t[1] or "" for t in texts).strip()
-                slot_texts.append(flat)
-            if all(_is_toc_slot_placeholder(t) for t in slot_texts):
-                empty_rows.append(row)
+        # Identify TOC rows by their TITLE shapes: a title shape has
+        # a tall frame (height ~40-50 px, the title text size) and is
+        # usually the largest in its y-band. We pick the y_top of
+        # each title shape, then group shapes whose y_top is within
+        # 90 px of that title (covers accent above + subtitle below).
+        title_y_values: list[float] = []
+        for gid, y_top, y_bot, x_l, x_r, body in items:
+            h = y_bot - y_top
+            txt = _text(body)
+            if 35 <= h <= 60 and txt and not _is_toc_slot_placeholder(txt):
+                # likely a title
+                title_y_values.append(y_top)
+        # Deduplicate close y values (left + right col title of same row).
+        title_y_values.sort()
+        row_anchors: list[float] = []
+        for y in title_y_values:
+            if row_anchors and abs(row_anchors[-1] - y) < 5.0:
+                continue
+            row_anchors.append(y)
+
+        if not row_anchors:
+            continue
+
+        # A row's full y-extent is [anchor - 30, anchor + 90]. Any shape
+        # whose y_top is in that range belongs to that row.
+        empty_rows: list[tuple[float, float]] = []  # (y_top, y_bot)
+        for anchor in row_anchors:
+            row_top = anchor - 30
+            row_bot = anchor + 90
+            row_shapes = [
+                it for it in items
+                if row_top <= it[1] <= row_bot
+            ]
+            # Collect the texts of the row's TITLE shapes (heights
+            # 35-60, with text). If ANY title has real (non-placeholder)
+            # text, the row is filled. If all titles are placeholder
+            # or there are no titles in the row, the row is empty.
+            title_texts: list[str] = []
+            for _gid, y_top, y_bot, _x, _r, body in row_shapes:
+                h = y_bot - y_top
+                txt = _text(body)
+                if 35 <= h <= 60 and txt:
+                    title_texts.append(txt)
+            if not title_texts:
+                # No title in this y-band — this is decoration
+                # (separators, page background), skip.
+                continue
+            if all(_is_toc_slot_placeholder(t) for t in title_texts):
+                empty_rows.append((row_top, row_bot))
         if not empty_rows:
             continue
 
-        # Strip the empty rows' <g> elements. We rebuild the file by
-        # removing each matching <g> ... </g> block (only the outer
-        # <g id="shape-XX"> with frame; nested <g>s without a frame
-        # attribute are decoration, e.g. the title slot's circle icons,
-        # and we leave those alone).
+        # Collect every shape whose y_top is in any empty row's range.
         gids_to_remove: set[str] = set()
-        for row in empty_rows:
-            for gid, _frame, _body in row:
-                gids_to_remove.add(gid)
+        for row_top, row_bot in empty_rows:
+            for gid, y_top, _, _, _, _ in items:
+                if row_top <= y_top <= row_bot:
+                    gids_to_remove.add(gid)
 
         patched = original
-        for gid in gids_to_remove:
-            # Match the *outer* <g id="gid" ...> ... </g> block — balance
-            # nested <g>...</g> so the regex does not stop at the first
-            # inner </g> (the slot may contain child <g>s for accent
-            # bar / title / subtitle).
-            start = re.search(
-                rf'<g id="{re.escape(gid)}"[^>]*>', patched
-            )
-            if not start:
+        for gid in sorted(gids_to_remove):
+            # Find the outer <g id="gid" ...> and balance nested
+            # </g> so we do not stop at a child's closer.
+            m = re.search(rf'<g id="{re.escape(gid)}"[^>]*>', patched)
+            if not m:
                 continue
             depth = 0
-            i = start.start()
+            i = m.start()
             end = None
             for j in range(i, len(patched)):
-                if patched[j] == "<" and patched[j:j + 2] == "<g":
+                if patched.startswith("<g", j):
                     depth += 1
-                elif patched[j] == "<" and patched[j:j + 4] == "</g>":
+                elif patched.startswith("</g>", j):
                     depth -= 1
                     if depth == 0:
                         end = j + 4
@@ -335,15 +404,15 @@ def _remove_empty_toc_slots(
         if patched != original:
             toc_svg.write_text(patched, encoding="utf-8")
             n_rows = len(empty_rows)
-            n_slots = sum(len(r) for r in empty_rows)
+            n_shapes_removed = len(gids_to_remove)
             log.info(
-                "phase3: TOC cleanup — removed %d empty row(s) / %d slot(s) "
+                "phase3: TOC cleanup — removed %d empty row(s) / %d shape(s) "
                 "from %s",
-                n_rows, n_slots, toc_svg.name,
+                n_rows, n_shapes_removed, toc_svg.name,
             )
             state.warnings.append(
-                f"toc cleanup: removed {n_slots} unfilled slot(s) from "
-                f"{toc_svg.name}"
+                f"toc cleanup: removed {n_shapes_removed} unfilled shape(s) "
+                f"from {toc_svg.name}"
             )
 
 
