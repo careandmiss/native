@@ -443,7 +443,7 @@ class AutofixTests(unittest.TestCase):
             self.assertEqual(records[0].action, "strip_linearGradient")
             content = svg.read_text(encoding="utf-8")
             self.assertNotIn("<linearGradient", content)
-            self.assertIn('fill="#FFFFFF"', content)
+            self.assertIn('fill="none"', content)
 
     def test_fix_unsafe_font(self):
         with tempfile.TemporaryDirectory() as td:

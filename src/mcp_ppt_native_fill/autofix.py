@@ -381,12 +381,16 @@ _URL_REF_RE = re.compile(r"url\(#([^)]+)\)")
 
 def fix_gradient_unexportable(svg_path: Path) -> list[AutoFixRecord]:
     """Strip ``<defs><linearGradient>...</linearGradient></defs>`` blocks
-    and rewrite ``fill="url(#x)"`` / ``stroke="url(#x)"`` to solid white.
+    and rewrite ``fill="url(#x)"`` / ``stroke="url(#x)"`` to ``"none"``.
 
     Per master §6.1, DrawingML's gradient stop requirements (monotonic,
-    positions in [0,1]) reject most authoring SVGs. White is a safe default
-    because slide backgrounds are usually light; consumers can re-tint via
-    slide redesign.
+    positions in [0,1]) reject most authoring SVGs. We replace with
+    ``fill="none"`` rather than ``fill="#FFFFFF"`` because most
+    author-time gradient fills are *decorative overlays* on top of the
+    slide background image (e.g. the boteng TOC's Freeform 3/4
+    panels). Setting the fill to solid white hides the underlying
+    background image. ``fill="none"`` makes the decorative overlay
+    transparent so the original background image shows through.
 
     Returns one record per gradient defs block removed.
     """
@@ -413,8 +417,8 @@ def fix_gradient_unexportable(svg_path: Path) -> list[AutoFixRecord]:
     if not gradient_ids:
         return records
 
-    # Rewrite fill / stroke references to a solid color. Use white, which is
-    # also what master §6.1 suggests.
+    # Rewrite fill / stroke references to "none" (transparent) so
+    # decorative gradient overlays do not hide the slide background.
     rewritten = 0
     for elem in root.iter():
         for attr in ("fill", "stroke"):
@@ -423,8 +427,66 @@ def fix_gradient_unexportable(svg_path: Path) -> list[AutoFixRecord]:
                 continue
             m = _URL_REF_RE.search(val)
             if m and m.group(1) in gradient_ids:
-                elem.set(attr, "#FFFFFF")
+                elem.set(attr, "none")
                 rewritten += 1
+
+    # Also rewrite solid white fills (a common residual from the
+    # roundtrip converter "inlining" a gradient stop — e.g. the
+    # boteng TOC has Freeform panels whose original gradient stops
+    # collapsed to fill="#FFFFFF", which then covers the slide
+    # background image). We only do this for shapes whose frame is
+    # canvas-sized or near-canvas-sized, so we don't accidentally
+    # clear a small white text background.
+    if gradient_ids:
+        solid_white_rewritten = 0
+        for elem in root.iter():
+            for attr in ("fill",):
+                val = elem.get(attr)
+                if not val:
+                    continue
+                if val.lower() not in ("#ffffff", "#fff", "white"):
+                    continue
+                # Only rewrite if this is one of the <g> elements
+                # that had a gradient id (or any descendant). Walk
+                # up to find a <g data-pptx-frame> owner.
+                def _parent(root, child):
+                    for parent in root.iter():
+                        for kid in parent:
+                            if kid is child:
+                                return parent
+                    return None
+                owner = elem
+                while owner is not None and (
+                    owner.tag != f"{{{svg_ns}}}g" or
+                    "data-pptx-frame" not in (owner.attrib or {})
+                ):
+                    parent = _parent(root, owner)
+                    if parent is None:
+                        owner = None
+                        break
+                    owner = parent
+                if owner is None:
+                    continue
+                frame_str = owner.attrib.get("data-pptx-frame", "")
+                parts = frame_str.split()
+                if len(parts) < 4:
+                    continue
+                try:
+                    fx, fy, fw, fh = (float(p) for p in parts[:4])
+                except ValueError:
+                    continue
+                # Treat as "full-slide decorative panel" if it covers
+                # most of the canvas (>= 80% of either width or
+                # height). Skip small shapes (text backgrounds, etc).
+                if fw < 0.6 * 1280 and fh < 0.6 * 720:
+                    continue
+                elem.set(attr, "none")
+                solid_white_rewritten += 1
+        if solid_white_rewritten:
+            rewritten += solid_white_rewritten
+            # Update the most recent record (or add a new one).
+            if records:
+                records[-1].detail += f"; cleared {solid_white_rewritten} solid-white decorative panels"
 
     if rewritten or gradient_ids:
         _write_svg(svg_path, root)
@@ -434,7 +496,7 @@ def fix_gradient_unexportable(svg_path: Path) -> list[AutoFixRecord]:
                 issue="gradient_unexportable",
                 action="strip_linearGradient",
                 before=sorted(gradient_ids),
-                after="#FFFFFF (solid)",
+                after="none (transparent)",
                 detail=f"rewritten {rewritten} url() references",
             )
         )
