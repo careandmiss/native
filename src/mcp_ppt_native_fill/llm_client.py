@@ -208,6 +208,52 @@ def _read_claude_settings() -> tuple[str | None, str | None, str | None, str | N
     return api_key, base_url, model, str(path)
 
 
+def _extract_first_json_object(text: str) -> dict | None:
+    """Scan ``text`` for the first balanced ``{ … }`` JSON object.
+
+    LLMs sometimes prefix the JSON with analysis prose or suffix it
+    with ``Reasoning: …`` notes that confuse ``json.loads``. We
+    bracket-count braces while respecting JSON string literals (and
+    ``\\`` escapes sequences inside them) so braces inside a string
+    do not desync the count. Returns the parsed dict, or ``None``
+    when no balanced object can be located.
+    """
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:i + 1]
+                    try:
+                        obj = json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break
+                    if isinstance(obj, dict):
+                        return obj
+                    # First balanced object was non-dict (e.g. a list);
+                    # fall through to next candidate below.
+                    break
+        start = text.find("{", start + 1)
+    return None
+
+
 def llm_complete_json(
     *,
     system: str,
@@ -245,13 +291,20 @@ def llm_complete_json(
 
     # The LLM may wrap JSON in ```json fences or precede it with prose.
     text = _strip_code_fence(text)
+    # Even after stripping fences the response may carry analysis prose
+    # before the JSON object, or `Reasoning:` text after. Try strict
+    # parse first; on failure fall back to scanning for the first
+    # balanced { ... } object so a single response covers a few cases.
     try:
         return json.loads(text)
-    except json.JSONDecodeError as exc:
+    except json.JSONDecodeError:
+        candidate = _extract_first_json_object(text)
+        if candidate is not None:
+            return candidate
         raise LLMError(
-            f"LLM response is not valid JSON: {exc}; "
+            f"LLM response is not valid JSON; "
             f"first 200 chars: {text[:200]!r}"
-        ) from exc
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -373,3 +426,5 @@ def _strip_code_fence(text: str) -> str:
         if s.endswith("```"):
             s = s[:-3]
     return s.strip()
+
+

@@ -360,6 +360,8 @@ def _seed_original_roster(
     authoring_dir: Path,
     *,
     exclude: frozenset[str] = frozenset(),
+    skeleton_kind: dict[str, str] | None = None,
+    ending_last: bool = False,
 ) -> list[dict[str, Any]]:
     """Build a page_plan from the original ``slide_NN.svg`` skeletons.
 
@@ -372,6 +374,14 @@ def _seed_original_roster(
     The pipeline must register the original cover/toc/divider/ending
     pages — otherwise they vanish from the export and the user sees
     "no cover, blank content".
+
+    ``ending_last=True`` (Phase B, Bug 1 fix): when set, identify the
+    ``ending`` skeleton and append it AFTER all other originals instead
+    of letting ``source_slide`` ordering place it in the middle.
+    ``skeleton_kind`` is consulted first (mapping ``"slide_NN.svg" →
+    "ending"|...``); if not provided or no ending entry is found, fall
+    back to the slide with the highest source_slide (the boteng
+    template's slide_05.svg is always the closing slide).
     """
     roster: list[dict[str, Any]] = []
     if not authoring_dir.is_dir():
@@ -388,8 +398,30 @@ def _seed_original_roster(
             continue
         candidates.append((int(m.group(1)), path.name))
     candidates.sort(key=lambda item: item[0])
+
+    # Identify the ending slide (pop it out so we can re-append at the
+    # end). Two strategies, in priority order:
+    #   1. skeleton_kind[name] == "ending" — planner already labelled it
+    #   2. last by source_slide — defensive fallback
+    ending_idx: int | None = None
+    if ending_last and candidates:
+        for idx, (_, name) in enumerate(candidates):
+            if skeleton_kind and skeleton_kind.get(name) == "ending":
+                ending_idx = idx
+                break
+        if ending_idx is None:
+            ending_idx = len(candidates) - 1  # fallback: highest NN
+
+    ending_entry: dict[str, Any] | None = None
+    if ending_idx is not None:
+        source_slide, name = candidates.pop(ending_idx)
+        ending_entry = {"source_slide": source_slide, "svg": name}
+
     for source_slide, name in candidates:
         roster.append({"source_slide": source_slide, "svg": name})
+
+    if ending_entry is not None:
+        roster.append(ending_entry)
     return roster
 
 
@@ -451,13 +483,18 @@ def phase2_6_realize_planner_output(
     # newly-cloned PART_* file, preserving the original ordering by
     # ``source_slide``.
     if not caller_page_plan:
-        seeded = _seed_original_roster(authoring_dir, exclude=frozenset(
-            e.get("svg", "") for e in planner_result.page_plan_additions
-        ))
+        seeded = _seed_original_roster(
+            authoring_dir,
+            exclude=frozenset(
+                e.get("svg", "") for e in planner_result.page_plan_additions
+            ),
+            skeleton_kind=planner_result.skeleton_kind,
+            ending_last=True,
+        )
         final_pages = list(seeded)
         log.info(
             "phase2.6: seeded %d original slide(s) into page_plan "
-            "(cover/toc/divider/ending)",
+            "(cover/toc/divider/ending; ending moved to last)",
             len(seeded),
         )
 
@@ -555,6 +592,33 @@ def phase2_6_realize_planner_output(
         final_new_blocks=final_new_blocks,
         state=state,
     )
+
+    # Bug 1 fix (Phase B): the ending skeleton (e.g. THANK YOU) must be
+    # the LAST page in the deck, not just the last original. Source-order
+    # sorting placed it at slide 5 of a 13-page deck because cloned
+    # PART_* content pages take source_slide 3/4, jumping over slide_05.
+    # Strategy: after all clones are appended, locate the ending entry
+    # (skeleton_kind says "ending") and move it to the tail.
+    if planner_result.skeleton_kind:
+        ending_svgs = {
+            svg for svg, kind in planner_result.skeleton_kind.items()
+            if kind == "ending"
+        }
+        ending_idx: int | None = None
+        for idx, page in enumerate(final_pages):
+            if page.get("svg") in ending_svgs:
+                ending_idx = idx
+                break  # take the first (there should be exactly one)
+        if ending_idx is not None and ending_idx != len(final_pages) - 1:
+            ending_entry = final_pages.pop(ending_idx)
+            final_pages.append(ending_entry)
+            log.info(
+                "phase2.6: moved ending slide %s to position %d "
+                "(was at %d)",
+                ending_entry.get("svg"),
+                len(final_pages),
+                ending_idx + 1,
+            )
 
     state.context["page_plan_pages"] = final_pages
     state.context["new_content_blocks"] = final_new_blocks
@@ -1247,6 +1311,180 @@ def _render_new_block(spec: dict[str, Any]) -> str:
                 f'<line x1="{bx:g}" y1="{ry + row_h:g}" x2="{bx + bw:g}" '
                 f'y2="{ry + row_h:g}" stroke="#E0E0E0" stroke-width="0.5"/>'
             )
+        return "\n".join(parts)
+    # Bug 3 fix (Phase B): add 4 new layouts so the LLM has variety
+    # beyond cards/flow/table and content pages stop looking templated.
+    if layout == "hero-number":
+        # 1 large centered value + small caption. For KPI / chapter-count
+        # statements ("5 章" / "总章数").
+        value = payload.get("value", "")
+        unit = payload.get("unit", "")
+        caption = payload.get("caption", "")
+        if not isinstance(value, str) or not value:
+            raise ValueError("hero-number requires spec.value (string)")
+        bounds = spec.get("bounds") or payload.get("bounds")
+        bx, by, bw, bh = (float(t) for t in bounds.split())
+        parts: list[str] = []
+        cx = bx + bw / 2
+        # Centered baseline of the big number.
+        value_y = by + bh * 0.55
+        parts.append(
+            f'<text x="{cx:g}" y="{value_y:g}" text-anchor="middle" '
+            f'font-size="72" font-weight="bold" fill="#1D2CAB">'
+            f'{_escape(value)}{_escape(unit)}</text>'
+        )
+        # Caption below.
+        if caption:
+            parts.append(
+                f'<text x="{cx:g}" y="{value_y + 36:g}" text-anchor="middle" '
+                f'font-size="18" fill="#666">'
+                f'{_escape(caption)}</text>'
+            )
+        return "\n".join(parts)
+    if layout == "callout-box":
+        # Quotation / motto in a soft-tinted box with a big quote glyph
+        # and an attribution line.
+        quote = payload.get("quote", "")
+        attribution = payload.get("attribution", "")
+        if not isinstance(quote, str) or not quote:
+            raise ValueError("callout-box requires spec.quote (string)")
+        bounds = spec.get("bounds") or payload.get("bounds")
+        bx, by, bw, bh = (float(t) for t in bounds.split())
+        parts: list[str] = []
+        # Tinted panel background.
+        parts.append(
+            f'<rect x="{bx:g}" y="{by:g}" width="{bw:g}" height="{bh:g}" '
+            f'rx="10" fill="#F4F6FB" stroke="#1D2CAB" '
+            f'stroke-width="1" stroke-opacity="0.3"/>'
+        )
+        # Big opening quote glyph at top-left.
+        parts.append(
+            f'<text x="{bx + 24:g}" y="{by + 64:g}" font-size="48" '
+            f'font-weight="bold" fill="#1D2CAB" '
+            f'fill-opacity="0.6">“</text>'
+        )
+        # Quote text — vertically centered.
+        parts.append(
+            f'<text x="{bx + 24:g}" y="{by + bh / 2:g}" font-size="24" '
+            f'fill="#222">{_escape(quote)}</text>'
+        )
+        # Attribution bottom-right.
+        if attribution:
+            parts.append(
+                f'<text x="{bx + bw - 24:g}" y="{by + bh - 24:g}" '
+                f'text-anchor="end" font-size="14" fill="#666" '
+                f'font-style="italic">— {_escape(attribution)}</text>'
+            )
+        return "\n".join(parts)
+    if layout == "two-column-compare":
+        # Two juxtaposed columns (e.g. 对比 / pros-cons) divided by a
+        # vertical rule.
+        left = payload.get("left") or {}
+        right = payload.get("right") or {}
+        if not (isinstance(left, dict) and isinstance(right, dict)):
+            raise ValueError(
+                "two-column-compare requires spec.left and spec.right "
+                "(both objects with title + items)"
+            )
+        for side_name, side in (("left", left), ("right", right)):
+            if not isinstance(side.get("title"), str) or not side["title"]:
+                raise ValueError(
+                    f"two-column-compare spec.{side_name}.title required"
+                )
+            if not isinstance(side.get("items"), list):
+                raise ValueError(
+                    f"two-column-compare spec.{side_name}.items must be list"
+                )
+        bounds = spec.get("bounds") or payload.get("bounds")
+        bx, by, bw, bh = (float(t) for t in bounds.split())
+        parts: list[str] = []
+        gap = 24.0
+        col_w = (bw - gap) / 2
+        for idx, side in enumerate((left, right)):
+            cx = bx + idx * (col_w + gap)
+            # Column title.
+            parts.append(
+                f'<text x="{cx + col_w / 2:g}" y="{by + 32:g}" '
+                f'text-anchor="middle" font-size="20" font-weight="bold" '
+                f'fill="#1D2CAB">{_escape(side["title"])}</text>'
+            )
+            # Items list.
+            for j, item in enumerate(side["items"]):
+                ty = by + 64 + j * 22
+                if ty > by + bh - 8:
+                    break
+                parts.append(
+                    f'<text x="{cx + 16:g}" y="{ty:g}" font-size="14" '
+                    f'fill="#222">{_escape(str(item))}</text>'
+                )
+        # Vertical divider rule between the two columns.
+        mid_x = bx + bw / 2
+        parts.append(
+            f'<line x1="{mid_x:g}" y1="{by + 16:g}" x2="{mid_x:g}" '
+            f'y2="{by + bh - 16:g}" stroke="#D0D6E5" stroke-width="1"/>'
+        )
+        return "\n".join(parts)
+    if layout == "timeline":
+        # 2-5 ordered steps along a horizontal axis with circle nodes.
+        steps = payload.get("steps") or []
+        if not 2 <= len(steps) <= 5:
+            raise ValueError("timeline supports 2-5 steps")
+        bounds = spec.get("bounds") or payload.get("bounds")
+        bx, by, bw, bh = (float(t) for t in bounds.split())
+        parts: list[str] = []
+        n = len(steps)
+        # Horizontal axis baseline near vertical middle.
+        axis_y = by + bh * 0.45
+        # Adaptive left/right margin: must be large enough that the
+        # leftmost / rightmost text (text-anchor="middle") does not
+        # bleed outside the declared bounds. Estimate the widest detail
+        # string at ~12.6 px per mixed char at 12px (CJK + ASCII), so
+        # half-width = chars * 6.3. Add 10 px headroom.
+        widest = max(
+            (len(str(s.get("detail", ""))) for s in steps),
+            default=0,
+        )
+        margin = max(40.0, widest * 6.3 + 10.0)
+        # Clamp margin so span stays positive.
+        margin = min(margin, bw / 2 - 10.0)
+        span = bw - 2 * margin
+        for i, step in enumerate(steps):
+            cx = bx + margin + (span * i / max(n - 1, 1))
+            color = step.get("color", "#1D2CAB")
+            label = step.get("label", f"Step {i + 1}")
+            detail = step.get("detail", "")
+            parts.append(
+                f'<circle cx="{cx:g}" cy="{axis_y:g}" r="10" '
+                f'fill="{color}"/>'
+            )
+            parts.append(
+                f'<text x="{cx:g}" y="{axis_y + 4:g}" text-anchor="middle" '
+                f'font-size="11" font-weight="bold" fill="#FFFFFF">'
+                f'{i + 1}</text>'
+            )
+            # Connector line to next node (path so we don't need a
+            # marker definition, same trick as flow-steps).
+            if i < n - 1:
+                next_cx = bx + margin + (span * (i + 1) / max(n - 1, 1))
+                parts.append(
+                    f'<line x1="{cx + 12:g}" y1="{axis_y:g}" '
+                    f'x2="{next_cx - 12:g}" y2="{axis_y:g}" '
+                    f'stroke="{color}" stroke-width="2" '
+                    f'stroke-opacity="0.5"/>'
+                )
+            # Label above the node.
+            parts.append(
+                f'<text x="{cx:g}" y="{axis_y - 24:g}" text-anchor="middle" '
+                f'font-size="14" font-weight="bold" fill="{color}">'
+                f'{_escape(str(label))}</text>'
+            )
+            # Detail below the node.
+            if detail:
+                parts.append(
+                    f'<text x="{cx:g}" y="{axis_y + 36:g}" '
+                    f'text-anchor="middle" font-size="12" fill="#222">'
+                    f'{_escape(str(detail))}</text>'
+                )
         return "\n".join(parts)
     raise ValueError(f"unsupported new_content_block layout: {layout!r}")
 
