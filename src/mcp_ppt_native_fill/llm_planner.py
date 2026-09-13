@@ -95,6 +95,23 @@ Rules
   on the body area. Do not emit a content clone without a `new_blocks`
   body.
 
+Composition Patterns (Phase B, Bug 3) — pick layout by content shape,
+NOT by template slot. The default of "always 3-column-cards" makes
+cloned content pages look identical and rigid. Vary the layout based
+on what the section is actually saying:
+
+  * 1 big claim / single KPI / total (e.g. "5 章", "200 万") → ``hero-number``
+  * 1 motto / quote / center thesis (e.g. "秉公办事、维护公司利益") → ``callout-box``
+  * 2 juxtaposed alternatives / contrast (e.g. "公开招标 vs 邀请招标") → ``two-column-compare``
+  * 5+ ordered steps in time (e.g. "申请 → 审批 → 采购 → 验收入库") → ``timeline`` (or ``flow-steps`` if 2-4 steps)
+  * 4+ parallel peer items (≤3 columns of comparable things) → ``3-column-cards``
+  * version / revision history (date / status / author) → ``revision-table``
+  * dense paragraphs with no clear structure → ``3-column-cards`` (default fallback)
+
+At least ONE cloned content page per deck should use a non-default
+layout (``hero-number``, ``callout-box``, ``two-column-compare``, or
+``timeline``) so the deck doesn't look templated.
+
 Output format (return ONLY this JSON object)
 --------------------------------------------
 {
@@ -144,6 +161,10 @@ Available layouts for `new_blocks`:
 - `3-column-cards` (1-4 cards; spec.cards = [{title, color, items}])
 - `flow-steps` (2-5 ordered steps; spec.steps = [{title, items}])
 - `revision-table` (header + rows; spec.rows = [{date, status, content, author}])
+- `hero-number` (centered KPI; spec.value, spec.unit?, spec.caption?)
+- `callout-box` (tinted quote panel; spec.quote, spec.attribution?)
+- `two-column-compare` (juxtaposition; spec.left={title, items}, spec.right={title, items})
+- `timeline` (2-5 ordered nodes on a horizontal axis; spec.steps=[{label, detail, color?}])
 - `raw` (caller supplied SVG; spec.svg = "<svg>...</svg>")
 
 If the markdown has no usable content for any shape, return `{}` for
@@ -283,6 +304,46 @@ def _read_md(md_path: Path) -> str:
         raise PlannerError(f"content_markdown is not utf-8: {exc}") from exc
 
 
+def _geometry_based_max_chars(grp: Any, text: Any) -> int | None:
+    """Compute ``max_chars`` from the shape's frame geometry + font-size.
+
+    Uses ``mcp_ppt_native_fill.text_width.chars_that_fit`` which is a
+    fork of ppt-master's ``svg_to_pptx/drawingml/utils.py`` per-character
+    width estimator. We binary-search a CJK and a Latin sample and
+    return the tighter cap so neither language overflows.
+
+    Returns ``None`` to signal the caller should fall back to the
+    placeholder-length heuristic when frame or font-size info is
+    missing.
+    """
+    from mcp_ppt_native_fill.text_width import chars_that_fit
+    frame_attr = grp.get("data-pptx-frame")
+    if not frame_attr:
+        return None
+    parts = frame_attr.split()
+    if len(parts) < 4:
+        return None
+    try:
+        _, _, w, _ = (float(p) for p in parts[:4])
+    except ValueError:
+        return None
+    if w <= 0:
+        return None
+    fs_attr = text.get("font-size")
+    if not fs_attr:
+        return None
+    try:
+        fs = float(fs_attr)
+    except ValueError:
+        return None
+    if fs <= 0:
+        return None
+    # font_weight: bold bumps latin 5 %, ignored by CJK (CJK fonts
+    # already render bold glyphs the same width).
+    weight = text.get("font-weight") or "400"
+    return chars_that_fit(w, fs, font_weight=str(weight))
+
+
 def _scan_text_shapes(workspace: Path) -> dict[str, dict[str, Any]]:
     """Parse every ``authoring-svg-flat/*.svg`` and return a per-slide map of
     editable text shapes. Each entry is::
@@ -295,15 +356,40 @@ def _scan_text_shapes(workspace: Path) -> dict[str, dict[str, Any]]:
     text without overflowing. Empty placeholders default to a conservative
     24 chars (one short headline).
 
+    TOC slides get a tighter per-font-size cap (Phase B, Bug 2): the
+    generic placeholder-length heuristic gives 28-30 chars which lets
+    the LLM write long chapter headings and leave a large blank gap
+    under each item. TOC chapter title slots are typically 24-32pt and
+    the rendered frame fits ~8 CJK chars comfortably; subtitle slots
+    are 14-18pt and fit ~6 chars. We honor the tighter of the two so
+    the LLM keeps titles short.
+
+    Non-TOC slides use a frame-geometry-aware cap (Phase B+, fix #2):
+    when the shape's ``data-pptx-frame`` attribute is parseable, we
+    compute ``frame_width / font_size`` (CJK chars render ~1.0× the
+    font-size; mixed Latin chars ~0.55×) and apply a 0.85 safety
+    factor so the LLM's text always fits. This catches the boteng
+    template's narrow cover title (47pt in a 681px frame ≈ 14 chars)
+    and section title (23pt in a 427px frame ≈ 16 chars) without
+    forcing us to hardcode per-template magic numbers. The
+    placeholder-length heuristic is kept as a fallback when frame
+    info is missing.
+
     Uses the same repair pipeline as ``autofix._parse_svg`` so vendor SVG
     quirks (duplicate attributes, unescaped inner quotes) don't trip the
     parser.
     """
     from . import autofix  # local import to avoid circular at module load
+    import re  # local — only used for the TOC eligibility check below
 
     flat = workspace / "authoring-svg-flat"
     if not flat.is_dir():
         raise PlannerError(f"authoring-svg-flat not found: {flat}")
+    # Pre-compute the per-slide skeleton role once. The boteng template
+    # has 10-12 TOC slots on slide_02; we want all of them tightened
+    # without changing the schema (still {shape_id: {placeholder,
+    # max_chars}}).
+    skeleton_kind = _detect_skeleton_kind(workspace).get("skeleton_kind", {})
     index: dict[str, dict[str, Any]] = {}
     for svg_path in sorted(flat.glob("*.svg")):
         try:
@@ -312,6 +398,19 @@ def _scan_text_shapes(workspace: Path) -> dict[str, dict[str, Any]]:
             log.warning("planner: skip %s (%s)", svg_path.name, exc)
             continue
         svg_ns = "{http://www.w3.org/2000/svg}"
+        # Restrict the Bug 2 tight cap to ORIGINAL slide_NN.svg files
+        # only. Cloned slides (slide_partNN_*.svg) inherit the slide_04
+        # (content) skeleton's shape IDs, but _detect_skeleton_kind may
+        # misclassify them as "toc" if the previous run's LLM edits left
+        # lots of text on the page. The cap is meant for the catalog
+        # page, not content clones.
+        is_original_skeleton = bool(
+            re.fullmatch(r"slide_\d+\.svg", svg_path.name)
+        )
+        is_toc_slide = (
+            is_original_skeleton
+            and skeleton_kind.get(svg_path.name) == "toc"
+        )
         per_slide: dict[str, Any] = {}
         # Strategy: find every <g id="shape-XX"> and pull the text content of
         # its descendant <text>/> children. If a <g> has no id but contains
@@ -331,7 +430,29 @@ def _scan_text_shapes(workspace: Path) -> dict[str, dict[str, Any]]:
             # tends to tolerate a bit more), floored at 24 so empty slots
             # still get a usable budget.
             base = max(len(placeholder), 24)
-            max_chars = int(base * 1.2)
+            heuristic = int(base * 1.2)
+            # Bug 2 fix (Phase B): on TOC slides, override the generic
+            # heuristic with a font-size-aware cap so chapter titles
+            # stay short. Big-font slots (title, ≥24pt) → 8 chars;
+            # small-font slots (subtitle, <24pt) → 6 chars. The min()
+            # preserves the original heuristic for unusually small frames
+            # (so we never loosen the cap).
+            if is_toc_slide and texts:
+                fs = float(texts[0].get("font-size") or 16)
+                cap = 8 if fs >= 24 else 6
+                max_chars = min(heuristic, cap)
+            else:
+                # Phase B+ fix #2 (frame-geometry): prefer frame_width /
+                # font_size over the placeholder-length heuristic when
+                # both are parseable. CJK glyphs render ~1.0× font-size
+                # in the boteng template's "微软雅黑" / "思源黑体 CN"
+                # stacks; Latin glyphs ~0.55×. 0.85 safety factor leaves
+                # 15% headroom for letter-spacing / hinting artifacts.
+                geom_cap = _geometry_based_max_chars(grp, texts[0])
+                max_chars = (
+                    min(heuristic, geom_cap) if geom_cap is not None
+                    else heuristic
+                )
             per_slide[gid] = {
                 "placeholder": placeholder,
                 "max_chars": max_chars,
@@ -731,7 +852,9 @@ def _normalize_new_blocks(raw: Any) -> list[dict[str, Any]]:
             log.warning("new_block %s missing bounds; dropping", svg)
             continue
         if layout not in {"3-column-cards", "flow-steps",
-                          "revision-table", "raw"}:
+                          "revision-table", "raw",
+                          "hero-number", "callout-box",
+                          "two-column-compare", "timeline"}:
             log.warning(
                 "new_block %s uses unsupported layout %r; dropping",
                 svg, layout,
@@ -765,6 +888,53 @@ def _normalize_new_blocks(raw: Any) -> list[dict[str, Any]]:
         elif layout == "raw":
             if not isinstance(spec.get("svg"), str) or not spec["svg"]:
                 log.warning("raw new_block requires spec.svg; dropping")
+                continue
+        elif layout == "hero-number":
+            if not isinstance(spec.get("value"), str) or not spec["value"]:
+                log.warning(
+                    "hero-number requires spec.value (string); dropping"
+                )
+                continue
+        elif layout == "callout-box":
+            if not isinstance(spec.get("quote"), str) or not spec["quote"]:
+                log.warning(
+                    "callout-box requires spec.quote (string); dropping"
+                )
+                continue
+        elif layout == "two-column-compare":
+            left = spec.get("left")
+            right = spec.get("right")
+            if not (isinstance(left, dict) and isinstance(right, dict)):
+                log.warning(
+                    "two-column-compare requires spec.left and spec.right "
+                    "(objects); dropping"
+                )
+                continue
+            compare_ok = True
+            for side_name, side in (("left", left), ("right", right)):
+                if not isinstance(side.get("title"), str) or not side["title"]:
+                    log.warning(
+                        "two-column-compare spec.%s.title required; dropping",
+                        side_name,
+                    )
+                    compare_ok = False
+                    break
+                if not isinstance(side.get("items"), list):
+                    log.warning(
+                        "two-column-compare spec.%s.items must be list; "
+                        "dropping", side_name,
+                    )
+                    compare_ok = False
+                    break
+            if not compare_ok:
+                continue
+        elif layout == "timeline":
+            steps = spec.get("steps") or []
+            if not 2 <= len(steps) <= 5:
+                log.warning(
+                    "timeline requires 2-5 steps, got %d; dropping",
+                    len(steps),
+                )
                 continue
         block_id = entry.get("id") or f"new-block-{len(cleaned) + 1}"
         cleaned.append({
