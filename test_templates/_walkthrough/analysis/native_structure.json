@@ -1,0 +1,224 @@
+{
+  "schema": "ppt-master.native-structure.v1",
+  "source": {
+    "name": "柏腾ppt模版.pptx",
+    "templateFile": "sources/source.pptx",
+    "sha256": "fe8b2e1067742f7cf3cc76c152f0b0f2ccfa2c89065d9542228f650770923b6c"
+  },
+  "slideSize": {
+    "width_emu": 12192000,
+    "height_emu": 6858000,
+    "width_px": 1280.0,
+    "height_px": 720.0
+  },
+  "strategy": {
+    "preservationEligible": true,
+    "reusableStructureDetected": false,
+    "recommendedMode": "template",
+    "recommendationScope": "source-structure-assessment",
+    "templateOutputMode": "template",
+    "downstreamTemplateAdherence": "strategist-confirmed-explicit-structure",
+    "hasMultipleMasters": false,
+    "reasonCodes": [
+      "source-structure-is-minimal"
+    ]
+  },
+  "masters": [
+    {
+      "key": "master_01",
+      "name": "slideMaster1",
+      "packagePart": "ppt/slideMasters/slideMaster1.xml",
+      "themePart": null,
+      "theme": {
+        "colors": {},
+        "fonts": {}
+      },
+      "backgroundAsset": null,
+      "imageAssets": [],
+      "shapeImageAssets": [],
+      "drawableShapeCount": 0,
+      "placeholders": [],
+      "layoutKeys": [
+        "layout_01",
+        "layout_02",
+        "layout_03",
+        "layout_04"
+      ]
+    }
+  ],
+  "layouts": [
+    {
+      "key": "layout_01",
+      "name": "标题幻灯片",
+      "type": null,
+      "packagePart": "ppt/slideLayouts/slideLayout1.xml",
+      "masterKey": "master_01",
+      "showMasterShapes": true,
+      "backgroundAsset": null,
+      "imageAssets": [],
+      "shapeImageAssets": [],
+      "drawableShapeCount": 0,
+      "placeholders": [],
+      "usedBySlides": [
+        2
+      ],
+      "svgFile": null
+    },
+    {
+      "key": "layout_02",
+      "name": "标题和内容",
+      "type": null,
+      "packagePart": "ppt/slideLayouts/slideLayout2.xml",
+      "masterKey": "master_01",
+      "showMasterShapes": true,
+      "backgroundAsset": null,
+      "imageAssets": [],
+      "shapeImageAssets": [],
+      "drawableShapeCount": 0,
+      "placeholders": [],
+      "usedBySlides": [
+        1,
+        3,
+        4,
+        5
+      ],
+      "svgFile": null
+    },
+    {
+      "key": "layout_03",
+      "name": "节标题",
+      "type": null,
+      "packagePart": "ppt/slideLayouts/slideLayout3.xml",
+      "masterKey": "master_01",
+      "showMasterShapes": true,
+      "backgroundAsset": null,
+      "imageAssets": [],
+      "shapeImageAssets": [],
+      "drawableShapeCount": 0,
+      "placeholders": [],
+      "usedBySlides": [],
+      "svgFile": null
+    },
+    {
+      "key": "layout_04",
+      "name": "空白",
+      "type": null,
+      "packagePart": "ppt/slideLayouts/slideLayout4.xml",
+      "masterKey": "master_01",
+      "showMasterShapes": true,
+      "backgroundAsset": null,
+      "imageAssets": [],
+      "shapeImageAssets": [],
+      "drawableShapeCount": 0,
+      "placeholders": [
+        {
+          "type": "dt",
+          "idx": "10",
+          "size": "half",
+          "orient": null,
+          "semanticRole": "date",
+          "shapeId": "2",
+          "shapeName": "日期占位符 1",
+          "geometry": {
+            "x": 88,
+            "y": 667,
+            "width": 288,
+            "height": 38
+          },
+          "textSamples": []
+        },
+        {
+          "type": "ftr",
+          "idx": "11",
+          "size": "quarter",
+          "orient": null,
+          "semanticRole": "footer",
+          "shapeId": "3",
+          "shapeName": "页脚占位符 2",
+          "geometry": {
+            "x": 424,
+            "y": 667,
+            "width": 432,
+            "height": 38
+          },
+          "textSamples": []
+        },
+        {
+          "type": "sldNum",
+          "idx": "12",
+          "size": "quarter",
+          "orient": null,
+          "semanticRole": "slide-number",
+          "shapeId": "4",
+          "shapeName": "灯片编号占位符 3",
+          "geometry": {
+            "x": 904,
+            "y": 667,
+            "width": 288,
+            "height": 38
+          },
+          "textSamples": []
+        }
+      ],
+      "usedBySlides": [],
+      "svgFile": null
+    }
+  ],
+  "slides": [
+    {
+      "index": 1,
+      "packagePart": "ppt/slides/slide1.xml",
+      "pageType": null,
+      "layoutKey": "layout_02",
+      "masterKey": "master_01",
+      "showInheritedShapes": true,
+      "placeholders": [],
+      "layeredSvgFile": "slide_01.svg",
+      "flatSvgFile": null
+    },
+    {
+      "index": 2,
+      "packagePart": "ppt/slides/slide2.xml",
+      "pageType": null,
+      "layoutKey": "layout_01",
+      "masterKey": "master_01",
+      "showInheritedShapes": true,
+      "placeholders": [],
+      "layeredSvgFile": "slide_02.svg",
+      "flatSvgFile": null
+    },
+    {
+      "index": 3,
+      "packagePart": "ppt/slides/slide3.xml",
+      "pageType": null,
+      "layoutKey": "layout_02",
+      "masterKey": "master_01",
+      "showInheritedShapes": true,
+      "placeholders": [],
+      "layeredSvgFile": "slide_03.svg",
+      "flatSvgFile": null
+    },
+    {
+      "index": 4,
+      "packagePart": "ppt/slides/slide4.xml",
+      "pageType": null,
+      "layoutKey": "layout_02",
+      "masterKey": "master_01",
+      "showInheritedShapes": true,
+      "placeholders": [],
+      "layeredSvgFile": "slide_04.svg",
+      "flatSvgFile": null
+    },
+    {
+      "index": 5,
+      "packagePart": "ppt/slides/slide5.xml",
+      "pageType": null,
+      "layoutKey": "layout_02",
+      "masterKey": "master_01",
+      "showInheritedShapes": true,
+      "placeholders": [],
+      "layeredSvgFile": "slide_05.svg",
+      "flatSvgFile": null
+    }
+  ]
+}
