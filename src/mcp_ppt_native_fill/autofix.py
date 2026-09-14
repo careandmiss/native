@@ -286,11 +286,17 @@ def fix_text_overflow(
     shape_ids: Iterable[str],
     *,
     shrink_factor: float = 0.85,
+    min_readable_font: float = 8.0,
 ) -> list[AutoFixRecord]:
     """Shrink ``font-size`` on the listed shapes by ``shrink_factor``.
 
-    Returns one record per shape actually shrunk. Skips shapes whose
-    font-size cannot be parsed as a unitless positive number (per master §5.5).
+    If shrinking would push the font below ``min_readable_font`` (8pt by
+    default), the text content is truncated instead — repeated shrink
+    rounds below the readable limit produce illegible output (Bug 11 fix).
+
+    Returns one record per shape actually shrunk OR truncated. Skips
+    shapes whose font-size cannot be parsed as a unitless positive
+    number (per master §5.5).
     """
     records: list[AutoFixRecord] = []
     if not shape_ids:
@@ -311,17 +317,46 @@ def fix_text_overflow(
             except ValueError:
                 continue
             new_fs = round(old_fs * shrink_factor, 2)
-            text.set("font-size", f"{new_fs:g}")
-            records.append(
-                AutoFixRecord(
-                    slide=svg_path.name,
-                    issue="text_overflow",
-                    action="shrink_font_size",
-                    before=old_fs,
-                    after=new_fs,
-                    detail=f"shape={gid} factor={shrink_factor}",
+            if new_fs >= min_readable_font:
+                text.set("font-size", f"{new_fs:g}")
+                records.append(
+                    AutoFixRecord(
+                        slide=svg_path.name,
+                        issue="text_overflow",
+                        action="shrink_font_size",
+                        before=old_fs,
+                        after=new_fs,
+                        detail=f"shape={gid} factor={shrink_factor}",
+                    )
                 )
-            )
+            else:
+                # Bug 11 fix: truncate instead of pushing below readable
+                # limit. Keep the original font-size (don't shrink) and
+                # shorten the text content to ~ (min_readable / old_fs)
+                # of its original length + ellipsis marker.
+                full_text = "".join(text.itertext())
+                ratio = min_readable_font / old_fs if old_fs > 0 else 0.5
+                keep_chars = max(1, int(len(full_text) * ratio))
+                # Trim back to a safe codepoint boundary; CJK-safe via
+                # plain slicing on Python strings (they're codepoint
+                # sequences, not bytes).
+                truncated = full_text[:keep_chars].rstrip()
+                if len(truncated) < len(full_text):
+                    truncated = truncated + "…"
+                text.text = truncated
+                records.append(
+                    AutoFixRecord(
+                        slide=svg_path.name,
+                        issue="text_overflow",
+                        action="truncate_text",
+                        before=len(full_text),
+                        after=len(truncated),
+                        detail=(f"shape={gid} shrink would push "
+                                f"font to {new_fs}pt < {min_readable_font}pt "
+                                f"min; truncated {len(full_text)}→"
+                                f"{len(truncated)} chars"),
+                    )
+                )
             break  # one fix per shape group is enough
 
     if records:

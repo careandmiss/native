@@ -386,6 +386,42 @@ class AutofixTests(unittest.TestCase):
             # file now reflects new font-size
             self.assertIn('font-size="34"', svg.read_text(encoding="utf-8"))
 
+    def test_fix_text_overflow_truncates_below_min_font(self):
+        """Bug 11 (Phase C3): when a small starting font (10pt) is
+        shrunk by the 0.85 factor repeatedly, after several rounds the
+        result would be unreadable (< 8pt). The fix must truncate the
+        text instead of continuing to shrink below the readable limit."""
+        from mcp_ppt_native_fill import autofix
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            svg = td / "slide_07.svg"
+            # 10pt starting font with long overflowing text. Default
+            # shrink_factor is 0.85 — 10 * 0.85 = 8.5 (still readable
+            # on first call). Simulate a second overflow round by
+            # calling again with 8.5pt font (write_text already set
+            # to 8.5pt). The fix must observe the MIN_READABLE_FONT
+            # floor and truncate rather than shrink to < 8pt.
+            svg.write_text(
+                '<?xml version="1.0"?>\n'
+                '<svg xmlns="http://www.w3.org/2000/svg" '
+                'viewBox="0 0 1280 720">'
+                '<g id="shape-9">'
+                '<text font-size="9">'
+                '采购审批流程 8 个步骤包括计划、审批、询价、议价、定购、'
+                '验收、入库、付款等环节，每个环节都需要严格的审批流程。'
+                '</text>'
+                '</g></svg>',
+                encoding="utf-8",
+            )
+            # 9pt → 9 * 0.85 = 7.65 (below 8pt floor) → must truncate.
+            records = autofix.fix_text_overflow(svg, ["shape-9"])
+            content = svg.read_text(encoding="utf-8")
+            self.assertEqual(len(records), 1)
+            # The action must NOT be "shrink_font_size" pushing < 8pt.
+            if records[0].action == "shrink_font_size":
+                self.assertGreaterEqual(records[0].after, 8.0,
+                    "shrink result must stay above MIN_READABLE_FONT (8pt)")
+
     def test_detect_overflow_shapes(self):
         stdout = (
             "slide_01.svg: shape-3 exceeds owning frame ... "
@@ -2081,6 +2117,37 @@ class NewBlockLayoutTests(unittest.TestCase):
         self.assertIn("#1D2CAB", out)
         self.assertIn("#EE822F", out)
 
+    def test_3_column_cards_truncates_overflow_items(self):
+        """Bug 05 (Phase C3): when items list is longer than what fits
+        in the card height, items must be truncated at the bottom edge
+        rather than overflowing the bounds (which the quality checker
+        flags as a blocking overflow)."""
+        import re
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        out = _render_new_block({
+            "layout": "3-column-cards",
+            "bounds": "120 130 1060 200",  # short bh = 200
+            "spec": {"cards": [
+                {"title": "X", "color": "#000",
+                 "items": [f"item{i}" for i in range(30)]},  # 30 items
+            ]},
+        })
+        # Items render at font-size=14, starting at y = by + 64 = 194.
+        # Each item is 22 px below the previous.
+        # Without truncation: items go to y = 194 + 29*22 = 832 (overflow).
+        text_y_re = re.compile(
+            r'<text x="[\d.]+" y="([\d.]+)" font-size="14"[^>]*>([^<]+)</text>'
+        )
+        ys = [float(m.group(1)) for m in text_y_re.finditer(out)]
+        item_ys = [y for y in ys if y >= 194]
+        self.assertGreater(len(item_ys), 0, "expected at least one item")
+        max_item_y = max(item_ys)
+        self.assertLessEqual(
+            max_item_y, 130 + 200 - 8,
+            f"3-column-cards overflow: last item at y={max_item_y}, "
+            f"but bounds end at y={130 + 200 - 8}"
+        )
+
     def test_flow_steps_renders_with_arrows(self):
         from mcp_ppt_native_fill.pipeline import _render_new_block
         out = _render_new_block({
@@ -2137,6 +2204,31 @@ class NewBlockLayoutTests(unittest.TestCase):
         self.assertIn("章", out)
         self.assertIn("制度总章数", out)
         self.assertIn("text-anchor=\"middle\"", out)
+
+    def test_hero_number_scales_font_to_short_bounds(self):
+        """Bug 12 (Phase C3): when bh is small (e.g. 50px), a fixed 72pt
+        font-size overflows the bounds (a 72pt glyph is ~90px tall, so
+        its baseline is at by + bh * 0.55 but the visual top of the
+        glyph is ~80px above the baseline). The fix must scale
+        font-size down so the rendered glyph stays inside bounds."""
+        import re
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        out = _render_new_block({
+            "layout": "hero-number",
+            "bounds": "0 0 200 50",  # very short bh
+            "spec": {"value": "100"},
+        })
+        # Pull out the value <text> font-size attribute. Must be ≤
+        # ~35 (bh * 0.5 = 25 minimum to fit glyph + caption).
+        match = re.search(
+            r'<text x="[\d.]+" y="[\d.]+" text-anchor="middle" '
+            r'font-size="([\d.]+)"', out)
+        self.assertIsNotNone(match)
+        fs = float(match.group(1))
+        self.assertLess(fs, 72,
+            f"hero-number font-size {fs} must shrink below default 72 "
+            f"when bh is only 50px")
+        self.assertGreater(fs, 0)
 
     def test_hero_number_rejects_missing_value(self):
         from mcp_ppt_native_fill.pipeline import _render_new_block
@@ -2212,6 +2304,7 @@ class NewBlockLayoutTests(unittest.TestCase):
         blocking overflow)."""
         import re
         from mcp_ppt_native_fill.pipeline import _render_new_block
+        from mcp_ppt_native_fill.text_width import estimate_text_width
         # bounds 120 130 1060 480 → x range [120, 1180]. With 5 nodes
         # and ~20-char detail text, naive margin=40 overflows by ~70px.
         out = _render_new_block({
@@ -2226,21 +2319,68 @@ class NewBlockLayoutTests(unittest.TestCase):
                 {"label": "L5", "detail": "交期控制"},
             ]},
         })
-        # Pull out the first detail <text> x coordinate and check it
-        # + estimated half-width stays inside [120, 1180].
-        # The first node's detail text uses font-size=12 with
-        # text-anchor="middle"; estimate width ~6.3 px per mixed char.
-        # We assert no <text> x < 120 - half_width for any detail line.
+        # Use the real width estimator (CJK = 1em, Latin = 0.55em)
+        # instead of the naive ``len() * 6.3`` heuristic so the test
+        # passes after the Phase C3 fix that switched the margin
+        # formula to estimate_text_width.
         match = re.search(r'<text x="([\d.]+)" y="([\d.]+)" '
                           r'text-anchor="middle" font-size="12" '
                           r'fill="#222">([^<]+)</text>', out)
         self.assertIsNotNone(match, "expected a centered 12px detail text")
         x = float(match.group(1))
         text = match.group(3)
-        half_w = len(text) * 6.3
-        self.assertGreaterEqual(x - half_w, 120 - 5,
+        real_w = estimate_text_width(text, font_size=12.0)
+        half_w = real_w / 2
+        # x must be at least 120 + half_w (so x - half_w >= 120).
+        self.assertGreaterEqual(x - half_w, 120 - 1,
             f"first timeline detail '{text}' at x={x} overflows left "
-            f"bound 120 (estimated half-width {half_w:.1f})")
+            f"bound 120 (real half-width {half_w:.1f}, real_w {real_w:.1f})")
+
+    def test_timeline_margin_uses_cjk_aware_width(self):
+        """Bug 03 (Phase C3): when the widest detail is dense CJK,
+        the timeline margin must accommodate the real text width, not
+        the naive ``len() * 6.3`` heuristic that assumes Latin widths.
+
+        For 12 CJK chars at font-size 12:
+          real width  ≈ 12 * 12 = 144 px (CJK = 1em)
+          naive width = 12 * 6.3 = 75.6 px (Latin heuristic)
+        The naive formula underestimates by ~70px, so the first node's
+        centered detail text overflows the left bounds by that amount.
+        The fix uses text_width.estimate_text_width for accurate widths.
+        """
+        import re
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        out = _render_new_block({
+            "layout": "timeline",
+            "bounds": "120 130 1060 480",
+            "spec": {"steps": [
+                {"label": "A", "detail": "国家发展改革委审批采购验"},  # 12 CJK
+                {"label": "B", "detail": "提交申请"},
+                {"label": "C", "detail": "采购验收"},
+            ]},
+        })
+        cjk_text = "国家发展改革委审批采购验"
+        # Conservative real-width estimate: 12 CJK chars × 12 px/char
+        # = 144 px. Half = 72 px. The fixed margin formula must put
+        # x ≥ 120 (left bound) + half_w + 10 headroom = 202.
+        # The naive formula gave x = 120 + 12*6.3 + 10 = 205.6 —
+        # close, but the margin wasn't *derived* from real width.
+        # Stronger assertion: verify x corresponds to estimate_text_width
+        # output (not naive chars × 6.3).
+        from mcp_ppt_native_fill.text_width import estimate_text_width
+        real_w = estimate_text_width(cjk_text, font_size=12.0)
+        # First timeline detail <text> at font-size 12.
+        match = re.search(r'<text x="([\d.]+)" y="([\d.]+)" '
+                          r'text-anchor="middle" font-size="12" '
+                          r'fill="#222">([^<]+)</text>', out)
+        self.assertIsNotNone(match, "expected a centered 12px detail text")
+        x = float(match.group(1))
+        # x must equal bx (=120) + margin, where margin ≥ real_w / 2 + 10.
+        expected_min_x = 120 + real_w / 2 + 10
+        self.assertGreaterEqual(x, expected_min_x - 0.5,
+            f"first timeline detail '{cjk_text}' at x={x} — "
+            f"margin ({x - 120:.1f}) too small for real_w={real_w:.1f} "
+            f"(need x ≥ {expected_min_x:.1f})")
 
     def test_normalize_accepts_new_layouts(self):
         """Bug 3 fix: _normalize_new_blocks accepts all 4 new layouts

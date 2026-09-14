@@ -1456,6 +1456,12 @@ def _render_new_block(spec: dict[str, Any]) -> str:
             )
             for j, item in enumerate(items):
                 ty = by + 64 + j * 22
+                # Bug 05 fix: stop rendering items that would fall
+                # below the card's bottom edge. Without this guard,
+                # LLM output with many items overflowed the bounds and
+                # the quality checker flagged it as a blocking overflow.
+                if ty > by + bh - 8:
+                    break
                 parts.append(
                     f'<text x="{cx + 16:g}" y="{ty:g}" font-size="14" '
                     f'fill="#222">{_escape(item)}</text>'
@@ -1577,11 +1583,16 @@ def _render_new_block(spec: dict[str, Any]) -> str:
         bx, by, bw, bh = (float(t) for t in bounds.split())
         parts: list[str] = []
         cx = bx + bw / 2
+        # Bug 12 fix: shrink font-size to fit short bounds. A 72pt glyph
+        # is ~90px tall, so for bh < ~140px the rendered glyph overflows
+        # the top of the bounds. Scale font down to bh * 0.5 (gives the
+        # glyph ~half the bounds height, leaving room for caption below).
+        fs = min(72.0, max(12.0, bh * 0.5))
         # Centered baseline of the big number.
         value_y = by + bh * 0.55
         parts.append(
             f'<text x="{cx:g}" y="{value_y:g}" text-anchor="middle" '
-            f'font-size="72" font-weight="bold" fill="#1D2CAB">'
+            f'font-size="{fs:g}" font-weight="bold" fill="#1D2CAB">'
             f'{_escape(value)}{_escape(unit)}</text>'
         )
         # Caption below.
@@ -1689,13 +1700,17 @@ def _render_new_block(spec: dict[str, Any]) -> str:
         # Adaptive left/right margin: must be large enough that the
         # leftmost / rightmost text (text-anchor="middle") does not
         # bleed outside the declared bounds. Estimate the widest detail
-        # string at ~12.6 px per mixed char at 12px (CJK + ASCII), so
-        # half-width = chars * 6.3. Add 10 px headroom.
-        widest = max(
-            (len(str(s.get("detail", ""))) for s in steps),
-            default=0,
+        # string with text_width.estimate_text_width so CJK chars are
+        # correctly counted at 1.0em (vs Latin 0.55em). Bug 03 fix:
+        # the previous ``len() * 6.3`` heuristic assumed Latin widths
+        # and underestimated CJK-heavy detail by up to 50%.
+        from .text_width import estimate_text_width
+        widest_px = max(
+            (estimate_text_width(str(s.get("detail", "")), font_size=12.0)
+             for s in steps),
+            default=0.0,
         )
-        margin = max(40.0, widest * 6.3 + 10.0)
+        margin = max(40.0, widest_px / 2 + 10.0)
         # Clamp margin so span stays positive.
         margin = min(margin, bw / 2 - 10.0)
         span = bw - 2 * margin
