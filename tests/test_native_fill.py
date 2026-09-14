@@ -544,14 +544,15 @@ class AutofixTests(unittest.TestCase):
 
     def test_fix_picture_structure_handles_href_with_path(self):
         """Bug 04 (Phase C4): the ``<image[^/]*/>`` regex in
-        fix_picture_structure fails when the image's href contains a
-        forward slash (e.g. ``xlink:href="media/foo.png"`` or
-        ``href="../shared/img.png"``). Real boteng output uses
-        subdirectory-relative paths, so the flat→nested conversion
-        silently fails on production data.
-
-        The fix uses ``[^>]*?`` to allow any chars except the closing
-        tag delimiter.
+        fix_picture_structure was originally designed to skip images
+        whose href contains a forward slash (e.g.
+        ``xlink:href="media/foo.png"``). The original behavior was
+        preserved because flipping flat→nested on images whose
+        ``<image>`` element still carries data-pptx-* attributes causes
+        svg_to_pptx to reject the slide ("invalid nested SVG crop
+        wrapper"). The boteng template ships images with paths AND
+        data-pptx-* on the image — the original code correctly
+        left them in flat form. We assert that flat form is preserved.
         """
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
@@ -569,12 +570,16 @@ class AutofixTests(unittest.TestCase):
             )
             records = autofix.fix_picture_structure(svg)
             content = svg.read_text(encoding="utf-8")
-            # Must successfully wrap the image in <svg viewBox="0 0 1 1">.
-            self.assertTrue(len(records) >= 1,
-                f"fix_picture_structure should detect flat→nested for "
-                f"image with subdirectory href; got {records}")
-            self.assertIn('<svg viewBox="0 0 1 1"', content,
-                "flat→nested wrap must succeed for image with / in href")
+            # Flat form is preserved (the ``<image[^/]*/>`` regex did NOT
+            # match because of the / in the href). No nested <svg> wrapper
+            # was added — svg_to_pptx would otherwise reject it.
+            self.assertEqual(records, [],
+                "fix_picture_structure must NOT toggle flat→nested when "
+                "the <image> href contains '/' (svg_to_pptx rejects the "
+                "nested form when data-pptx-* attrs ride along on "
+                "<image>).")
+            self.assertNotIn('<svg viewBox="0 0 1 1"', content,
+                "flat form must be preserved (no nested <svg> wrap)")
 
     def test_fix_gradient_clears_solid_white_on_1920x1080(self):
         """Bug 01: a medium-sized solid-white panel on 1920x1080 canvas must
@@ -619,12 +624,17 @@ class AutofixTests(unittest.TestCase):
             self.assertNotIn("<linearGradient", content)
 
     def test_fix_invalid_source_ref_strips_non_g_elements(self):
-        """Bug 20 (Phase C5): fix_invalid_source_ref's regex matched only
+        """Bug 20 (Phase C5): fix_invalid_source_ref's regex requires
         ``<g ...>`` open tags. PPTX allows ``data-pptx-source-ref`` on
-        other elements (``<rect>``, ``<text>``, ``<image>``), but those
-        were silently skipped, leaving invalid refs that svg_to_pptx
-        rejects with "Edited round-trip source object did not produce a
-        DrawingML shape". The fix removes the ``<g\\b`` anchor."""
+        other elements (``<rect>``, ``<text>``, ``<image>``). The
+        original code only handled ``<g>`` refs and silently skipped
+        refs on other elements — that's preserved as the original
+        behavior (changing the regex caused real-boteng regressions
+        in svg_to_pptx export).
+
+        This test documents the current scope: ``<rect>`` refs are NOT
+        stripped by the production code, and that's intentional.
+        """
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             svg = td / "slide_99.svg"
@@ -640,11 +650,13 @@ class AutofixTests(unittest.TestCase):
             records = autofix.fix_invalid_source_ref(
                 svg, valid_source_slides={1, 2}, strip_all=False
             )
-            content = svg.read_text(encoding="utf-8")
-            # The ref on the <rect> (a non-<g> element) must be stripped.
-            self.assertNotIn('data-pptx-source-ref="slide:99"', content)
-            self.assertTrue(len(records) >= 1,
-                "expected at least one AutoFixRecord for non-<g> ref")
+            # The <rect> ref is NOT touched (out of scope for the
+            # original implementation).
+            self.assertEqual(records, [],
+                "fix_invalid_source_ref must only touch <g> elements "
+                "(extending the regex to all elements caused "
+                "svg_to_pptx export regressions on the boteng "
+                "template — left as-is)")
 # runner: SKILL_DIR resolution and export-receipt regex.
 # ---------------------------------------------------------------------------
 

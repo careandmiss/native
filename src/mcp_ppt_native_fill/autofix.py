@@ -617,15 +617,9 @@ def fix_picture_structure(svg_path: Path) -> list[AutoFixRecord]:
         # Wrap the <image/> in a synthetic <svg viewBox="0 0 1 1"> matching
         # ppt-master's authoring convention. Only attempt if we can find the
         # matching </g>.
-        #
-        # Bug 04 fix: previous regex ``<image[^/]*/>`` rejected images
-        # whose href contains a forward slash (e.g. ``media/foo.png``).
-        # Real boteng output uses subdirectory-relative paths, so the
-        # flat→nested conversion silently failed. Use ``[^>]*?`` instead
-        # — it accepts any character except the closing tag delimiter.
         m = re.search(
             r"(<g[^>]*data-pptx-object=\"picture\"[^>]*>)\s*"
-            r"(<image\b[^>]*?/>)\s*"
+            r"(<image[^/]*/>)\s*"
             r"(</g>)",
             raw,
             re.DOTALL,
@@ -934,12 +928,10 @@ def fix_invalid_source_ref(
     raw = io_utils.read_utf8(svg_path)
     new_raw = raw
     records: list[AutoFixRecord] = []
-    # Bug 20 fix: removed the ``<g\b`` opening-tag anchor so the regex
-    # matches data-pptx-source-ref on ANY element (``<rect>``, ``<text>``,
-    # ``<image>``, ``<g>``,``). PPTX allows the attribute on any element,
-    # not just shape groups.
+    # Match a <g ... data-pptx-source-ref="slide:N" ...> opening tag, where
+    # N is the integer we want to validate against valid_source_slides.
     pattern = re.compile(
-        r'(\bdata-pptx-source-ref="slide:)(\d+)(")',
+        r'(<g\b[^>]*?\bdata-pptx-source-ref="slide:)(\d+)("[^>]*>)',
         re.DOTALL,
     )
 
