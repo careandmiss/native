@@ -618,8 +618,33 @@ class AutofixTests(unittest.TestCase):
             # The gradient defs must still be stripped (independent logic).
             self.assertNotIn("<linearGradient", content)
 
-
-# ---------------------------------------------------------------------------
+    def test_fix_invalid_source_ref_strips_non_g_elements(self):
+        """Bug 20 (Phase C5): fix_invalid_source_ref's regex matched only
+        ``<g ...>`` open tags. PPTX allows ``data-pptx-source-ref`` on
+        other elements (``<rect>``, ``<text>``, ``<image>``), but those
+        were silently skipped, leaving invalid refs that svg_to_pptx
+        rejects with "Edited round-trip source object did not produce a
+        DrawingML shape". The fix removes the ``<g\\b`` anchor."""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            svg = td / "slide_99.svg"
+            svg.write_text(
+                '<?xml version="1.0"?>\n'
+                '<svg xmlns="http://www.w3.org/2000/svg" '
+                'viewBox="0 0 1280 720">'
+                '<rect data-pptx-source-ref="slide:99" '
+                'x="0" y="0" width="100" height="100"/>'
+                '</svg>',
+                encoding="utf-8",
+            )
+            records = autofix.fix_invalid_source_ref(
+                svg, valid_source_slides={1, 2}, strip_all=False
+            )
+            content = svg.read_text(encoding="utf-8")
+            # The ref on the <rect> (a non-<g> element) must be stripped.
+            self.assertNotIn('data-pptx-source-ref="slide:99"', content)
+            self.assertTrue(len(records) >= 1,
+                "expected at least one AutoFixRecord for non-<g> ref")
 # runner: SKILL_DIR resolution and export-receipt regex.
 # ---------------------------------------------------------------------------
 
@@ -682,6 +707,31 @@ class RunnerTests(unittest.TestCase):
                 runner._DEFAULT_POSIX_SKILL_DIR = old_default_posix
                 runner._DEFAULT_WINDOWS_SKILL_DIR = old_default_win
             self.assertEqual(resolved, (td / "ppt-master").resolve())
+
+    def test_default_windows_skill_dir_uses_home(self):
+        """Bug 17 (Phase C5): _DEFAULT_WINDOWS_SKILL_DIR was hardcoded
+        to ``C:\\Users\\Administrator\\.claude\\skills\\ppt-master`` —
+        a path specific to one Windows account. Other Windows accounts
+        running the pipeline would never find their skill install.
+        The fix replaces the constant with a function that derives the
+        path from ``Path.home()`` so it works for any user."""
+        from pathlib import Path as _Path
+        import mcp_ppt_native_fill.runner as _runner
+        # The fix may have replaced the constant with a callable. Accept
+        # either form: a path matching Path.home()/.claude/skills/ppt-master.
+        expected = (_Path.home() / ".claude" / "skills" / "ppt-master").resolve()
+        actual_attr = getattr(_runner, "_DEFAULT_WINDOWS_SKILL_DIR", None)
+        self.assertIsNotNone(actual_attr, "_DEFAULT_WINDOWS_SKILL_DIR missing")
+        # If it's a callable, call it to get the path. Otherwise use as-is.
+        if callable(actual_attr):
+            actual = actual_attr().resolve()
+        else:
+            actual = actual_attr.resolve()
+        self.assertEqual(
+            actual, expected,
+            f"_DEFAULT_WINDOWS_SKILL_DIR must derive from Path.home(), "
+            f"got {actual}, expected {expected}"
+        )
 
     def test_parse_quality_summary(self):
         stdout = (
@@ -2273,6 +2323,48 @@ class NewBlockLayoutTests(unittest.TestCase):
         self.assertEqual(out.count("<path"), 2)
         self.assertIn("申请", out)
         self.assertIn("审批", out)
+
+    def test_flow_steps_arrow_outside_next_card(self):
+        """Bug 19 (Phase C5): connector arrows between flow steps must
+        render in the gap between cards, NOT inside the next card's
+        rectangle. Previous code positioned the arrow at the midpoint
+        between cards (`cx + step_w + gap / 2`), but the next card's
+        rect started at `cx + step_w + gap`, so the arrow's tip at
+        `ax + 5` (= gap/2 + 5) ended up 5 px past the midpoint, which
+        could still be inside the next card if its rect overlapped.
+        The fix positions the arrow tip strictly inside the gap."""
+        import re
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        out = _render_new_block({
+            "layout": "flow-steps",
+            "bounds": "0 0 600 200",
+            "spec": {"steps": [
+                {"title": "A", "items": ["a"]},
+                {"title": "B", "items": ["b"]},
+                {"title": "C", "items": ["c"]},
+            ]},
+        })
+        # Find all rect x positions and widths.
+        rects = re.findall(
+            r'<rect x="([\d.\-]+)" y="[\d.\-]+" width="([\d.\-]+)" '
+            r'height="[\d.\-]+"', out
+        )
+        # Find all arrow path commands (they're the only <path> elements
+        # in flow-steps).
+        paths = re.findall(r'<path d="M ([\d.\-]+)', out)
+        self.assertEqual(len(rects), 3, "expected 3 step rectangles")
+        self.assertEqual(len(paths), 2, "expected 2 connector arrows")
+        # Parse card positions.
+        card_xs = [(float(x), float(x) + float(w)) for x, w in rects]
+        for arrow_x_str in paths:
+            ax = float(arrow_x_str)
+            # Arrow must NOT start inside any card's x range.
+            for x_left, x_right in card_xs:
+                self.assertFalse(
+                    x_left <= ax <= x_right,
+                    f"arrow at x={ax} falls inside card x=[{x_left}, "
+                    f"{x_right}] — should be in the gap between cards"
+                )
 
     def test_revision_table_renders_header_and_rows(self):
         from mcp_ppt_native_fill.pipeline import _render_new_block

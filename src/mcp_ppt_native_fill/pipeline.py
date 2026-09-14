@@ -1118,7 +1118,8 @@ def phase4_quality(
     if restored:
         log.info("phase4 pre-export: restored data-pptx-* attrs on %d svg(s)", restored)
 
-    authoring_dir = workspace / "authoring-svg-flat"
+    # Bug 18 fix: removed redundant re-assignment of authoring_dir
+    # (it was already bound to workspace / "authoring-svg-flat" above).
     slide_files = sorted(authoring_dir.glob("slide_*.svg"))
     # also include any non-conforming clones (e.g. slide_part02_div.svg)
     slide_files.extend(sorted(p for p in authoring_dir.glob("*.svg") if p not in slide_files))

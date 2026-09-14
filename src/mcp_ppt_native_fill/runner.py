@@ -37,7 +37,12 @@ log = logging.getLogger("mcp_ppt_native_fill.runner")
 # Skill directory resolution.
 # ---------------------------------------------------------------------------
 
-_DEFAULT_WINDOWS_SKILL_DIR = Path(r"C:\Users\Administrator\.claude\skills\ppt-master")
+# Bug 17 fix: was hardcoded ``C:\Users\Administrator\...`` which only
+# worked for one Windows account. Derive from Path.home() so the
+# default works for any user. Posix and Windows defaults are
+# identical on all platforms (just ``~/.claude/skills/ppt-master``)
+# since Claude Code uses ``.claude`` on every platform.
+_DEFAULT_WINDOWS_SKILL_DIR = Path.home() / ".claude/skills/ppt-master"
 _DEFAULT_POSIX_SKILL_DIR = Path.home() / ".claude/skills/ppt-master"
 
 

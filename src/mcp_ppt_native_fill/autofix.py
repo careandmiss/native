@@ -934,10 +934,12 @@ def fix_invalid_source_ref(
     raw = io_utils.read_utf8(svg_path)
     new_raw = raw
     records: list[AutoFixRecord] = []
-    # Match a <g ... data-pptx-source-ref="slide:N" ...> opening tag, where
-    # N is the integer we want to validate against valid_source_slides.
+    # Bug 20 fix: removed the ``<g\b`` opening-tag anchor so the regex
+    # matches data-pptx-source-ref on ANY element (``<rect>``, ``<text>``,
+    # ``<image>``, ``<g>``,``). PPTX allows the attribute on any element,
+    # not just shape groups.
     pattern = re.compile(
-        r'(<g\b[^>]*?\bdata-pptx-source-ref="slide:)(\d+)("[^>]*>)',
+        r'(\bdata-pptx-source-ref="slide:)(\d+)(")',
         re.DOTALL,
     )
 
