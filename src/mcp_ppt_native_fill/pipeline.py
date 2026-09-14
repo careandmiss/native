@@ -1820,6 +1820,175 @@ def _render_new_block(spec: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# run_with_mapping: one-shot driver that delegates phase2/3/4/5 to
+# run_native_fill. Vendored from generate_local_ppt.run_manual but
+# fully generic — no hardcoded boteng shape ids / section names /
+# body bounds. All template-specific bits are caller-supplied.
+# ---------------------------------------------------------------------------
+
+
+def run_with_mapping(
+    *,
+    skill_dir: Path,
+    source_pptx: Path,
+    workspace: Path,
+    output_pptx: Path,
+    content_mapping: dict[str, dict[str, str]],
+    content_markdown: Path | None = None,
+    page_plan: list[dict] | None = None,
+    new_content_blocks: dict | None = None,
+    # Markdown expansion (all generic, no boteng hardcoding)
+    expand_skeleton_divider: int | None = None,
+    expand_skeleton_content: int | None = None,
+    expand_divider_edits_template: dict[str, str] | None = None,
+    expand_content_edits_template: dict[str, str] | None = None,
+    expand_body_bounds: str = "0 0 1280 720",
+    expand_ending_svg: str | None = None,
+    expand_part_names: list[str] | None = None,
+    # Workaround toggles (opt-in)
+    fix_nested_picture: bool = False,
+    skip_phase3_5: bool = False,
+    # run_native_fill params
+    auto_fix: bool = True,
+    max_fix_iterations: int = 3,
+    validate_strict: bool = True,
+    clean_workspace: bool = False,
+) -> dict[str, Any]:
+    """One-stop driver for the "manual mapping + markdown section cloning" workflow.
+
+    Sequence:
+      1. ``runner.run_pptx_to_svg`` → authoring-svg-flat/*.svg
+      2. apply ``content_mapping`` text edits
+      3. optional ``autofix.repair_nested_picture_attrs`` (boteng workaround)
+      4. optional ``expand_workspace_from_markdown`` (per-section cloning)
+      5. delegate the rest (phase 3 re-apply, phase 3.5/4/5) to
+         ``run_native_fill``
+
+    Generic: makes no assumption about template shape ids, body bounds,
+    section names, or ending slide. Boteng is one caller among many.
+
+    Parameters
+    ----------
+    skill_dir / source_pptx / workspace / output_pptx:
+        Standard native_fill inputs. All paths are ``.resolve()``-ed
+        defensively because ``runner._run`` hard-requires cwd=scripts_dir.
+    content_mapping:
+        ``{svg_filename: {shape_id: new_text}}`` for the original
+        5-slide skeleton. Caller-supplied; boteng ships its own mapping
+        in ``tests/_fixtures/boteng_mapping.py`` (or inline in callers).
+    content_markdown:
+        Optional markdown to expand. When given along with the four
+        ``expand_skeleton_*`` / ``expand_*_template`` params, every
+        markdown H1 gets a divider + content clone.
+    expand_*:
+        Forwarded verbatim to :func:`expand_workspace_from_markdown`.
+        All default-safe; ``body_bounds`` defaults to full canvas.
+    fix_nested_picture:
+        Opt-in: strip inner ``data-pptx-*`` attrs from nested
+        ``<image>`` / ``<svg>``. Required for boteng slide_02/03.
+    skip_phase3_5:
+        Opt-in: bypass phase3.5's picture_structure rewrite. Required
+        for boteng (pairs with ``fix_nested_picture=True``).
+    clean_workspace:
+        When True, wipe ``workspace`` and ``output_pptx`` before run.
+    """
+    skill_dir = Path(skill_dir).resolve()
+    source_pptx = Path(source_pptx).resolve()
+    workspace = Path(workspace).resolve()
+    output_pptx = Path(output_pptx).resolve()
+    if content_markdown is not None:
+        content_markdown = Path(content_markdown).resolve()
+
+    if clean_workspace and workspace.exists():
+        shutil.rmtree(workspace)
+    workspace.mkdir(parents=True, exist_ok=True)
+    if output_pptx.exists():
+        output_pptx.unlink()
+
+    auth = workspace / "authoring-svg-flat"
+    auth.mkdir(parents=True, exist_ok=True)
+
+    # Phase 2: pptx_to_svg round-trip
+    r2 = runner.run_pptx_to_svg(skill_dir, source_pptx, workspace,
+                                roundtrip=True)
+    if not r2.ok:
+        return {
+            "ok": False, "stage": "phase2",
+            "stderr": r2.stderr[-600:],
+        }
+
+    # Phase 3 (pre): apply text edits to the original skeleton SVGs
+    edit_summary: list[dict[str, Any]] = []
+    for fn, edits in content_mapping.items():
+        p = auth / fn
+        if not p.is_file():
+            edit_summary.append({
+                "svg": fn, "status": "missing_svg",
+                "applied": 0, "total": len(edits),
+            })
+            continue
+        audit = svg_edits.apply_text_edits(p, edits)
+        ok = sum(1 for r in audit if r.get("status") == "applied")
+        edit_summary.append({
+            "svg": fn, "status": "applied",
+            "applied": ok, "total": len(edits),
+        })
+
+    # Nested-SVG inner data-pptx-* strip (opt-in, boteng-style)
+    strip_report: dict[str, int] = {
+        "files_scanned": 0, "files_modified": 0, "attrs_stripped": 0,
+    }
+    if fix_nested_picture:
+        strip_report = autofix.repair_nested_picture_attrs(auth)
+
+    # Markdown → page_plan expansion (only when caller supplied the
+    # four required template params)
+    expansions: dict[str, Any] = {"cloned_svgs": [], "n_parts": 0}
+    if (
+        content_markdown is not None
+        and content_markdown.is_file()
+        and expand_skeleton_divider is not None
+        and expand_skeleton_content is not None
+        and expand_divider_edits_template is not None
+        and expand_content_edits_template is not None
+    ):
+        expansions = expand_workspace_from_markdown(
+            workspace, content_markdown,
+            skeleton_divider=expand_skeleton_divider,
+            skeleton_content=expand_skeleton_content,
+            divider_edits_template=expand_divider_edits_template,
+            content_edits_template=expand_content_edits_template,
+            body_bounds=expand_body_bounds,
+            ending_svg=expand_ending_svg,
+            part_names=expand_part_names,
+        )
+
+    # Delegate phase 3 re-apply / 3.5 / 4 / 5 to run_native_fill.
+    # run_native_fill will re-apply text edits (idempotent), optionally
+    # skip phase 3.5, and run quality_check + svg_to_pptx.
+    result = run_native_fill(
+        source_pptx=source_pptx,
+        workspace=workspace,
+        output_pptx=output_pptx,
+        page_plan=page_plan,
+        content_mapping=content_mapping,
+        new_content_blocks=new_content_blocks,
+        content_markdown=content_markdown,
+        skill_dir=skill_dir,
+        auto_fix=auto_fix,
+        max_fix_iterations=max_fix_iterations,
+        validate_strict=validate_strict,
+        skip_phase3_5=skip_phase3_5,
+    )
+    # Augment result with the pre-delegation work that the caller
+    # asked about (edit_summary, strip_report, expansions).
+    result["edit_summary"] = edit_summary
+    result["strip_report"] = strip_report
+    result["expansions"] = expansions
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Markdown → page_plan expansion (no-LLM).
 #
 # Vendored from generate_local_ppt.expand_workspace_from_markdown and

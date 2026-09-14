@@ -2861,5 +2861,40 @@ class TestExpandWorkspaceFromMarkdown(unittest.TestCase):
             )
 
 
+# ---------------------------------------------------------------------------
+# Phase I3: pipeline.run_with_mapping one-shot driver
+# ---------------------------------------------------------------------------
+
+
+class TestRunWithMapping(unittest.TestCase):
+    """run_with_mapping 是 generate_local_ppt.run_manual 的下沉版本,
+    复用 run_native_fill 而非重写 phase2/3/4/5。所有 boteng 特有参数显式传。"""
+
+    def test_signature_exposes_new_params(self):
+        sig = inspect.signature(pl.run_with_mapping)
+        for p in (
+            "fix_nested_picture", "skip_phase3_5", "content_markdown",
+            "expand_skeleton_divider", "expand_skeleton_content",
+            "expand_divider_edits_template", "expand_content_edits_template",
+            "expand_body_bounds", "expand_ending_svg", "expand_part_names",
+            "clean_workspace",
+        ):
+            self.assertIn(p, sig.parameters, f"missing param: {p}")
+
+    def test_no_hardcoded_boteng_in_run_with_mapping(self):
+        """run_with_mapping 体内不得硬编码 boteng 特有字段。"""
+        src = inspect.getsource(pl.run_with_mapping)
+        for hardcoded in [
+            "柏腾", "采购制度", "PART_NAMES",
+            "DEFAULT_MAPPING", "shape-4", "shape-5", "shape-17",
+            "120 130 1060 480",  # boteng body_bounds
+            "前言", "目的", "适用范围", "基本原则", "工作程序", "附件",
+        ]:
+            self.assertNotIn(
+                hardcoded, src,
+                f"hardcoded boteng value in run_with_mapping: {hardcoded!r}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
