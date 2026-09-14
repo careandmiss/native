@@ -2771,5 +2771,95 @@ class TestFixNestedPictureDataAttrs(unittest.TestCase):
             self.assertNotIn("data-pptx-source-ref", p.read_text(encoding="utf-8"))
 
 
+# ---------------------------------------------------------------------------
+# Phase I2: pipeline.expand_workspace_from_markdown + run_native_fill.skip_phase3_5
+# ---------------------------------------------------------------------------
+
+import inspect  # noqa: E402
+
+from mcp_ppt_native_fill import pipeline as pl  # noqa: E402
+
+
+class TestExpandWorkspaceFromMarkdown(unittest.TestCase):
+    """通用化:expand 默认从 markdown H1 自动抽 section title,不假设任何模板。"""
+
+    def _make_workspace(self, td: str) -> Path:
+        ws = Path(td)
+        auth = ws / "authoring-svg-flat"
+        auth.mkdir(parents=True)
+        (auth / "slide_03.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg">'
+            '<g id="shape-4"/><g id="shape-5"/></svg>',
+            encoding="utf-8",
+        )
+        (auth / "slide_04.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg">'
+            '<g id="shape-17"/></svg>',
+            encoding="utf-8",
+        )
+        (auth / "slide_05.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg"/>',
+            encoding="utf-8",
+        )
+        return ws
+
+    def test_expand_auto_extracts_h1_titles(self):
+        """不传 part_names 时,从 markdown H1 自动抽取,无 boteng 硬编码"""
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_workspace(td)
+            md = Path(td) / "m.md"
+            md.write_text(
+                "# Custom Section A\nbody A\n\n"
+                "# Custom Section B\nbody B\n\n"
+                "# Custom Section C\nbody C",
+                encoding="utf-8",
+            )
+            result = pl.expand_workspace_from_markdown(
+                ws, md,
+                skeleton_divider=3,
+                skeleton_content=4,
+                divider_edits_template={
+                    "shape-4": "PART {nn}",
+                    "shape-5": "{title}",
+                },
+                content_edits_template={"shape-17": "{title} ({nn})"},
+                body_bounds="100 100 1000 500",
+                ending_svg="slide_05.svg",
+            )
+            self.assertEqual(result["n_parts"], 3)
+            # 3 sections × (1 div + 1 content) = 6 cloned svgs
+            self.assertEqual(len(result["cloned_svgs"]), 6)
+            # page_plan.json 必须写入:fixture 造了 3 张原始 slide_03/04/05
+            # + 6 cloned = 9 page
+            plan = json.loads(
+                (ws / "page_plan.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(plan["pages"]), 9)
+            # 验证 cloned SVG 文件确实生成
+            self.assertTrue(
+                (ws / "authoring-svg-flat" / "slide_part01_div.svg").is_file()
+            )
+            # ending slide 必须放最后
+            last = plan["pages"][-1]
+            self.assertEqual(last["svg"], "slide_05.svg")
+
+    def test_run_native_fill_skip_phase3_5_param_exists(self):
+        sig = inspect.signature(pl.run_native_fill)
+        self.assertIn("skip_phase3_5", sig.parameters)
+        self.assertEqual(
+            sig.parameters["skip_phase3_5"].default, False
+        )
+
+    def test_no_hardcoded_part_names_in_expand(self):
+        """expand 函数体内不得出现 boteng 6 个中文 section 名"""
+        src = inspect.getsource(pl.expand_workspace_from_markdown)
+        for hardcoded in ["前言", "目的", "适用范围",
+                          "基本原则", "工作程序", "附件"]:
+            self.assertNotIn(
+                hardcoded, src,
+                f"hardcoded boteng section name: {hardcoded}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

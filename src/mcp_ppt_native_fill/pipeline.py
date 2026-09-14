@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1272,11 +1273,18 @@ def run_native_fill(
     inheritance_mode: str = "both",
     content_markdown: Path | None = None,
     llm_plan: bool = False,
+    skip_phase3_5: bool = False,
 ) -> dict[str, Any]:
     """End-to-end native_fill pipeline.
 
     Always returns a dict suitable as an MCP tool result. ``ok`` is True
     only when the final stage reaches ``done`` and validate_strict succeeded.
+
+    ``skip_phase3_5`` (default False) bypasses
+    :func:`phase3_5_pre_export_fixes`. Set True only for source templates
+    whose nested picture form is mis-rehydrated by phase3.5's
+    ``fix_picture_structure`` (e.g. boteng slide_02/03). For normal
+    templates the fixup protects against svg_to_pptx rejections.
     """
     state = PipelineState(skill_dir=skill_dir)
 
@@ -1347,9 +1355,16 @@ def run_native_fill(
     # Runs before quality-check so the autofix loop in phase4 only has to
     # deal with overflow / viewBox / page_plan issues that depend on
     # rendered metrics.
-    state = phase3_5_pre_export_fixes(state, source_pptx=source_pptx)
-    if state.stage == "failed":
-        return _finalize(state)
+    # Bypass when caller sets skip_phase3_5=True (boteng nested-SVG regression).
+    if skip_phase3_5:
+        log.info(
+            "phase3.5 SKIPPED by skip_phase3_5=True "
+            "(boteng-style nested-SVG compatibility)"
+        )
+    else:
+        state = phase3_5_pre_export_fixes(state, source_pptx=source_pptx)
+        if state.stage == "failed":
+            return _finalize(state)
 
     # Phase 4 (with auto-fix loop)
     state = phase4_quality(
@@ -1802,6 +1817,177 @@ def _render_new_block(spec: dict[str, Any]) -> str:
                 )
         return "\n".join(parts)
     raise ValueError(f"unsupported new_content_block layout: {layout!r}")
+
+
+# ---------------------------------------------------------------------------
+# Markdown → page_plan expansion (no-LLM).
+#
+# Vendored from generate_local_ppt.expand_workspace_from_markdown and
+# made fully generic — no hardcoded boteng section names, shape ids,
+# or body bounds. All template-specific bits are caller-supplied.
+# ---------------------------------------------------------------------------
+
+
+def expand_workspace_from_markdown(
+    workspace: Path,
+    md_path: Path,
+    *,
+    skeleton_divider: int,
+    skeleton_content: int,
+    divider_edits_template: dict[str, str],
+    content_edits_template: dict[str, str],
+    body_bounds: str = "0 0 1280 720",
+    layout: str = "3-column-cards",
+    ending_svg: str | None = None,
+    part_names: list[str] | None = None,
+) -> dict[str, Any]:
+    """Clone skeleton slides for each markdown H1 section.
+
+    For every H1 in ``md_path`` we clone ``slide_<skeleton_divider>.svg``
+    into ``slide_partNN_div.svg`` and ``slide_<skeleton_content>.svg``
+    into ``slide_partNN_content.svg``, then apply template-supplied text
+    edits and embed an auto-generated new_block of cards pulled from
+    the section body. Finally we re-seal ``page_plan.json`` with the
+    original roster prepended and (optionally) ``ending_svg`` moved
+    to the last position.
+
+    Parameters
+    ----------
+    workspace:
+        Authoring workspace root. ``authoring-svg-flat/`` must exist
+        under it and contain ``slide_<NN>.svg`` skeletons.
+    md_path:
+        Markdown file. H1s (``^#\\s+(.+)$``) define sections.
+    skeleton_divider / skeleton_content:
+        Slide numbers (1-based) of the divider / content skeleton SVGs.
+        Required — caller must supply whatever fits their template.
+    divider_edits_template / content_edits_template:
+        ``{shape_id: text_format}`` maps. Each ``text_format`` supports
+        ``{nn}`` (zero-padded section index), ``{n}`` (1-based integer),
+        and ``{title}`` (H1 title text). e.g. boteng::
+            {"shape-4": "PART {nn}", "shape-5": "{title}"}
+    body_bounds:
+        ``"x y w h"`` for the embedded cards block. Default is the
+        full 1280×720 canvas; boteng callers pass ``"120 130 1060 480"``.
+    layout:
+        Layout name passed to :func:`_render_new_block`. Default
+        ``"3-column-cards"``.
+    ending_svg:
+        If given, force-move this svg filename to the end of the
+        generated page_plan (so the deck ends with the ending slide).
+    part_names:
+        Optional ordered list of section titles. Default ``None`` →
+        auto-extract every H1 from the markdown. Caller may supply a
+        subset to cap cloning (e.g. take only the first 4 H1s).
+
+    Returns
+    -------
+    ``{"cloned_svgs": [..], "page_plan_path": Path, "n_parts": int}``.
+
+    Fully generic: this function makes no assumption about template
+    shape ids, body bounds, section names, or layout choice. The boteng
+    scenario is one of many callers.
+    """
+    md_text = md_path.read_text(encoding="utf-8")
+    sections = _split_markdown_sections(md_text)
+    if part_names is None:
+        part_names = [s["title"] for s in sections]
+    n_parts = min(len(part_names), len(sections))
+
+    auth = workspace / "authoring-svg-flat"
+    cloned: list[str] = []
+
+    def _format(template_dict: dict[str, str], *, nn: str, n: int,
+                title: str) -> dict[str, str]:
+        return {
+            k: v.format(nn=nn, n=n, title=title)
+            for k, v in template_dict.items()
+        }
+
+    for i, title in enumerate(part_names[:n_parts], start=1):
+        nn = f"{i:02d}"
+
+        # 1) divider clone
+        div_svg_name = f"slide_part{nn}_div.svg"
+        div_skeleton = auth / f"slide_{skeleton_divider:02d}.svg"
+        if div_skeleton.is_file():
+            shutil.copy2(div_skeleton, auth / div_svg_name)
+            div_edits = _format(divider_edits_template,
+                                nn=nn, n=i, title=title)
+            svg_edits.apply_text_edits(auth / div_svg_name, div_edits)
+            cloned.append(div_svg_name)
+        else:
+            log.warning(
+                "expand: divider skeleton %s missing; skipping %s",
+                div_skeleton.name, div_svg_name,
+            )
+
+        # 2) content clone + new_block
+        cont_svg_name = f"slide_part{nn}_content.svg"
+        cont_skeleton = auth / f"slide_{skeleton_content:02d}.svg"
+        if cont_skeleton.is_file():
+            shutil.copy2(cont_skeleton, auth / cont_svg_name)
+            cont_edits = _format(content_edits_template,
+                                 nn=nn, n=i, title=title)
+            svg_edits.apply_text_edits(auth / cont_svg_name, cont_edits)
+            # Embed auto-generated cards block
+            stem = f"part{nn}"
+            cards = _cards_for_section(sections, stem)
+            for c in cards:
+                c["items"] = [
+                    it[:40] + ("…" if len(it) > 40 else "")
+                    for it in c["items"]
+                ]
+            if not cards:
+                cards = [{
+                    "title": "要点",
+                    "color": "#1D2CAB",
+                    "items": ["(待补充)"],
+                }]
+            spec = {
+                "layout": layout,
+                "spec": {"cards": cards},
+                "bounds": body_bounds,
+            }
+            inner = _render_new_block(spec)
+            svg_edits.write_new_content_block(
+                auth / cont_svg_name,
+                group_id="body_cards",
+                bounds=body_bounds,
+                inner_svg=inner,
+            )
+            cloned.append(cont_svg_name)
+        else:
+            log.warning(
+                "expand: content skeleton %s missing; skipping %s",
+                cont_skeleton.name, cont_svg_name,
+            )
+
+    # Re-seal page_plan.json with original roster + cloned, ending last
+    additions_dicts = [
+        {
+            "source_slide": skeleton_divider if n.endswith("_div.svg")
+            else skeleton_content,
+            "svg": n,
+        }
+        for n in cloned
+    ]
+    original_roster = _seed_original_roster(auth)
+    pages = original_roster + additions_dicts
+    if ending_svg:
+        idx = next(
+            (i for i, p in enumerate(pages)
+             if p.get("svg") == ending_svg),
+            None,
+        )
+        if idx is not None and idx != len(pages) - 1:
+            pages.append(pages.pop(idx))
+    plan_path = write_page_plan(workspace, pages)
+    return {
+        "cloned_svgs": cloned,
+        "page_plan_path": plan_path,
+        "n_parts": n_parts,
+    }
 
 
 def _escape(text: str) -> str:
