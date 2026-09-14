@@ -618,9 +618,11 @@ def _seed_original_roster(
     candidates.sort(key=lambda item: item[0])
 
     # Identify the ending slide (pop it out so we can re-append at the
-    # end). Two strategies, in priority order:
+    # end). Three strategies, in priority order:
     #   1. skeleton_kind[name] == "ending" — planner already labelled it
-    #   2. last by source_slide — defensive fallback
+    #   2. body text contains THANK YOU / 谢谢 / Q&A — semantic signal
+    #   3. filename matches thank|ending|closing — defensive filename match
+    #   4. last by source_slide — last-resort fallback
     ending_idx: int | None = None
     if ending_last and candidates:
         for idx, (_, name) in enumerate(candidates):
@@ -628,7 +630,30 @@ def _seed_original_roster(
                 ending_idx = idx
                 break
         if ending_idx is None:
-            ending_idx = len(candidates) - 1  # fallback: highest NN
+            # Bug 08 fix: scan SVG bodies for ending markers (THANK YOU /
+            # 谢谢 / Q&A). Templates that append an appendix slide at a
+            # higher source_slide than the actual ending would otherwise
+            # mis-pick the appendix as ending.
+            ending_keywords = ("THANK", "谢谢", "Q&A", "答疑", "再见")
+            for idx, (_, name) in enumerate(candidates):
+                try:
+                    body = (authoring_dir / name).read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except OSError:
+                    continue
+                if any(kw in body for kw in ending_keywords):
+                    ending_idx = idx
+                    break
+            if ending_idx is None:
+                # Defensive filename match before resorting to position.
+                for idx, (_, name) in enumerate(candidates):
+                    if re.search(r"(thank|ending|closing|back_cover)",
+                                 name, re.I):
+                        ending_idx = idx
+                        break
+            if ending_idx is None:
+                ending_idx = len(candidates) - 1  # fallback: highest NN
 
     ending_entry: dict[str, Any] | None = None
     if ending_idx is not None:
@@ -1073,9 +1098,12 @@ def phase4_quality(
     # also include any non-conforming clones (e.g. slide_part02_div.svg)
     slide_files.extend(sorted(p for p in authoring_dir.glob("*.svg") if p not in slide_files))
 
-    if state.page_plan_pages if hasattr(state, "page_plan_pages") else None:
-        # Already validated in phase3; refresh summary regardless.
-        pass
+    # Bug 09 fix: removed dead-code block that referenced
+    # ``state.page_plan_pages`` (which never existed on PipelineState;
+    # page_plan data lives in ``state.context["page_plan_pages"]``).
+    # The block was unreachable (``hasattr`` was always False) and did
+    # nothing useful (just ``pass``). Validation already happened in
+    # phase3_author; phase4 only needs to refresh the summary.
 
     runner.run_svg_authoring_view_refresh(
         state.skill_dir,  # type: ignore[arg-type]

@@ -1919,6 +1919,56 @@ class PipelinePhase26Tests(unittest.TestCase):
             self.assertEqual(svgs2[-1], "slide_03.svg")
             self.assertNotIn("slide_03.svg", svgs2[:-1])
 
+    def test_phase4_quality_has_no_dead_code(self):
+        """Bug 09: phase4_quality contained a dead-code block that
+        referenced ``hasattr(state, 'page_plan_pages')`` — but
+        PipelineState never defined that attribute (the data lives in
+        ``state.context['page_plan_pages']``), so the block was unreachable
+        and ``pass`` did nothing.
+
+        Asserting on inspect.getsource() is a lightweight way to prevent
+        the dead code from sneaking back in via a future refactor.
+        """
+        import inspect
+        from mcp_ppt_native_fill import pipeline
+        src = inspect.getsource(pipeline.phase4_quality)
+        self.assertNotIn('hasattr(state, "page_plan_pages")', src)
+        # The confused ternary ``if X if hasattr(...) else None`` pattern
+        # must also be gone.
+        self.assertNotIn("if hasattr(", src)
+
+    def test_seed_original_roster_fallback_finds_thank_keyword(self):
+        """Bug 08: when skeleton_kind is None and the last slide is NOT
+        the ending (e.g. an appendix is appended at slide_10), the
+        fallback must find the actual ending by scanning SVG bodies for
+        THANK YOU / 谢谢 / Q&A keywords — not blindly pick the
+        highest source_slide."""
+        from mcp_ppt_native_fill import pipeline
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            flat = td / "authoring-svg-flat"
+            flat.mkdir(parents=True)
+            # 5 originals + 1 appendix. Without skeleton_kind and without
+            # skeleton detection, the naive fallback picks slide_10 (highest
+            # source_slide), but slide_05 has "THANK YOU" → must be picked.
+            for n in range(1, 6):
+                (flat / f"slide_{n:02d}.svg").write_text(
+                    f"<svg><text>item {n}</text></svg>", encoding="utf-8"
+                )
+            (flat / "slide_05.svg").write_text(
+                "<svg><text>THANK YOU</text></svg>", encoding="utf-8"
+            )
+            # An appendix added later (e.g. slide_10) — this is the highest
+            # source_slide and would win under the old buggy fallback.
+            (flat / "slide_10.svg").write_text(
+                "<svg><text>附录：参考文献</text></svg>", encoding="utf-8"
+            )
+            roster = pipeline._seed_original_roster(flat, ending_last=True)
+            svgs = [p["svg"] for p in roster]
+            # slide_05 (THANK YOU) must be the ending, NOT slide_10.
+            self.assertEqual(svgs[-1], "slide_05.svg")
+            self.assertNotEqual(svgs[-1], "slide_10.svg")
+
 
 class ContentBlockFallbackTests(unittest.TestCase):
     """Bug #2 fix: cloned content pages that the LLM forgot to fill
