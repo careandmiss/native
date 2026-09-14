@@ -708,11 +708,18 @@ def run_autofix_round(
     fix_gradient: bool = True,
     fix_picture: bool = True,
     fix_font: bool = True,
+    fix_nested_picture: bool = False,
 ) -> list[AutoFixRecord]:
     """Run one auto-fix pass over the slide set.
 
     Detection is purely local (no LLM). The caller is responsible for capping
     total rounds (master §7.9 suggests 3).
+
+    ``fix_nested_picture`` defaults to False — it is an opt-in workaround
+    for vendor svg_to_pptx's nested-picture validator which rejects inner
+    ``<image>`` / ``<svg>`` elements that still carry ``data-pptx-*``
+    attributes (e.g. boteng slide_02/03). Enable only when the source
+    template is known to emit nested picture form.
     """
     overflow_by_slide = _detect_overflow_by_slide(quality_stdout, slide_files)
     records: list[AutoFixRecord] = []
@@ -731,6 +738,14 @@ def run_autofix_round(
         if fix_overflow:
             shape_ids = overflow_by_slide.get(svg_path.name, [])
             records.extend(fix_text_overflow(svg_path, shape_ids))
+        if fix_nested_picture:
+            try:
+                records.extend(fix_nested_picture_data_attrs(svg_path))
+            except Exception as exc:
+                log.warning(
+                    "fix_nested_picture on %s failed: %s",
+                    svg_path.name, exc,
+                )
 
     return records
 
@@ -1026,3 +1041,90 @@ def restore_shape_attrs(
     if fixed:
         log.info("restore_shape_attrs: repaired %d svg file(s)", fixed)
     return fixed
+
+
+# ---------------------------------------------------------------------------
+# Nested-SVG inner data-pptx-* strip (boteng slide_02/03 workaround)
+# ---------------------------------------------------------------------------
+
+# Match the opening tag of any <image ...> or <svg ...> (start-of-tag only;
+# the body content of <svg>...</svg> is not consumed). DOTALL lets `[^>]*?`
+# cross newlines if Illustrator emitted multi-line tag attributes.
+_NESTED_PICTURE_TAG_RE = re.compile(
+    r'(<image\b|<svg\b)([^>]*?)(\s*/?>)',
+    re.DOTALL,
+)
+# Match a single data-pptx-* attribute (with leading whitespace) inside a tag.
+_DATA_PPTX_ATTR_RE = re.compile(
+    r'\s+data-pptx-[a-z-]+="[^"]*"',
+)
+# Capture just the attribute name for the AutoFixRecord detail.
+_DATA_PPTX_ATTR_NAME_RE = re.compile(
+    r'\s+(data-pptx-[a-z-]+)="[^"]*"',
+)
+
+
+def fix_nested_picture_data_attrs(svg_path: Path) -> list[AutoFixRecord]:
+    """Strip ``data-pptx-*`` attrs from inner ``<image>`` / ``<svg>`` tags.
+
+    Workaround for vendor svg_to_pptx's ``_require_project_nested_svg_crops``
+    validator: in nested picture form, only the outer ``<g>`` may carry
+    ``data-pptx-*`` attrs; the inner ``<image>`` / ``<svg>`` must NOT.
+
+    Pattern (DOTALL): ``(<image\b|<svg\b)([^>]*?)(\s*/?>)``
+    Sub: drop ``\s+data-pptx-[a-z-]+="[^"]*"`` from attrs.
+
+    Returns one ``AutoFixRecord`` per element whose attrs were stripped.
+    No-op when the SVG has no nested ``data-pptx-*`` attrs.
+    """
+    raw = io_utils.read_utf8(svg_path)
+    records: list[AutoFixRecord] = []
+
+    def _clean(m: re.Match) -> str:
+        head, attrs, tail = m.group(1), m.group(2), m.group(3)
+        stripped_names = _DATA_PPTX_ATTR_NAME_RE.findall(attrs)
+        new_attrs = _DATA_PPTX_ATTR_RE.sub("", attrs)
+        if new_attrs != attrs and stripped_names:
+            records.append(
+                AutoFixRecord(
+                    slide=svg_path.name,
+                    issue="nested_picture_data_attrs",
+                    action="strip_inner_data_pptx_attrs",
+                    before=",".join(stripped_names) or "(none)",
+                    after="(removed from inner element)",
+                    detail=f"stripped {len(stripped_names)} attr(s) from "
+                           f"inner <{head.lstrip('<')}>, types="
+                           f"{','.join(sorted(set(stripped_names)))}",
+                )
+            )
+        return head + new_attrs + tail
+
+    new_raw = _NESTED_PICTURE_TAG_RE.sub(_clean, raw)
+    if records:
+        io_utils.write_utf8_atomic(svg_path, new_raw)
+    return records
+
+
+def repair_nested_picture_attrs(
+    authoring_dir: Path,
+    *,
+    glob: str = "slide_*.svg",
+) -> dict[str, int]:
+    """Bulk variant of :func:`fix_nested_picture_data_attrs`.
+
+    Walks every SVG under ``authoring_dir`` matching ``glob`` and strips
+    inner ``data-pptx-*`` attrs. Returns a summary dict
+    ``{files_scanned, files_modified, attrs_stripped}`` for audit.
+    ``attrs_stripped`` counts the number of ELEMENTS touched (not the
+    number of individual attrs).
+    """
+    summary = {"files_scanned": 0, "files_modified": 0, "attrs_stripped": 0}
+    if not authoring_dir.is_dir():
+        return summary
+    for svg_path in sorted(authoring_dir.glob(glob)):
+        summary["files_scanned"] += 1
+        records = fix_nested_picture_data_attrs(svg_path)
+        if records:
+            summary["files_modified"] += 1
+            summary["attrs_stripped"] += len(records)
+    return summary

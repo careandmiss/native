@@ -2696,5 +2696,80 @@ class NewBlockLayoutTests(unittest.TestCase):
         self.assertEqual(cleaned, [])
 
 
+# ---------------------------------------------------------------------------
+# Phase I1: nested-SVG inner data-pptx-* strip (boteng slide_02/03 workaround)
+# ---------------------------------------------------------------------------
+
+from mcp_ppt_native_fill.autofix import (  # noqa: E402
+    fix_nested_picture_data_attrs,
+    repair_nested_picture_attrs,
+    run_autofix_round,
+)
+
+
+class TestFixNestedPictureDataAttrs(unittest.TestCase):
+    """boteng 兼容性:vendor svg_to_pptx 的 _require_project_nested_svg_crops
+    要求嵌套形态下只有外层 <g> 可带 data-pptx-* 属性,内层 <image>/<svg> 不允许。
+    """
+
+    SVG_NESTED = (
+        '<svg xmlns="http://www.w3.org/2000/svg">'
+        '<svg data-pptx-source-ref="slide:2" data-pptx-shape-id="x">'
+        '<image href="x.png" data-pptx-picture-id="42" data-pptx-frame="0 0 1280 720"/>'
+        '</svg>'
+        '</svg>'
+    )
+    SVG_CLEAN = (
+        '<svg xmlns="http://www.w3.org/2000/svg">'
+        '<image href="x.png"/>'
+        '</svg>'
+    )
+
+    def test_strips_inner_data_pptx_attrs(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "t.svg"
+            p.write_text(self.SVG_NESTED, encoding="utf-8")
+            records = fix_nested_picture_data_attrs(p)
+            # 应记录 2 个 stripped element:1 个 <svg>,1 个 <image>
+            self.assertEqual(len(records), 2)
+            cleaned = p.read_text(encoding="utf-8")
+            self.assertNotIn("data-pptx-source-ref", cleaned)
+            self.assertNotIn("data-pptx-picture-id", cleaned)
+            self.assertNotIn("data-pptx-frame", cleaned)
+            # href 必须保留
+            self.assertIn('href="x.png"', cleaned)
+
+    def test_noop_on_clean_svg(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "t.svg"
+            p.write_text(self.SVG_CLEAN, encoding="utf-8")
+            self.assertEqual(fix_nested_picture_data_attrs(p), [])
+            # 内容不变
+            self.assertEqual(p.read_text(encoding="utf-8"), self.SVG_CLEAN)
+
+    def test_repair_bulk_summary(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td) / "authoring-svg-flat"
+            d.mkdir()
+            (d / "slide_a.svg").write_text(self.SVG_NESTED, encoding="utf-8")
+            (d / "slide_b.svg").write_text(self.SVG_CLEAN, encoding="utf-8")
+            summary = repair_nested_picture_attrs(d)
+            self.assertEqual(summary,
+                             {"files_scanned": 2,
+                              "files_modified": 1,
+                              "attrs_stripped": 2})
+
+    def test_run_autofix_round_default_does_not_strip(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "s.svg"
+            p.write_text(self.SVG_NESTED, encoding="utf-8")
+            # 默认 fix_nested_picture=False,不动
+            run_autofix_round([p], "", fix_nested_picture=False)
+            self.assertIn("data-pptx-source-ref", p.read_text(encoding="utf-8"))
+            # 显式开启
+            run_autofix_round([p], "", fix_nested_picture=True)
+            self.assertNotIn("data-pptx-source-ref", p.read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()
