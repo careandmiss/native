@@ -744,6 +744,11 @@ def _truncate_to_fit(text: str, max_chars: int) -> str:
     character straddles the boundary, producing broken UTF-8. We back off
     to the nearest boundary that doesn't split a codepoint, then strip
     trailing whitespace and a trailing ``,.;:!?。；：、`` if any.
+
+    Bug 16 fix: if the result was actually truncated (i.e. shorter
+    than the input), append an ellipsis "…" so callers can tell that
+    the content was shortened — without the marker, truncated text
+    looks like data corruption.
     """
     if len(text) <= max_chars:
         return text
@@ -751,7 +756,11 @@ def _truncate_to_fit(text: str, max_chars: int) -> str:
     # Walk back to a safe codepoint boundary (Python strings are sequences
     # of codepoints, not bytes, so ``len`` already measures codepoints).
     # Strip any trailing punctuation/space.
-    return truncated.rstrip(" ,.;:!?。；：、""''")
+    cleaned = truncated.rstrip(" ,.;:!?。；：、""''")
+    # Only append the ellipsis if we actually cut content off.
+    if len(cleaned) < len(text):
+        cleaned = cleaned + "…"
+    return cleaned
 
 
 def _normalize_page_plan_additions(

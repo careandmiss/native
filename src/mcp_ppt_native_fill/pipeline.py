@@ -199,13 +199,19 @@ def phase2_5_llm_plan(
 
 
 # Default TOC placeholder phrases that the LLM did NOT replace. When a
-# TOC slot's text still equals one of these, the slot is "unfilled" and
-# its <g> elements (accent bar + title + subtitle) are removed so the
-# rendered slide does not show template default text in empty rows.
+# TOC slot's text still equals one of these (after whitespace
+# normalisation), the slot is "unfilled" and its <g> elements (accent
+# bar + title + subtitle) are removed so the rendered slide does not
+# show template default text in empty rows.
+#
+# Bug 06 fix: entries are stored in whitespace-normalised form (no
+# spaces) to match ``"".join(text.split())`` in _is_toc_slot_placeholder.
+# The previous set had "click to add title" (with spaces) which never
+# matched the normalised input.
 _TOC_PLACEHOLDER_PHRASES: frozenset[str] = frozenset({
     "单击添加大标题", "点击添加大标题", "点击添加标题",
-    "click to add title", "click here to add title",
-    "单击添加", "chapter", "Chapter", "CHAPTER",
+    "clicktoaddtitle", "clickheretoaddtitle",
+    "单击添加",
     "",  # genuinely empty
 })
 
@@ -215,12 +221,16 @@ def _is_toc_slot_placeholder(text: str) -> bool:
 
     Matched patterns:
       * The original template default strings (Chinese: "单击添加大标题",
-        "点击添加大标题" etc.; English: "click to add title", "Chapter").
+        "点击添加大标题" etc.; English: "click to add title").
       * Subtitle defaults (boteng: "单击添加小标题/标题英文 单价..." style).
-      * Boteng's default row labels: "第五章" / "第六章" / "Chapter N"
-        — these are template placeholders the LLM should have replaced
-        with a real chapter name. If still present, the row is unused.
+      * Boteng's default row labels: "第五章" / "第六章" — these are
+        template placeholders the LLM should have replaced with a real
+        chapter name. If still present, the row is unused.
       * Empty string.
+
+    Bug 06 fix: previously matched ``[Cc]hapter\\s*\\d+`` as a placeholder,
+    which wrongly flagged short English chapter titles like "Chapter 1"
+    as unfilled template defaults. Replaced with a strict whitelist.
     """
     t = "".join(text.split())  # strip whitespace
     if t in _TOC_PLACEHOLDER_PHRASES:
@@ -235,9 +245,6 @@ def _is_toc_slot_placeholder(text: str) -> bool:
     # content text, so a bare "第N章" with no associated content is
     # the template default we want to remove.
     if re.fullmatch(r"第[一二三四五六七八九十百千]+章", t):
-        return True
-    # "Chapter N" / "CHAPTER N" / "Chapter One" etc.
-    if re.fullmatch(r"[Cc]hapter\s*\d+", t):
         return True
     return False
 
@@ -343,12 +350,30 @@ def _remove_empty_toc_slots(
         if not row_anchors:
             continue
 
-        # A row's full y-extent is [anchor - 30, anchor + 90]. Any shape
-        # whose y_top is in that range belongs to that row.
+        # A row's full y-extent is derived from adjacent anchor positions.
+        # Bug 07 fix: was hardcoded ``anchor - 30, anchor + 90`` (matched
+        # boteng's ~90px row height). For templates with compact rows
+        # (~30px), the 90px band swallowed the next row's decoration;
+        # for templates with loose rows (~140px), the band missed the
+        # current row's subtitle. Compute row extent from the gap to the
+        # next (or previous) anchor when available.
         empty_rows: list[tuple[float, float]] = []  # (y_top, y_bot)
-        for anchor in row_anchors:
-            row_top = anchor - 30
-            row_bot = anchor + 90
+        for i, anchor in enumerate(row_anchors):
+            prev_anchor = row_anchors[i - 1] if i > 0 else None
+            next_anchor = (
+                row_anchors[i + 1] if i + 1 < len(row_anchors) else None
+            )
+            if prev_anchor is not None and next_anchor is not None:
+                # Middle row: split the gap evenly, cap at 90.
+                row_h = min(90.0, (next_anchor - prev_anchor) / 2)
+            elif prev_anchor is not None:
+                row_h = min(90.0, (anchor - prev_anchor))
+            elif next_anchor is not None:
+                row_h = min(90.0, (next_anchor - anchor))
+            else:
+                row_h = 90.0  # single-row TOC fallback
+            row_top = anchor - 20
+            row_bot = anchor + row_h
             row_shapes = [
                 it for it in items
                 if row_top <= it[1] <= row_bot
@@ -1550,18 +1575,30 @@ def _render_new_block(spec: dict[str, Any]) -> str:
                 break  # bounds budget exhausted
             for j, key in enumerate(("date", "status", "content", "author")):
                 raw_val = row.get(key, "")
-                # Tolerate list / dict values emitted by the LLM (e.g.
-                # it may return ``content: ["item1", "item2"]`` instead
-                # of a flat string). Stringify into a single cell.
+                # Bug 10 fix: list values now render as multiple <tspan>
+                # lines (one per item) instead of "; "-joined into a
+                # single long cell string. The first item stays inline;
+                # subsequent items use dy="14" to step down a line within
+                # the same <text> element (so the cell stays vertically
+                # aligned with its row baseline).
                 if isinstance(raw_val, (list, tuple)):
-                    cell_text = "; ".join(str(v) for v in raw_val)
+                    cell_items = [str(v) for v in raw_val]
                 elif isinstance(raw_val, dict):
-                    cell_text = "; ".join(f"{k}={v}" for k, v in raw_val.items())
+                    cell_items = [f"{k}={v}" for k, v in raw_val.items()]
                 else:
-                    cell_text = str(raw_val)
+                    cell_items = [str(raw_val)]
+                tspans = []
+                for k, item in enumerate(cell_items):
+                    if k == 0:
+                        tspans.append(_escape(item))
+                    else:
+                        tspans.append(
+                            f'<tspan x="{bx + j * col_w + 12:g}" dy="14">'
+                            f'{_escape(item)}</tspan>'
+                        )
                 parts.append(
                     f'<text x="{bx + j * col_w + 12:g}" y="{ry + 18:g}" '
-                    f'font-size="12" fill="#333">{_escape(cell_text)}</text>'
+                    f'font-size="12" fill="#333">{"".join(tspans)}</text>'
                 )
             # Row separator.
             parts.append(
@@ -1620,10 +1657,21 @@ def _render_new_block(spec: dict[str, Any]) -> str:
             f'stroke-width="1" stroke-opacity="0.3"/>'
         )
         # Big opening quote glyph at top-left.
+        # Bug 13 fix: detect the first character's Unicode bidirectional
+        # class. RTL languages (Arabic, Hebrew) expect a mirrored right
+        # curly quote ” (U+201D) instead of the left “ (U+201C).
+        # Fall back to “ for LTR / neutral text.
+        import unicodedata
+        quote_first = quote[0] if quote else ""
+        bidi = unicodedata.bidirectional(quote_first) if quote_first else "L"
+        if bidi in ("R", "AL", "RLE", "RLO"):
+            open_quote, close_quote = "”", "“"
+        else:
+            open_quote, close_quote = "“", "”"
         parts.append(
             f'<text x="{bx + 24:g}" y="{by + 64:g}" font-size="48" '
             f'font-weight="bold" fill="#1D2CAB" '
-            f'fill-opacity="0.6">“</text>'
+            f'fill-opacity="0.6">{open_quote}</text>'
         )
         # Quote text — vertically centered.
         parts.append(

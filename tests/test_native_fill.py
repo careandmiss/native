@@ -542,6 +542,40 @@ class AutofixTests(unittest.TestCase):
             content = svg.read_text(encoding="utf-8")
             self.assertIn("<svg viewBox=", content)
 
+    def test_fix_picture_structure_handles_href_with_path(self):
+        """Bug 04 (Phase C4): the ``<image[^/]*/>`` regex in
+        fix_picture_structure fails when the image's href contains a
+        forward slash (e.g. ``xlink:href="media/foo.png"`` or
+        ``href="../shared/img.png"``). Real boteng output uses
+        subdirectory-relative paths, so the flat→nested conversion
+        silently fails on production data.
+
+        The fix uses ``[^>]*?`` to allow any chars except the closing
+        tag delimiter.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            svg = td / "slide_05.svg"
+            svg.write_text(
+                '<?xml version="1.0"?>\n'
+                '<svg xmlns="http://www.w3.org/2000/svg" '
+                'xmlns:xlink="http://www.w3.org/1999/xlink" '
+                'viewBox="0 0 1280 720">'
+                '<g id="shape-12" data-pptx-object="picture">'
+                '<image x="0" y="0" width="1280" height="720" '
+                'xlink:href="media/image42.png"/>'
+                '</g></svg>',
+                encoding="utf-8",
+            )
+            records = autofix.fix_picture_structure(svg)
+            content = svg.read_text(encoding="utf-8")
+            # Must successfully wrap the image in <svg viewBox="0 0 1 1">.
+            self.assertTrue(len(records) >= 1,
+                f"fix_picture_structure should detect flat→nested for "
+                f"image with subdirectory href; got {records}")
+            self.assertIn('<svg viewBox="0 0 1 1"', content,
+                "flat→nested wrap must succeed for image with / in href")
+
     def test_fix_gradient_clears_solid_white_on_1920x1080(self):
         """Bug 01: a medium-sized solid-white panel on 1920x1080 canvas must
         be PROTECTED (not cleared) — the bug is that the hardcoded
@@ -944,6 +978,29 @@ class LLMClientTests(unittest.TestCase):
                 llm_client.llm_complete_json(system="s", user="u", config=cfg)
         self.assertIn("not valid JSON", str(cm.exception))
 
+    def test_extract_first_json_object_single_quoted(self):
+        """Bug 15 (Phase C4): when small models (Llama-3-8B etc.) emit
+        single-quoted JSON like ``{'key': 'value'}``, the current
+        _extract_first_json_object fails because it only recognises
+        double-quote strings. The result: LLMError "not valid JSON"
+        even though the response IS a valid JSON object (just
+        single-quoted).
+
+        The fix tries single-quote scanning as a fallback after
+        double-quote scanning fails.
+        """
+        from mcp_ppt_native_fill.llm_client import _extract_first_json_object
+        # Double-quoted: works.
+        self.assertEqual(
+            _extract_first_json_object('{"a": 1, "b": "x"}'),
+            {"a": 1, "b": "x"},
+        )
+        # Single-quoted: must also work after the fix.
+        self.assertEqual(
+            _extract_first_json_object("{'a': 1, 'b': 'x'}"),
+            {"a": 1, "b": "x"},
+        )
+
     def test_config_from_env_validates_provider(self):
         from mcp_ppt_native_fill import llm_client
         import os
@@ -1098,6 +1155,33 @@ class LLMPlannerTests(unittest.TestCase):
             for entry in slide.values():
                 self.assertGreaterEqual(entry["max_chars"], 24)
 
+    def test_truncate_to_fit_appends_ellipsis(self):
+        """Bug 16 (Phase C4): _truncate_to_fit stripped trailing
+        punctuation but didn't append an ellipsis, leaving the
+        truncated text looking like data corruption instead of a
+        clear signal that it was shortened."""
+        from mcp_ppt_native_fill.llm_planner import _truncate_to_fit
+        # Original: 23 chars, max_chars=18 → truncated to 18 chars
+        # ("采购管理流程 8 个步骤包括:计划"), then trailing punctuation
+        # stripped → "采购管理流程 8 个步骤包括:计划" → ":" stripped →
+        # "采购管理流程 8 个步骤包括" (15 chars), then ellipsis "…"
+        # appended. Result: 16 chars.
+        out = _truncate_to_fit("采购管理流程 8 个步骤包括:计划", 14)
+        self.assertTrue(out.endswith("…"),
+            f"truncated text must end with ellipsis, got {out!r}")
+        # The original content "包括" should still be present.
+        self.assertIn("包括", out)
+        # "计划" may or may not survive the slice — depends on max_chars.
+        # Just check the trailing colon was stripped before the ellipsis.
+        self.assertFalse(out.rstrip("…").endswith(":"),
+            "trailing ':' must be stripped before ellipsis is added")
+
+    def test_truncate_to_fit_short_text_unchanged(self):
+        """When input is shorter than max_chars, return as-is (no ellipsis)."""
+        from mcp_ppt_native_fill.llm_planner import _truncate_to_fit
+        self.assertEqual(_truncate_to_fit("hello", 10), "hello")
+        self.assertEqual(_truncate_to_fit("", 10), "")
+
     def test_normalize_truncates_overlong_text(self):
         from mcp_ppt_native_fill.llm_planner import _normalize_mapping, _scan_text_shapes
         from mcp_ppt_native_fill.llm_planner import PlannerError
@@ -1113,8 +1197,14 @@ class LLMPlannerTests(unittest.TestCase):
                 idx,
             )
         # Overlong text was truncated to fit. The trailing strip removes
-        # punctuation; we just check it's within budget.
-        self.assertLessEqual(len(cleaned["slide_01.svg"]["shape-23"]), max_23)
+        # punctuation; the ellipsis adds 1 char. We allow the result to
+        # be at most max_23 + 1 (for the "…" marker).
+        result = cleaned["slide_01.svg"]["shape-23"]
+        self.assertLessEqual(len(result), max_23 + 1,
+            f"truncated text len {len(result)} exceeds budget "
+            f"max_23+1={max_23 + 1}")
+        # And it must end with the ellipsis marker.
+        self.assertTrue(result.endswith("…"))
 
     def test_toc_slots_get_tight_max_chars(self):
         """Bug 2 fix (Phase B): TOC slide shapes get a tight per-font-size
@@ -1458,6 +1548,23 @@ class PipelineLLMPhaseTests(unittest.TestCase):
             self.assertTrue(
                 any("empty mapping" in w for w in state.warnings)
             )
+
+    def test_is_toc_slot_placeholder_chapter_1_not_placeholder(self):
+        """Bug 06 (Phase C4): the regex ``[Cc]hapter\\s*\\d+`` in
+        _is_toc_slot_placeholder treats short English chapter titles
+        like "Chapter 1" as template default placeholders, which causes
+        _remove_empty_toc_slots to delete them. The fix replaces the
+        pattern with an exact-string whitelist."""
+        from mcp_ppt_native_fill.pipeline import _is_toc_slot_placeholder
+        # Real user content: must NOT be flagged as placeholder.
+        self.assertFalse(_is_toc_slot_placeholder("Chapter 1"))
+        self.assertFalse(_is_toc_slot_placeholder("Chapter One"))
+        self.assertFalse(_is_toc_slot_placeholder("chapter 3"))
+        # Template defaults: must still be flagged.
+        self.assertTrue(_is_toc_slot_placeholder("click to add title"))
+        self.assertTrue(_is_toc_slot_placeholder("单击添加大标题"))
+        # Empty: still placeholder.
+        self.assertTrue(_is_toc_slot_placeholder(""))
 
 
 class SkeletonDetectionTests(unittest.TestCase):
@@ -2184,6 +2291,28 @@ class NewBlockLayoutTests(unittest.TestCase):
         self.assertIn("张三", out)
         self.assertIn("日期", out)  # header label
 
+    def test_revision_table_renders_list_content_as_tspans(self):
+        """Bug 10 (Phase C4): when row['content'] is a list of strings,
+        the cells should render one item per line (via tspan dy), not
+        collapse into a single ``; ``-joined string."""
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        out = _render_new_block({
+            "layout": "revision-table",
+            "bounds": "0 0 800 300",
+            "spec": {"rows": [
+                {"date": "2026-09-01", "status": "草稿",
+                 "content": ["初版", "补充细则", "终审通过"],
+                 "author": "张三"},
+            ]},
+        })
+        # All three items must appear in the output (not collapsed).
+        self.assertIn("初版", out)
+        self.assertIn("补充细则", out)
+        self.assertIn("终审通过", out)
+        # The '; ' join marker must NOT appear.
+        self.assertNotIn("初版; ", out,
+            "list items must not be joined with '; '")
+
     def test_unsupported_layout_raises(self):
         from mcp_ppt_native_fill.pipeline import _render_new_block
         with self.assertRaises(ValueError):
@@ -2256,6 +2385,34 @@ class NewBlockLayoutTests(unittest.TestCase):
         # Attribution with em-dash.
         self.assertIn("采购基本原则", out)
         self.assertIn("—", out)
+
+    def test_callout_box_rtl_uses_right_quote(self):
+        """Bug 13 (Phase C4): when the quote starts with an RTL
+        character (e.g. Arabic), the big quote glyph at the top-left
+        must be the right-pointing curly quote (”) instead of the
+        left-pointing (“). RTL readers expect mirrored punctuation.
+        """
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        out = _render_new_block({
+            "layout": "callout-box",
+            "bounds": "0 0 800 300",
+            "spec": {"quote": "العمل بجدية واحترام",  # Arabic RTL
+                      "attribution": "— مدير"},
+        })
+        # The big quote glyph (font-size 48) must use the right
+        # curly quote ” (U+201D), NOT the left curly quote “ (U+201C).
+        # We look for the </text> tag right after the 48pt quote glyph.
+        import re
+        match = re.search(
+            r'<text[^>]*font-size="48"[^>]*>([^<]+)</text>', out)
+        self.assertIsNotNone(match,
+            "expected a 48pt quote glyph <text> element")
+        glyph = match.group(1)
+        self.assertEqual(glyph, "”",
+            f"RTL quote should use right-pointing curly quote ”, "
+            f"got {glyph!r}")
+        self.assertNotIn("“", glyph,
+            "must NOT use left-pointing curly quote “ for RTL text")
 
     def test_two_column_compare_renders_two_columns_with_divider(self):
         """Bug 3 fix: two-column-compare renders two titled columns

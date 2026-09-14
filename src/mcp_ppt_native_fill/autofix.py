@@ -617,9 +617,15 @@ def fix_picture_structure(svg_path: Path) -> list[AutoFixRecord]:
         # Wrap the <image/> in a synthetic <svg viewBox="0 0 1 1"> matching
         # ppt-master's authoring convention. Only attempt if we can find the
         # matching </g>.
+        #
+        # Bug 04 fix: previous regex ``<image[^/]*/>`` rejected images
+        # whose href contains a forward slash (e.g. ``media/foo.png``).
+        # Real boteng output uses subdirectory-relative paths, so the
+        # flat→nested conversion silently failed. Use ``[^>]*?`` instead
+        # — it accepts any character except the closing tag delimiter.
         m = re.search(
             r"(<g[^>]*data-pptx-object=\"picture\"[^>]*>)\s*"
-            r"(<image[^/]*/>)\s*"
+            r"(<image\b[^>]*?/>)\s*"
             r"(</g>)",
             raw,
             re.DOTALL,

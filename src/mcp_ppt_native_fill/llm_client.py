@@ -217,7 +217,20 @@ def _extract_first_json_object(text: str) -> dict | None:
     ``\\`` escapes sequences inside them) so braces inside a string
     do not desync the count. Returns the parsed dict, or ``None``
     when no balanced object can be located.
+
+    Bug 15 fix (Phase C4): try double-quote scanning first (standard
+    JSON), then fall back to single-quote scanning for small models
+    (Llama-3-8B etc.) that occasionally emit ``{'key': 'value'}``.
     """
+    obj = _scan_json_with_quote(text, quote_char='"')
+    if obj is not None:
+        return obj
+    return _scan_json_with_quote(text, quote_char="'")
+
+
+def _scan_json_with_quote(text: str, *, quote_char: str) -> dict | None:
+    """Scan ``text`` for the first balanced ``{ … }`` JSON object using
+    ``quote_char`` (``"`` or ``'``) as the string delimiter."""
     start = text.find("{")
     while start != -1:
         depth = 0
@@ -230,10 +243,10 @@ def _extract_first_json_object(text: str) -> dict | None:
                     escape = False
                 elif ch == "\\":
                     escape = True
-                elif ch == '"':
+                elif ch == quote_char:
                     in_string = False
                 continue
-            if ch == '"':
+            if ch == quote_char:
                 in_string = True
             elif ch == "{":
                 depth += 1
@@ -241,6 +254,12 @@ def _extract_first_json_object(text: str) -> dict | None:
                 depth -= 1
                 if depth == 0:
                     candidate = text[start:i + 1]
+                    # Normalise single quotes to double quotes for the
+                    # strict json.loads parser (which only accepts the
+                    # latter). This is safe because we've already
+                    # bracket-counted correctly.
+                    if quote_char == "'":
+                        candidate = candidate.replace("'", '"')
                     try:
                         obj = json.loads(candidate)
                     except json.JSONDecodeError:
