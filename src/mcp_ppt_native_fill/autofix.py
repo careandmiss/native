@@ -476,9 +476,31 @@ def fix_gradient_unexportable(svg_path: Path) -> list[AutoFixRecord]:
                 except ValueError:
                     continue
                 # Treat as "full-slide decorative panel" if it covers
-                # most of the canvas (>= 80% of either width or
-                # height). Skip small shapes (text backgrounds, etc).
-                if fw < 0.6 * 1280 and fh < 0.6 * 720:
+                # most of the canvas (>= 60% of both width and height).
+                # Skip small shapes (text backgrounds, etc).
+                #
+                # Bug 01 fix: read canvas dimensions from the SVG root
+                # instead of hardcoding 1280×720. A panel that is
+                # "decoration" on a 1280×720 canvas (e.g. 800×500) is
+                # just a content card on a 1920×1080 canvas; using
+                # relative thresholds keeps the protection logic
+                # template-agnostic.
+                canvas_w, canvas_h = 1280.0, 720.0
+                if root.tag == f"{{{svg_ns}}}svg":
+                    try:
+                        w_attr = root.get("width") or root.get(
+                            "{http://www.w3.org/2000/svg}width"
+                        )
+                        h_attr = root.get("height") or root.get(
+                            "{http://www.w3.org/2000/svg}height"
+                        )
+                        if w_attr:
+                            canvas_w = float(re.sub(r"[^\d.]", "", w_attr) or "1280")
+                        if h_attr:
+                            canvas_h = float(re.sub(r"[^\d.]", "", h_attr) or "720")
+                    except (ValueError, AttributeError):
+                        pass
+                if fw < 0.6 * canvas_w and fh < 0.6 * canvas_h:
                     continue
                 elem.set(attr, "none")
                 solid_white_rewritten += 1

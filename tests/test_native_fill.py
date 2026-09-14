@@ -506,6 +506,48 @@ class AutofixTests(unittest.TestCase):
             content = svg.read_text(encoding="utf-8")
             self.assertIn("<svg viewBox=", content)
 
+    def test_fix_gradient_clears_solid_white_on_1920x1080(self):
+        """Bug 01: a medium-sized solid-white panel on 1920x1080 canvas must
+        be PROTECTED (not cleared) — the bug is that the hardcoded
+        ``fw < 0.6 * 1280 and fh < 0.6 * 720`` threshold treats an 800×500
+        panel as "full canvas" on a 1920×1080 template, clearing content
+        card backgrounds that the template designer intended to keep white.
+
+        On 1280×720 (the original boteng target), 800×500 IS a large panel
+        that legitimately covers the slide background image → cleared.
+        On 1920×1080, the same 800×500 is just a content card → must stay.
+
+        The fix is to read canvas dimensions from the SVG root and use a
+        relative threshold (0.6 × canvas_w / canvas_h).
+        """
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            svg = td / "slide_01.svg"
+            # 1920×1080 canvas with a 800×500 medium-size white card
+            # placed at top-left (legitimate content card on this canvas).
+            svg.write_text(
+                '<?xml version="1.0"?>\n'
+                '<svg xmlns="http://www.w3.org/2000/svg" '
+                'width="1920" height="1080" viewBox="0 0 1920 1080">'
+                '<defs>'
+                '<linearGradient id="g1">'
+                '<stop offset="0" stop-color="#fff"/>'
+                '</linearGradient>'
+                '</defs>'
+                '<g id="shape-1" data-pptx-frame="100 100 800 500" fill="#FFFFFF">'
+                '<rect x="100" y="100" width="800" height="500"/>'
+                '</g>'
+                '</svg>',
+                encoding="utf-8",
+            )
+            records = autofix.fix_gradient_unexportable(svg)
+            content = svg.read_text(encoding="utf-8")
+            # 800×500 on 1920×1080 is small (0.6×1920=1152, 0.6×1080=648)
+            # → must be protected from the solid-white rewrite.
+            self.assertIn('fill="#FFFFFF"', content)
+            # The gradient defs must still be stripped (independent logic).
+            self.assertNotIn("<linearGradient", content)
+
 
 # ---------------------------------------------------------------------------
 # runner: SKILL_DIR resolution and export-receipt regex.
@@ -1460,6 +1502,57 @@ class SkeletonDetectionTests(unittest.TestCase):
         self.assertEqual(r["skeleton_kind"]["slide_05.svg"], "ending")
         self.assertEqual(r["divider_id"], 3)
         self.assertEqual(r["content_id"], 4)
+
+    def test_skeleton_detect_38pt_divider_via_keyword(self):
+        """Bug 02 (part 2): a slide whose title is only 38pt but its body
+        contains a Chinese "第N章"-style marker must still classify as
+        divider. The previous ``fs >= 50`` hardcoded threshold wrongly
+        missed 38pt divider titles (common in templates that economize on
+        type size for non-cover pages).
+
+        The fix is to use semantic signals (chapter marker / "第N章" /
+        "PART N") in addition to the font-size heuristic.
+        """
+        from mcp_ppt_native_fill.llm_planner import _detect_skeleton_kind
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            flat = td / "authoring-svg-flat"
+            flat.mkdir(parents=True)
+            (flat / "authoring_summary.json").write_text(
+                '{"schema": "x", "documents": []}', encoding="utf-8"
+            )
+            # 5 slides: cover / toc / 38pt-divider / content / ending
+            fixtures = {
+                "slide_01.svg": [("shape-1", 56, "山西柏腾")],
+                "slide_02.svg": [("shape-1", 24, "目录")],
+                # 38pt divider with explicit "第N章" marker in body
+                "slide_03.svg": [
+                    ("shape-1", 38, "第二章 招标范围"),
+                    ("shape-2", 24, "本章要点"),
+                ],
+                "slide_04.svg": [("shape-1", 20, "正文内容")],
+                "slide_05.svg": [
+                    ("shape-1", 60, "THANK YOU"),
+                    ("shape-2", 30, "感谢您的聆听"),
+                ],
+            }
+            for name, shapes in fixtures.items():
+                body = "".join(
+                    f'<g id="{sid}"><text x="10" y="20" '
+                    f'font-size="{fs}">{text}</text></g>'
+                    for sid, fs, text in shapes
+                )
+                (flat / name).write_text(
+                    '<?xml version="1.0" encoding="utf-8"?>'
+                    '<svg xmlns="http://www.w3.org/2000/svg" '
+                    'viewBox="0 0 1280 720">'
+                    f'{body}</svg>',
+                    encoding="utf-8",
+                )
+            r = _detect_skeleton_kind(td)
+        # 38pt + "第N章" keyword must classify as divider (was failing).
+        self.assertEqual(r["skeleton_kind"]["slide_03.svg"], "divider")
+        self.assertEqual(r["divider_id"], 3)
 
 
 class PlannerResultTests(unittest.TestCase):

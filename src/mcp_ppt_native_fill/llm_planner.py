@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -513,8 +514,15 @@ def _detect_skeleton_kind(workspace: Path) -> dict[str, Any]:
       * ending — last slide, low text count, presence of "THANK" placeholder
       * cover  — first slide, moderate text count, large title slot
       * toc    — slide with the most text_elements (catalog/目录)
-      * divider — slide with ≥ 1 large-font (>50pt) title and few text elements
+      * divider — slide with ≥ 1 large-font (>38pt) title and few text elements
       * content — other slides with small-font body area
+
+    Bug 02 fix (Phase C1): the divider threshold was 50pt (matched boteng
+    only). Templates using 38-49pt divider titles were mis-classified as
+    content. Lowered threshold to 38pt AND added a semantic fallback: any
+    slide whose body text matches "第N章" / "PART N" patterns is classified
+    as divider regardless of font size. This catches templates that
+    economize on type size for non-cover pages.
 
     Phase B will replace font-size thresholds with font-size × frame geometry;
     for now this works well enough on the boteng template.
@@ -528,8 +536,11 @@ def _detect_skeleton_kind(workspace: Path) -> dict[str, Any]:
     if not svg_files:
         return {"skeleton_kind": {}, "divider_id": None, "content_id": None}
 
-    kind: dict[str, str] = {}
-    per_slide_stats: list[tuple[Path, int, float]] = []  # (path, n_text, max_fs)
+    # Bug 02 (Phase C1): per-slide semantic flags.
+    # ``has_chapter_marker`` — body text matches "第N章" / "PART N" patterns.
+    # Used as fallback divider signal when font-size heuristic is too strict.
+    chapter_re = re.compile(r"(第[一-鿿]{1,4}章|PART\s*[0-9一二三四五六七八九十]+)")
+    part_stats: list[tuple[Path, int, float, bool]] = []  # (path, n_text, max_fs, has_chapter)
     for svg_path in svg_files:
         try:
             _, root = autofix._parse_svg(svg_path)
@@ -539,39 +550,48 @@ def _detect_skeleton_kind(workspace: Path) -> dict[str, Any]:
         svg_ns = "{http://www.w3.org/2000/svg}"
         text_count = 0
         max_font_size = 0.0
+        body_text_chunks: list[str] = []
         for t in root.iter(svg_ns + "text"):
             text_count += 1
             fs = float(t.get("font-size") or 0)
             if fs > max_font_size:
                 max_font_size = fs
-        per_slide_stats.append((svg_path, text_count, max_font_size))
+            body_text_chunks.append("".join(t.itertext()))
+        body_text = " ".join(body_text_chunks)
+        has_chapter = bool(chapter_re.search(body_text))
+        part_stats.append((svg_path, text_count, max_font_size, has_chapter))
 
-    if not per_slide_stats:
+    if not part_stats:
         return {"skeleton_kind": {}, "divider_id": None, "content_id": None}
 
+    kind: dict[str, str] = {}
     # last slide → ending (highest priority).
-    last_path, _, _ = per_slide_stats[-1]
+    last_path = part_stats[-1][0]
     kind[last_path.name] = "ending"
 
     # first slide → cover.
-    first_path, first_n, first_fs = per_slide_stats[0]
+    first_path = part_stats[0][0]
     if first_path.name not in kind:
         kind[first_path.name] = "cover"
 
     # toc = slide with most text_elements (excluding cover/ending we already
-    # classified).
-    candidates = [s for s in per_slide_stats if s[0].name not in kind]
+    # classified, AND slides with chapter markers — those are dividers, not toc).
+    candidates = [s for s in part_stats if s[0].name not in kind and not s[3]]
+    remaining_all = [s for s in part_stats if s[0].name not in kind]
     if candidates:
-        toc_path, toc_n, _ = max(candidates, key=lambda s: s[1])
+        toc_path, toc_n, _, _ = max(candidates, key=lambda s: s[1])
         kind[toc_path.name] = "toc"
-        remaining = [s for s in candidates if s[0].name not in kind]
+        remaining = [s for s in remaining_all if s[0].name not in kind]
     else:
-        remaining = []
+        remaining = remaining_all
 
-    # divider = first remaining with max_font_size >= 50 (large title).
+    # Bug 02 fix: divider = first remaining with max_font_size >= 38
+    # (was 50; lowered for 38-49pt divider titles) OR body contains
+    # a chapter marker (semantic fallback for templates that use small
+    # fonts for divider titles).
     divider_id = None
-    for path, n, fs in remaining:
-        if fs >= 50:
+    for path, n, fs, has_chapter in remaining:
+        if fs >= 38 or has_chapter:
             kind[path.name] = "divider"
             divider_id = _source_slide_from_filename(path.name)
             remaining = [s for s in remaining if s[0].name not in kind]
@@ -579,7 +599,7 @@ def _detect_skeleton_kind(workspace: Path) -> dict[str, Any]:
 
     # everything else → content.
     content_id = None
-    for path, n, fs in remaining:
+    for path, n, fs, _ in remaining:
         if path.name not in kind:
             kind[path.name] = "content"
             if content_id is None:
