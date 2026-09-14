@@ -188,6 +188,98 @@ TOOL_NATIVE_FILL: dict[str, Any] = {
                         "enum": ["both", "layered", "flat"],
                         "default": "both",
                     },
+                    "skip_phase3_5": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Skip the phase3.5 pre-export fixup pass. "
+                            "Enable only when vendor svg_to_pptx rejects "
+                            "nested-picture rehydration (e.g. boteng "
+                            "slide_02/03). Default False preserves full "
+                            "pipeline safety."
+                        ),
+                    },
+                    "fix_nested_picture": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Strip inner data-pptx-* attrs from <image>/<svg> "
+                            "nested inside authoring-svg-flat SVGs before "
+                            "phase4/5. Required for templates whose nested "
+                            "SVG would otherwise be mis-rehydrated by "
+                            "svg_to_pptx. Pairs with skip_phase3_5=True for "
+                            "the boteng regression."
+                        ),
+                    },
+                    "expand_skeleton_divider": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": (
+                            "Source slide N used as the divider template "
+                            "when cloning per-markdown-section pages. "
+                            "Required (along with the other expand_* "
+                            "params) to enable markdown expansion."
+                        ),
+                    },
+                    "expand_skeleton_content": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": (
+                            "Source slide N used as the content template "
+                            "when cloning per-markdown-section pages."
+                        ),
+                    },
+                    "expand_divider_edits_template": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": (
+                            "Shape-id → text-format template for cloned "
+                            "divider pages. Each value supports {nn}, {n}, "
+                            "{title} placeholders. e.g. boteng: "
+                            "{\"shape-4\": \"PART {nn}\", \"shape-5\": \"{title}\"}"
+                        ),
+                    },
+                    "expand_content_edits_template": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": (
+                            "Shape-id → text-format template for cloned "
+                            "content pages. Same placeholder rules as "
+                            "expand_divider_edits_template."
+                        ),
+                    },
+                    "expand_body_bounds": {
+                        "type": "string",
+                        "default": "0 0 1280 720",
+                        "description": (
+                            "Bounds 'x y w h' for the auto-inserted content "
+                            "cards block. boteng callers pass "
+                            "\"120 130 1060 480\"."
+                        ),
+                    },
+                    "expand_ending_svg": {
+                        "type": "string",
+                        "description": (
+                            "Optional filename (e.g. 'slide_05.svg') to "
+                            "force-move to the end of page_plan."
+                        ),
+                    },
+                    "expand_part_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional ordered section titles. Default "
+                            "extracts all H1 from content_markdown."
+                        ),
+                    },
+                    "clean_workspace": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "When true, wipe workspace + output_pptx "
+                            "before running. Used by manual boteng runs."
+                        ),
+                    },
                 },
             },
         },
@@ -212,6 +304,17 @@ def _execute_native_fill(arguments: dict) -> dict:
     validate_strict = bool(options.get("validate_strict", True))
     inheritance_mode = options.get("inheritance_mode", "both")
     llm_plan = bool(options.get("llm_plan", False))
+    skip_phase3_5 = bool(options.get("skip_phase3_5", False))
+    fix_nested_picture = bool(options.get("fix_nested_picture", False))
+    clean_workspace = bool(options.get("clean_workspace", False))
+
+    expand_skeleton_divider = options.get("expand_skeleton_divider")
+    expand_skeleton_content = options.get("expand_skeleton_content")
+    expand_divider_edits_template = options.get("expand_divider_edits_template")
+    expand_content_edits_template = options.get("expand_content_edits_template")
+    expand_body_bounds = options.get("expand_body_bounds", "0 0 1280 720")
+    expand_ending_svg = options.get("expand_ending_svg")
+    expand_part_names = options.get("expand_part_names")
 
     content_markdown_raw = arguments.get("content_markdown")
     content_markdown: Path | None = (
@@ -243,6 +346,52 @@ def _execute_native_fill(arguments: dict) -> dict:
             ),
         }
 
+    # If caller asked for markdown expansion, route through run_with_mapping
+    # (the one-shot driver that handles pptx_to_svg, edits, strip,
+    # expansion, and delegates the rest to run_native_fill).
+    needs_expand = (
+        expand_skeleton_divider is not None
+        and expand_skeleton_content is not None
+        and expand_divider_edits_template is not None
+        and expand_content_edits_template is not None
+    )
+    if needs_expand:
+        if not content_markdown:
+            return {
+                "ok": False,
+                "stage": "init",
+                "error": "expand_* options require content_markdown path",
+                "hint": (
+                    "Set arguments.content_markdown to an absolute .md "
+                    "file path when using expand_skeleton_divider / "
+                    "expand_skeleton_content / expand_divider_edits_template "
+                    "/ expand_content_edits_template."
+                ),
+            }
+        return pipeline.run_with_mapping(
+            skill_dir=skill_dir,
+            source_pptx=source_pptx,
+            workspace=workspace,
+            output_pptx=output_pptx,
+            content_mapping=arguments.get("content_mapping") or {},
+            content_markdown=content_markdown,
+            page_plan=arguments.get("page_plan"),
+            new_content_blocks=arguments.get("new_content_blocks"),
+            expand_skeleton_divider=expand_skeleton_divider,
+            expand_skeleton_content=expand_skeleton_content,
+            expand_divider_edits_template=expand_divider_edits_template,
+            expand_content_edits_template=expand_content_edits_template,
+            expand_body_bounds=expand_body_bounds,
+            expand_ending_svg=expand_ending_svg,
+            expand_part_names=expand_part_names,
+            fix_nested_picture=fix_nested_picture,
+            skip_phase3_5=skip_phase3_5,
+            auto_fix=auto_fix,
+            max_fix_iterations=max_fix_iterations,
+            validate_strict=validate_strict,
+            clean_workspace=clean_workspace,
+        )
+
     return pipeline.run_native_fill(
         source_pptx=source_pptx,
         workspace=workspace,
@@ -257,6 +406,7 @@ def _execute_native_fill(arguments: dict) -> dict:
         max_fix_iterations=max_fix_iterations,
         validate_strict=validate_strict,
         inheritance_mode=inheritance_mode,
+        skip_phase3_5=skip_phase3_5,
     )
 
 
