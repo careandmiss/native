@@ -309,6 +309,46 @@ TOOL_NATIVE_FILL: dict[str, Any] = {
                             "before running. Used by manual boteng runs."
                         ),
                     },
+                    "expand_toc_from_markdown": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "When true, auto-fill the TOC slide from the "
+                            "markdown H1s (after manual content_mapping "
+                            "edits). TOC slide is auto-detected (the "
+                            "first slide containing '目录' or "
+                            "'CONTENTS'). Caller must supply "
+                            "expand_toc_slot_title_ids. Manual mapping "
+                            "entries that target TOC slot shape ids "
+                            "are silently dropped to avoid stomping the "
+                            "auto-fill."
+                        ),
+                    },
+                    "expand_toc_slot_title_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Required when expand_toc_from_markdown is "
+                            "true: ordered list of shape-* ids that "
+                            "receive the chapter titles in row-major "
+                            "fill order. Caller picks the ids for "
+                            "their template (e.g. boteng: "
+                            "['shape-69','shape-72','shape-77',"
+                            "'shape-80','shape-86','shape-89'])."
+                        ),
+                    },
+                    "expand_toc_slot_subtitle_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional parallel list of shape-* ids for "
+                            "subtitle text. Same length as "
+                            "expand_toc_slot_title_ids. If given, "
+                            "subtitles mirror the title text (caller "
+                            "can post-edit). If omitted, subtitle "
+                            "slots are left untouched."
+                        ),
+                    },
                 },
             },
         },
@@ -349,6 +389,13 @@ def _execute_native_fill(arguments: dict) -> dict:
     )
     expand_exclude_source_slides = options.get("expand_exclude_source_slides")
 
+    # Smart TOC fill (opt-in)
+    expand_toc_from_markdown = bool(
+        options.get("expand_toc_from_markdown", False)
+    )
+    expand_toc_slot_title_ids = options.get("expand_toc_slot_title_ids")
+    expand_toc_slot_subtitle_ids = options.get("expand_toc_slot_subtitle_ids")
+
     content_markdown_raw = arguments.get("content_markdown")
     content_markdown: Path | None = (
         Path(content_markdown_raw) if content_markdown_raw else None
@@ -379,16 +426,21 @@ def _execute_native_fill(arguments: dict) -> dict:
             ),
         }
 
-    # If caller asked for markdown expansion, route through run_with_mapping
-    # (the one-shot driver that handles pptx_to_svg, edits, strip,
-    # expansion, and delegates the rest to run_native_fill).
+    # If caller asked for markdown expansion OR smart TOC fill, route
+    # through run_with_mapping (the one-shot driver that handles
+    # pptx_to_svg, edits, strip, expansion, and delegates the rest to
+    # run_native_fill).
     needs_expand = (
         expand_skeleton_divider is not None
         and expand_skeleton_content is not None
         and expand_divider_edits_template is not None
         and expand_content_edits_template is not None
     )
-    if needs_expand:
+    needs_toc_expand = (
+        expand_toc_from_markdown
+        and expand_toc_slot_title_ids is not None
+    )
+    if needs_expand or needs_toc_expand:
         if not content_markdown:
             return {
                 "ok": False,
@@ -419,6 +471,9 @@ def _execute_native_fill(arguments: dict) -> dict:
             expand_part_names=expand_part_names,
             expand_divider_subtitle_template=expand_divider_subtitle_template,
             expand_exclude_source_slides=expand_exclude_source_slides,
+            expand_toc_from_markdown=expand_toc_from_markdown,
+            expand_toc_slot_title_ids=expand_toc_slot_title_ids,
+            expand_toc_slot_subtitle_ids=expand_toc_slot_subtitle_ids,
             fix_nested_picture=fix_nested_picture,
             skip_phase3_5=skip_phase3_5,
             auto_fix=auto_fix,
@@ -458,7 +513,13 @@ def _execute_tool(name: str, arguments: dict) -> dict:
 
 def _build_tool_result(payload: dict) -> dict:
     """Wrap a tool payload as an MCP ``CallToolResult``."""
-    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    # Defensively serialise any pathlib.Path that leaked into the
+    # result dict (e.g. from a stage summary that captured a Path).
+    # json.dumps's default= handler keeps the structure intact while
+    # turning Path into its str form.
+    text = json.dumps(
+        payload, ensure_ascii=False, indent=2, default=str,
+    )
     return {
         "content": [{"type": "text", "text": text}],
         "structuredContent": payload,

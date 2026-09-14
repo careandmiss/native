@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -3039,6 +3040,9 @@ class TestRunWithMapping(unittest.TestCase):
             "expand_divider_edits_template", "expand_content_edits_template",
             "expand_body_bounds", "expand_ending_svg", "expand_part_names",
             "clean_workspace",
+            "expand_toc_from_markdown",
+            "expand_toc_slot_title_ids",
+            "expand_toc_slot_subtitle_ids",
         ):
             self.assertIn(p, sig.parameters, f"missing param: {p}")
 
@@ -3055,6 +3059,349 @@ class TestRunWithMapping(unittest.TestCase):
                 hardcoded, src,
                 f"hardcoded boteng value in run_with_mapping: {hardcoded!r}",
             )
+
+
+class TestFilterTocManualMapping(unittest.TestCase):
+    """T5: drop manual content_mapping entries that target TOC slot ids."""
+
+    def test_drops_toc_shape_ids_keeps_rest(self):
+        mapping = {
+            "slide_02.svg": {
+                "shape-title-0": "manual A",
+                "shape-title-1": "manual B",
+                "shape-other": "should keep",
+            },
+            "slide_03.svg": {
+                "shape-not-toc": "should keep",
+            },
+        }
+        filtered, dropped = pl._filter_toc_manual_mapping(
+            mapping, ["shape-title-0", "shape-title-1"],
+        )
+        self.assertEqual(dropped, 2)
+        # TOC entries dropped
+        self.assertNotIn("shape-title-0", filtered["slide_02.svg"])
+        self.assertNotIn("shape-title-1", filtered["slide_02.svg"])
+        # Non-TOC entry kept
+        self.assertEqual(filtered["slide_02.svg"]["shape-other"], "should keep")
+        self.assertEqual(filtered["slide_03.svg"]["shape-not-toc"], "should keep")
+
+    def test_no_drop_when_no_toc_ids_match(self):
+        mapping = {"slide_02.svg": {"shape-X": "manual"}}
+        filtered, dropped = pl._filter_toc_manual_mapping(
+            mapping, ["shape-Y", "shape-Z"],
+        )
+        self.assertEqual(dropped, 0)
+        self.assertEqual(filtered["slide_02.svg"]["shape-X"], "manual")
+
+    def test_handles_missing_toc_ids_arg(self):
+        """Empty toc_shape_ids list → nothing dropped."""
+        mapping = {"slide_02.svg": {"shape-X": "manual"}}
+        filtered, dropped = pl._filter_toc_manual_mapping(mapping, [])
+        self.assertEqual(dropped, 0)
+        self.assertEqual(filtered["slide_02.svg"]["shape-X"], "manual")
+
+    def test_drops_both_title_and_subtitle_toc_ids(self):
+        mapping = {
+            "slide_02.svg": {
+                "shape-t-0": "title",
+                "shape-s-0": "subtitle",
+                "shape-t-1": "title",
+                "shape-other": "keep",
+            },
+        }
+        filtered, dropped = pl._filter_toc_manual_mapping(
+            mapping, ["shape-t-0", "shape-t-1", "shape-s-0", "shape-s-1"],
+        )
+        self.assertEqual(dropped, 3)
+        self.assertNotIn("shape-t-0", filtered["slide_02.svg"])
+        self.assertNotIn("shape-s-0", filtered["slide_02.svg"])
+        self.assertNotIn("shape-t-1", filtered["slide_02.svg"])
+        self.assertIn("shape-other", filtered["slide_02.svg"])
+
+
+class TestFindTocSvg(unittest.TestCase):
+    """_find_toc_svg: 找含 '目录' / 'CONTENTS' marker 的 slide_NN.svg。
+
+    Smart-TOC 入口辅助:不指定 toc_svg 时,函数从这里推断。
+    不解析 SVG 结构,只看文本里有没有 TOC marker 字串。
+    """
+
+    def _make_workspace(self, td: str, *, toc_filename: str | None = "slide_02.svg",
+                        toc_marker: str = "目录") -> Path:
+        ws = Path(td)
+        auth = ws / "authoring-svg-flat"
+        auth.mkdir(parents=True)
+        # 三张 slide: 只有 toc_filename 含 marker
+        for i, name in enumerate(["slide_01.svg", "slide_02.svg", "slide_03.svg"]):
+            if name == toc_filename:
+                (auth / name).write_text(
+                    f'<svg><text>{toc_marker}</text></svg>',
+                    encoding="utf-8",
+                )
+            else:
+                (auth / name).write_text(
+                    '<svg><text>随便</text></svg>',
+                    encoding="utf-8",
+                )
+        return ws
+
+    def test_finds_目录_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_workspace(td)
+            self.assertEqual(pl._find_toc_svg(ws / "authoring-svg-flat"),
+                             "slide_02.svg")
+
+    def test_finds_CONTENTS_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_workspace(
+                td, toc_filename="slide_03.svg", toc_marker="CONTENTS",
+            )
+            self.assertEqual(pl._find_toc_svg(ws / "authoring-svg-flat"),
+                             "slide_03.svg")
+
+    def test_raises_when_no_toc_slide(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            auth = ws / "authoring-svg-flat"
+            auth.mkdir(parents=True)
+            (auth / "slide_01.svg").write_text(
+                '<svg><text>普通页</text></svg>', encoding="utf-8",
+            )
+            with self.assertRaises(ValueError) as cm:
+                pl._find_toc_svg(auth)
+            self.assertIn("No TOC slide found", str(cm.exception))
+
+
+class TestExpandWorkspaceFromToc(unittest.TestCase):
+    """expand_workspace_from_toc: smart TOC fill from markdown H1s.
+
+    Caller supplies slot id lists (title + optional subtitle).
+    Function: auto-fills < N, clones > N, preserves <g> shapes.
+    """
+
+    def _make_toc_workspace(self, td: str, *, slots: int = 6) -> Path:
+        """Synthesize a TOC slide with N slots. Each slot has one
+        title shape and one subtitle shape."""
+        ws = Path(td)
+        auth = ws / "authoring-svg-flat"
+        auth.mkdir(parents=True)
+        # TOC slide with 目录 marker
+        toc_parts = ['<svg xmlns="http://www.w3.org/2000/svg">',
+                     '<text>目录</text>']
+        for i in range(slots):
+            # Title shape: large placeholder text
+            toc_parts.append(
+                f'<g id="shape-title-{i}" data-pptx-frame="0 {i*100} 400 46">'
+                f'<text>单击添加大标题 {i}</text></g>'
+            )
+            # Subtitle shape: smaller placeholder text
+            toc_parts.append(
+                f'<g id="shape-sub-{i}" data-pptx-frame="0 {i*100+50} 400 30">'
+                f'<text>单击添加小标题 {i}</text></g>'
+            )
+        toc_parts.append('</svg>')
+        (auth / "slide_02.svg").write_text("\n".join(toc_parts),
+                                           encoding="utf-8")
+        # Dummy other slide (not TOC)
+        (auth / "slide_01.svg").write_text(
+            '<svg><text>cover</text></svg>', encoding="utf-8",
+        )
+        return ws
+
+    def _title_ids(self, n: int) -> list[str]:
+        return [f"shape-title-{i}" for i in range(n)]
+
+    def _sub_ids(self, n: int) -> list[str]:
+        return [f"shape-sub-{i}" for i in range(n)]
+
+    # --- T3: < N case ---
+
+    def test_lt_n_fills_first_n_clears_rest_keeps_g(self):
+        """4 H1s into 6-slot TOC: first 4 filled, last 2 cleared but
+        their <g id="..."> shape must remain in the SVG."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_toc_workspace(td, slots=6)
+            md = Path(td) / "m.md"
+            md.write_text("# Alpha\n\n# Bravo\n\n# Charlie\n\n# Delta",
+                          encoding="utf-8")
+            pl.expand_workspace_from_toc(
+                workspace=ws, md_path=md,
+                toc_slot_title_ids=self._title_ids(6),
+                toc_slot_subtitle_ids=self._sub_ids(6),
+                toc_svg="slide_02.svg",
+            )
+            svg_text = (ws / "authoring-svg-flat" /
+                        "slide_02.svg").read_text(encoding="utf-8")
+            # Slots 0-3 filled with markdown H1 titles
+            for title in ("Alpha", "Bravo", "Charlie", "Delta"):
+                self.assertIn(f">{title}<", svg_text,
+                              f"expected {title!r} in TOC slide")
+            # Slots 4-5 must NOT contain the placeholder title
+            self.assertNotIn("单击添加大标题 4", svg_text)
+            self.assertNotIn("单击添加大标题 5", svg_text)
+            # Slots 4-5 subtitle cleared too
+            self.assertNotIn("单击添加小标题 4", svg_text)
+            self.assertNotIn("单击添加小标题 5", svg_text)
+            # <g> shapes for slots 4-5 must still exist (we clear text, not shape)
+            self.assertIn('id="shape-title-4"', svg_text)
+            self.assertIn('id="shape-title-5"', svg_text)
+            self.assertIn('id="shape-sub-4"', svg_text)
+            self.assertIn('id="shape-sub-5"', svg_text)
+            # Some text node in slots 4-5 must be empty
+            # (ET self-closes <text></text> as <text ... />)
+            self.assertRegex(svg_text, r'<g id="shape-title-4"[^>]*>\s*<text[^>]*/>')
+
+    def test_lt_n_returns_summary(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_toc_workspace(td, slots=6)
+            md = Path(td) / "m.md"
+            md.write_text("# A\n\n# B\n\n# C\n\n# D", encoding="utf-8")
+            result = pl.expand_workspace_from_toc(
+                workspace=ws, md_path=md,
+                toc_slot_title_ids=self._title_ids(6),
+                toc_svg="slide_02.svg",
+            )
+            self.assertEqual(result["toc_svg"], "slide_02.svg")
+            self.assertEqual(result["slot_count"], 6)
+            self.assertEqual(result["filled"], 4)
+            self.assertEqual(result["cloned_svgs"], [])
+
+    def test_lt_n_without_subtitle_ids(self):
+        """Subtitle list optional: title-only fill still works."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_toc_workspace(td, slots=4)
+            md = Path(td) / "m.md"
+            md.write_text("# X\n\n# Y", encoding="utf-8")
+            pl.expand_workspace_from_toc(
+                workspace=ws, md_path=md,
+                toc_slot_title_ids=self._title_ids(4),
+                # toc_slot_subtitle_ids omitted
+                toc_svg="slide_02.svg",
+            )
+            svg_text = (ws / "authoring-svg-flat" /
+                        "slide_02.svg").read_text(encoding="utf-8")
+            self.assertIn(">X<", svg_text)
+            self.assertIn(">Y<", svg_text)
+            # Slot 2, 3 cleared (title placeholders gone)
+            self.assertNotIn("单击添加大标题 2", svg_text)
+            self.assertNotIn("单击添加大标题 3", svg_text)
+
+    # --- T4: > N case (clone TOC slide) ---
+
+    def test_gt_n_clones_overflow_into_part02_toc(self):
+        """8 H1s into 6-slot TOC: first 6 in slide_02, last 2 in clone."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_toc_workspace(td, slots=6)
+            md = Path(td) / "m.md"
+            md.write_text(
+                "\n".join(f"# Title{i}" for i in range(1, 9)),
+                encoding="utf-8",
+            )
+            result = pl.expand_workspace_from_toc(
+                workspace=ws, md_path=md,
+                toc_slot_title_ids=self._title_ids(6),
+                toc_svg="slide_02.svg",
+            )
+            auth = ws / "authoring-svg-flat"
+            self.assertEqual(result["cloned_svgs"], ["slide_part02_toc.svg"])
+            self.assertEqual(result["filled"], 8)
+            self.assertTrue((auth / "slide_part02_toc.svg").is_file())
+
+            # Original TOC: titles 1-6
+            original_text = (auth / "slide_02.svg").read_text(encoding="utf-8")
+            for i in range(1, 7):
+                self.assertIn(f">Title{i}<", original_text)
+            self.assertNotIn(">Title7<", original_text)
+
+            # Clone: titles 7, 8 in slots 0, 1; slots 2-5 cleared
+            clone_text = (auth / "slide_part02_toc.svg").read_text(encoding="utf-8")
+            self.assertIn(">Title7<", clone_text)
+            self.assertIn(">Title8<", clone_text)
+            # Slots 2-5 placeholders gone (text cleared)
+            for i in range(2, 6):
+                self.assertNotIn(f"单击添加大标题 {i}", clone_text)
+            # <g> shapes preserved on clone (cleared text, not deleted shape)
+            self.assertIn('id="shape-title-2"', clone_text)
+            self.assertIn('id="shape-title-5"', clone_text)
+
+    # --- T6: real boteng TOC structure ---
+
+    def test_real_boteng_toc_fills_from_markdown(self):
+        """Smoke test against the real boteng slide_02 TOC structure.
+
+        Uses project baseline_workspace/authoring-svg-flat/slide_02.svg
+        (verified shape ids: row1col1={title: shape-69, subtitle: shape-70,
+        connector: shape-62}, etc.). Skipped if baseline_workspace is not
+        present (e.g. fresh clone).
+        """
+        boteng_ws = (
+            Path(__file__).resolve().parent.parent
+            / "projects" / "baseline_workspace"
+        )
+        if not (boteng_ws / "authoring-svg-flat" / "slide_02.svg").is_file():
+            self.skipTest("boteng baseline_workspace not present")
+
+        with tempfile.TemporaryDirectory() as td:
+            # Copy baseline workspace
+            shutil.copytree(boteng_ws / "authoring-svg-flat",
+                            Path(td) / "authoring-svg-flat")
+            ws = Path(td)
+
+            md = Path(td) / "m.md"
+            md.write_text(
+                "# 第一章 项目概述\nbody\n\n"
+                "# 第二章 实施计划\nbody\n\n"
+                "# 第三章 团队分工\nbody\n\n"
+                "# 第四章 风险控制\nbody\n\n"
+                "# 第五章 验收\nbody\n\n"
+                "# 第六章 收尾\nbody",
+                encoding="utf-8",
+            )
+
+            # Real boteng slot ids (verified from earlier exploration)
+            title_ids = [
+                "shape-69", "shape-72",   # row 1
+                "shape-77", "shape-80",   # row 2
+                "shape-86", "shape-89",   # row 3
+            ]
+            sub_ids = [
+                "shape-70", "shape-73",
+                "shape-78", "shape-81",
+                "shape-87", "shape-90",
+            ]
+
+            result = pl.expand_workspace_from_toc(
+                workspace=ws, md_path=md,
+                toc_slot_title_ids=title_ids,
+                toc_slot_subtitle_ids=sub_ids,
+                toc_svg="slide_02.svg",
+            )
+            self.assertEqual(result["slot_count"], 6)
+            self.assertEqual(result["filled"], 6)
+            self.assertEqual(result["cloned_svgs"], [])
+
+            svg_text = (ws / "authoring-svg-flat" /
+                        "slide_02.svg").read_text(encoding="utf-8")
+            # All 6 chapter titles filled
+            for ch in ["第一章", "第二章", "第三章",
+                       "第四章", "第五章", "第六章"]:
+                self.assertIn(ch, svg_text,
+                              f"chapter {ch!r} not in TOC slide")
+            # Exact full H1 text appears in <text> nodes
+            self.assertIn(">第一章 项目概述<", svg_text)
+            self.assertIn(">第六章 收尾<", svg_text)
+            # Boteng's "第N章" template defaults (no following content) are
+            # gone. The real boteng template renders placeholders like
+            # "第五章" with no chapter content; we replace those with the
+            # full chapter title text from markdown.
+            # New <text> contents must each include a chapter name + body.
+            chapter_with_body = sum(
+                1 for ch in ["第一章", "第二章", "第三章",
+                             "第四章", "第五章", "第六章"]
+                if f"{ch} " in svg_text
+            )
+            self.assertEqual(chapter_with_body, 6)
 
 
 if __name__ == "__main__":

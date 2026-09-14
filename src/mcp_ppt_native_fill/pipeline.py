@@ -218,6 +218,86 @@ _TOC_PLACEHOLDER_PHRASES: frozenset[str] = frozenset({
 })
 
 
+def _find_toc_svg(authoring_dir: Path) -> str:
+    """Return the filename of the slide that contains the TOC marker.
+
+    Looks for any ``slide_*.svg`` in ``authoring_dir`` whose body
+    contains the Chinese "目录" or English "CONTENTS" string. Used as
+    the default value for ``toc_svg`` in
+    :func:`expand_workspace_from_toc` when the caller doesn't supply
+    one explicitly.
+
+    Mirrors the same scan logic used by :func:`_remove_empty_toc_slots`
+    (lines below) but returns just the filename rather than the list
+    of candidate paths.
+
+    Raises
+    ------
+    ValueError
+        If no slide in ``authoring_dir`` contains a TOC marker. Caller
+        should pass ``toc_svg=`` explicitly in that case.
+    """
+    candidates: list[Path] = []
+    for path in sorted(authoring_dir.glob("slide_*.svg")):
+        try:
+            data = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if "目录" in data or "CONTENTS" in data.upper():
+            candidates.append(path)
+    if not candidates:
+        raise ValueError(
+            f"No TOC slide found in {authoring_dir}: no slide contains "
+            "'目录' or 'CONTENTS'. Pass toc_svg= explicitly."
+        )
+    return candidates[0].name
+
+
+def _filter_toc_manual_mapping(
+    content_mapping: dict[str, dict[str, str]],
+    toc_shape_ids: list[str],
+) -> tuple[dict[str, dict[str, str]], int]:
+    """Drop manual mapping entries that target TOC slot shape ids.
+
+    When ``expand_toc_from_markdown`` is on, the auto-fill from
+    :func:`expand_workspace_from_toc` would overwrite any manual TOC
+    entries anyway — but dropping them up front makes the intent
+    explicit and surfaces the conflict in audit logs instead of
+    silently overwriting.
+
+    Parameters
+    ----------
+    content_mapping:
+        ``{svg_filename: {shape_id: new_text}}`` — the caller's
+        manual mapping. Mutated by replacing per-svg dicts (not the
+        outer container) to keep the caller's reference intact.
+    toc_shape_ids:
+        Union of title + subtitle shape ids supplied by the caller
+        for smart TOC fill.
+
+    Returns
+    -------
+    ``(filtered_mapping, total_dropped)``. The returned mapping is a
+    shallow copy with per-svg dicts replaced as needed.
+    """
+    toc_set = set(toc_shape_ids)
+    total_dropped = 0
+    filtered: dict[str, dict[str, str]] = {}
+    for svg_name, edits in content_mapping.items():
+        kept = {k: v for k, v in edits.items() if k not in toc_set}
+        dropped = len(edits) - len(kept)
+        if dropped:
+            log.info(
+                "expand_toc_from_markdown: dropped %d manual TOC entries "
+                "in %s (shape_ids: %s)",
+                dropped, svg_name,
+                [k for k in edits if k not in kept],
+            )
+            total_dropped += dropped
+        filtered[svg_name] = kept
+    return filtered, total_dropped
+
+
 def _is_toc_slot_placeholder(text: str) -> bool:
     """True if the slot text is still template default (unfilled by LLM).
 
@@ -1919,6 +1999,10 @@ def run_with_mapping(
     # Workaround toggles (opt-in)
     fix_nested_picture: bool = False,
     skip_phase3_5: bool = False,
+    # Smart TOC fill (opt-in; auto-detects TOC slide from 目录/CONTENTS)
+    expand_toc_from_markdown: bool = False,
+    expand_toc_slot_title_ids: list[str] | None = None,
+    expand_toc_slot_subtitle_ids: list[str] | None = None,
     # run_native_fill params
     auto_fix: bool = True,
     max_fix_iterations: int = 3,
@@ -1989,6 +2073,22 @@ def run_with_mapping(
             "stderr": r2.stderr[-600:],
         }
 
+    # Smart TOC pre-filter: when expand_toc_from_markdown is on, drop
+    # any manual content_mapping entries that target TOC slot shape ids.
+    # Otherwise those manual entries would stomp the auto-generated TOC.
+    toc_dropped_count = 0
+    if (
+        expand_toc_from_markdown
+        and (expand_toc_slot_title_ids or expand_toc_slot_subtitle_ids)
+    ):
+        toc_shape_ids = list(
+            (expand_toc_slot_title_ids or []) +
+            (expand_toc_slot_subtitle_ids or [])
+        )
+        content_mapping, toc_dropped_count = _filter_toc_manual_mapping(
+            content_mapping, toc_shape_ids,
+        )
+
     # Phase 3 (pre): apply text edits to the original skeleton SVGs
     edit_summary: list[dict[str, Any]] = []
     for fn, edits in content_mapping.items():
@@ -2037,6 +2137,42 @@ def run_with_mapping(
             exclude_source_slides=expand_exclude_source_slides,
         )
 
+    # Smart TOC fill (opt-in): auto-fill TOC slide from markdown H1s.
+    # Runs AFTER content_mapping so the auto-fill wins over any
+    # leftover placeholders. We already pre-filtered manual TOC entries
+    # above so they don't stomp the auto-generated values.
+    toc_summary: dict[str, Any] = {
+        "toc_svg": None, "slot_count": 0, "filled": 0,
+        "cloned_svgs": [],
+    }
+    if (
+        expand_toc_from_markdown
+        and content_markdown is not None
+        and content_markdown.is_file()
+        and expand_toc_slot_title_ids
+    ):
+        toc_summary = expand_workspace_from_toc(
+            workspace, content_markdown,
+            toc_slot_title_ids=expand_toc_slot_title_ids,
+            toc_slot_subtitle_ids=expand_toc_slot_subtitle_ids,
+        )
+        # Also merge the TOC fill into content_mapping for the TOC slide
+        # so phase3_author's re-apply (idempotent) restores the fill
+        # AFTER run_native_fill's phase2_import overwrites the SVG.
+        # Without this merge the TOC reverts to template defaults.
+        toc_svg_name = toc_summary["toc_svg"]
+        toc_edits_for_phase3 = _build_toc_phase3_edits(
+            workspace, content_markdown,
+            toc_slot_title_ids=expand_toc_slot_title_ids,
+            toc_slot_subtitle_ids=expand_toc_slot_subtitle_ids,
+        )
+        if toc_edits_for_phase3:
+            existing = content_mapping.get(toc_svg_name, {})
+            merged = {**existing, **toc_edits_for_phase3}
+            content_mapping = {
+                **content_mapping, toc_svg_name: merged,
+            }
+
     # Delegate phase 3 re-apply / 3.5 / 4 / 5 to run_native_fill.
     # run_native_fill will re-apply text edits (idempotent), optionally
     # skip phase 3.5, and run quality_check + svg_to_pptx.
@@ -2075,10 +2211,12 @@ def run_with_mapping(
         quality_strict=quality_strict,
     )
     # Augment result with the pre-delegation work that the caller
-    # asked about (edit_summary, strip_report, expansions).
+    # asked about (edit_summary, strip_report, expansions, toc_summary).
     result["edit_summary"] = edit_summary
     result["strip_report"] = strip_report
     result["expansions"] = expansions
+    result["toc_summary"] = toc_summary
+    result["toc_dropped_entries"] = toc_dropped_count
     return result
 
 
@@ -2296,3 +2434,213 @@ def _escape(text: str) -> str:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
+
+
+# ---------------------------------------------------------------------------
+# expand_workspace_from_toc: smart TOC fill from markdown H1s.
+#
+# Caller supplies the slot shape-id lists (title + optional subtitle,
+# row-major fill order). Function: auto-detects the TOC slide, fills
+# < N slots and clears the rest, clones overflow into
+# slide_partNN_toc.svg, and updates page_plan.json so clones follow the
+# original TOC. Fully generic — no per-template shape ids, no font-size
+# heuristics, no SVG parsing beyond the 目录/CONTENTS marker detection
+# in :func:`_find_toc_svg`.
+# ---------------------------------------------------------------------------
+
+
+def _build_toc_slot_edits(
+    titles_for_slots: list[str],
+    slot_indices: list[int],
+    title_ids: list[str],
+    sub_ids: list[str] | None,
+) -> dict[str, str]:
+    """Build an edits dict for a batch of TOC slots.
+
+    For slot ``slot_indices[i]`` we set:
+      * ``title_ids[slot_indices[i]]`` -> ``titles_for_slots[i]``
+        (or "" if i out of range -> clear the text).
+      * ``sub_ids[slot_indices[i]]`` -> same as title when subtitles
+        are provided (caller can post-edit if they want different
+        subtitle text per slot).
+
+    Out-of-range titles_for_slots entries mean "clear this slot's text".
+    """
+    edits: dict[str, str] = {}
+    for i, slot_idx in enumerate(slot_indices):
+        text = titles_for_slots[i] if i < len(titles_for_slots) else ""
+        edits[title_ids[slot_idx]] = text
+        if sub_ids is not None:
+            edits[sub_ids[slot_idx]] = text
+    return edits
+
+
+def _toc_clone_basename(batch_idx: int) -> str:
+    """Map batch index to clone SVG filename. batch_idx is 1-based."""
+    return f"slide_part{batch_idx:02d}_toc.svg"
+
+
+def _build_toc_phase3_edits(
+    workspace: Path,
+    md_path: Path,
+    *,
+    toc_slot_title_ids: list[str],
+    toc_slot_subtitle_ids: list[str] | None,
+) -> dict[str, str]:
+    """Compute fill+clear edits for the original TOC slide only.
+
+    Used by :func:`run_with_mapping` to merge TOC edits into
+    ``content_mapping`` so phase3_author's re-apply (idempotent)
+    restores the fill AFTER run_native_fill's phase2_import overwrites
+    the SVG. Overflow clones are NOT included — they live outside
+    the source pptx and aren't regenerated by phase2_import.
+    """
+    auth = workspace / "authoring-svg-flat"
+    toc_svg = _find_toc_svg(auth)
+
+    sections = _split_markdown_sections(md_path.read_text(encoding="utf-8"))
+    titles = [s["title"] for s in sections]
+    slot_count = len(toc_slot_title_ids)
+    n = min(len(titles), slot_count)
+
+    filled_titles = titles[:n] + [""] * (slot_count - n)
+    return _build_toc_slot_edits(
+        filled_titles, list(range(slot_count)),
+        toc_slot_title_ids, toc_slot_subtitle_ids,
+    )
+
+
+def expand_workspace_from_toc(
+    workspace: Path,
+    md_path: Path,
+    *,
+    toc_slot_title_ids: list[str],
+    toc_slot_subtitle_ids: list[str] | None = None,
+    toc_svg: str | None = None,
+    part_names: list[str] | None = None,
+) -> dict[str, Any]:
+    """Fill the TOC slide from markdown H1s using caller-supplied slot ids.
+
+    Parameters
+    ----------
+    workspace:
+        Authoring workspace root. Must contain ``authoring-svg-flat/``.
+    md_path:
+        Markdown file; H1s define section titles to fill into the TOC.
+    toc_slot_title_ids:
+        Ordered list of shape-* ids that receive the chapter titles, in
+        row-major fill order. Required.
+    toc_slot_subtitle_ids:
+        Optional parallel list of shape-* ids for subtitles. If given,
+        must have the same length as ``toc_slot_title_ids``. If omitted,
+        subtitle slots are left untouched.
+    toc_svg:
+        Optional explicit TOC SVG filename. Auto-detected (first slide
+        containing "目录" / "CONTENTS") if None.
+    part_names:
+        Optional explicit list of section titles. Defaults to all H1s
+        in the markdown.
+
+    Behaviour
+    ---------
+    * N <= slots_total: edit ``toc_svg`` in place. Fill first N slots;
+      clear remaining slots' title text (and subtitle text if subtitle
+      ids were supplied). Slot ``<g>`` shapes are preserved — only
+      ``<text>`` nodes are emptied.
+    * N > slots_total: fill first batch in ``toc_svg``; for each
+      subsequent batch of ``slots_total`` items, clone ``toc_svg`` as
+      ``slide_partNN_toc.svg`` and fill. page_plan.json is updated so
+      clones appear after the original TOC slide.
+
+    Returns
+    -------
+    dict with keys: ``toc_svg`` (str), ``slot_count`` (int),
+    ``filled`` (int), ``cloned_svgs`` (list[str]).
+    """
+    auth = workspace / "authoring-svg-flat"
+    if toc_svg is None:
+        toc_svg = _find_toc_svg(auth)
+
+    sections = _split_markdown_sections(md_path.read_text(encoding="utf-8"))
+    titles = part_names if part_names is not None else [s["title"] for s in sections]
+    n_total = len(titles)
+    slot_count = len(toc_slot_title_ids)
+    if toc_slot_subtitle_ids is not None and len(toc_slot_subtitle_ids) != slot_count:
+        raise ValueError(
+            f"toc_slot_subtitle_ids length {len(toc_slot_subtitle_ids)} "
+            f"!= toc_slot_title_ids length {slot_count}"
+        )
+
+    # --- < N / == N case: edit toc_svg in place ---
+    fill_n = min(n_total, slot_count)
+    all_indices = list(range(slot_count))
+    edits = _build_toc_slot_edits(
+        titles[:fill_n] + [""] * (slot_count - fill_n),
+        all_indices,
+        toc_slot_title_ids,
+        toc_slot_subtitle_ids,
+    )
+    svg_edits.apply_text_edits(auth / toc_svg, edits)
+
+    # --- > N case: clone per overflow batch ---
+    cloned: list[str] = []
+    if n_total > slot_count:
+        for batch_idx, batch_start in enumerate(
+            range(slot_count, n_total, slot_count), start=2
+        ):
+            clone_name = _toc_clone_basename(batch_idx)
+            shutil.copy2(auth / toc_svg, auth / clone_name)
+            batch_titles = titles[batch_start:batch_start + slot_count]
+            clone_fill = len(batch_titles)
+            clone_edits = _build_toc_slot_edits(
+                batch_titles + [""] * (slot_count - clone_fill),
+                all_indices,
+                toc_slot_title_ids,
+                toc_slot_subtitle_ids,
+            )
+            svg_edits.apply_text_edits(auth / clone_name, clone_edits)
+            cloned.append(clone_name)
+
+    # --- Update page_plan.json: clones follow the original TOC ---
+    if cloned:
+        plan_path = workspace / "page_plan.json"
+        if plan_path.is_file():
+            payload = json.loads(plan_path.read_text(encoding="utf-8"))
+            pages = payload.get("pages")
+            if isinstance(pages, list):
+                toc_source = _toc_slide_number(toc_svg)
+                # Find TOC slide index in roster
+                toc_idx = next(
+                    (i for i, p in enumerate(pages)
+                     if p.get("svg") == toc_svg),
+                    len(pages),
+                )
+                # Build clone entries; insert right after original TOC
+                clone_entries = [
+                    {"source_slide": toc_source, "svg": c} for c in cloned
+                ]
+                pages = (
+                    pages[:toc_idx + 1]
+                    + clone_entries
+                    + [p for p in pages[toc_idx + 1:]
+                       if p.get("svg") not in set(cloned)]
+                )
+                payload["pages"] = pages
+                plan_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+
+    return {
+        "toc_svg": toc_svg,
+        "slot_count": slot_count,
+        "filled": n_total,
+        "cloned_svgs": cloned,
+    }
+
+
+def _toc_slide_number(toc_svg_filename: str) -> int:
+    """Extract 1-based slide number from ``slide_NN.svg`` filename."""
+    m = re.search(r"slide_(\d+)\.svg$", toc_svg_filename)
+    return int(m.group(1)) if m else 0
+
