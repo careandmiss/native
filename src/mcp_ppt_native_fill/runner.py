@@ -295,6 +295,11 @@ def run_pptx_to_svg(
     timeout_ms: int = 120_000,
 ) -> ScriptResult:
     """Phase 2 — import round-trip workspace."""
+    # Resolve to absolute paths because vendor scripts run with
+    # cwd=<skill_dir>/scripts — relative paths would land under
+    # ``<scripts>/projects/...`` instead of the caller's intent.
+    source_pptx = Path(source_pptx).resolve()
+    workspace = Path(workspace).resolve()
     args = [
         str(source_pptx),
         "-o",
@@ -340,6 +345,9 @@ def run_svg_quality_check(
     timeout_ms: int = 60_000,
 ) -> ScriptResult:
     """Phase 4 — round-trip quality gate. Exit 0 = OK/WARN, 1 = blocking ERROR."""
+    # Resolve to absolute path — vendor cwd is <skill_dir>/scripts, so
+    # a relative workspace would land under ``scripts/projects/...``.
+    workspace = Path(workspace).resolve()
     res = _run(
         "svg_quality_checker.py",
         [str(workspace), "--roundtrip"],
@@ -360,6 +368,9 @@ def run_svg_to_pptx(
     timeout_ms: int = 240_000,
 ) -> ScriptResult:
     """Phase 5 — export a native DrawingML PPTX."""
+    # Resolve to absolute paths — vendor cwd is <skill_dir>/scripts.
+    workspace = Path(workspace).resolve()
+    output_pptx = Path(output_pptx).resolve()
     res = _run(
         "svg_to_pptx.py",
         [str(workspace), "--roundtrip", "-o", str(output_pptx)],

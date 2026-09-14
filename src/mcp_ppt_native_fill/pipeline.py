@@ -17,6 +17,7 @@ re-try up to ``max_fix_iterations`` times (default 3) before giving up.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shutil
@@ -507,9 +508,31 @@ def _fill_missing_content_blocks(
         )
 
 
+def _strip_inline_markdown(text: str) -> str:
+    """Strip common markdown inline markers from a heading line.
+
+    Removes ``**bold**`` / ``__bold__`` / ``*italic*`` / ``_italic_``
+    / `` `code` `` so the title injected into PPT shapes doesn't show
+    the literal asterisks. Generic — no template-specific assumptions.
+    """
+    # Order matters: strip bold (** **) before italic (* *) to avoid
+    # eating an outer ** by mistake.
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    text = re.sub(r"\*(.+?)\*", r"\1", text)
+    text = re.sub(r"_(.+?)_", r"\1", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    return text
+
+
 def _split_markdown_sections(md_text: str) -> list[dict[str, str]]:
     """Split a Chinese procurement policy markdown into
-    ``[{title, body}]`` sections keyed on `# 一、` / `# 二、` etc."""
+    ``[{title, body}]`` sections keyed on `# 一、` / `# 二、` etc.
+
+    H1 inline markdown (``**bold**`` / ``*italic*`` / `` `code` ``)
+    is stripped — otherwise those markers leak into the PPT shape
+    text and render as literal asterisks.
+    """
     sections: list[dict[str, str]] = []
     head_re = re.compile(r"^#\s+(.+)$", re.MULTILINE)
     matches = list(head_re.finditer(md_text))
@@ -517,7 +540,8 @@ def _split_markdown_sections(md_text: str) -> list[dict[str, str]]:
         start = m.end()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(md_text)
         body = md_text[start:end].strip()
-        sections.append({"title": m.group(1).strip(), "body": body})
+        title = _strip_inline_markdown(m.group(1).strip())
+        sections.append({"title": title, "body": body})
     return sections
 
 
@@ -1100,8 +1124,16 @@ def phase4_quality(
     auto_fix: bool,
     max_fix_iterations: int,
     timeout_ms: int = 60_000,
+    strict: bool = True,
 ) -> PipelineState:
-    """Phase 4: refresh summary + quality check + optional auto-fix loop."""
+    """Phase 4: refresh summary + quality check + optional auto-fix loop.
+
+    ``strict=False`` treats quality-check WARN/ERROR as advisory — the
+    pipeline records them in ``state.warnings`` / ``state.errors`` but
+    advances to phase 5 anyway. Required for templates whose vendor
+    quality checker emits WARN for non-blocking issues that don't
+    actually block svg_to_pptx (e.g. boteng's "non-PPT-safe font" WARN).
+    """
     state.stage = "quality"
     workspace = state.workspace
     assert workspace is not None
@@ -1148,6 +1180,20 @@ def phase4_quality(
         state.last_quality_stdout = qc.stdout + "\n" + qc.stderr
         if qc.ok:
             state.stage = "quality_passed"
+            return state
+
+        # Advisory mode: report QC issues but advance to phase 5.
+        if not strict:
+            log.warning(
+                "phase4 quality_check exit=%d (advisory, strict=False); "
+                "proceeding to phase 5",
+                qc.exit,
+            )
+            state.warnings.append(
+                f"phase4 quality_check exit={qc.exit} (advisory; "
+                "proceeding to phase 5)"
+            )
+            state.stage = "quality_advisory"
             return state
 
         if not auto_fix or iterations >= max_fix_iterations:
@@ -1274,6 +1320,7 @@ def run_native_fill(
     content_markdown: Path | None = None,
     llm_plan: bool = False,
     skip_phase3_5: bool = False,
+    quality_strict: bool = True,
 ) -> dict[str, Any]:
     """End-to-end native_fill pipeline.
 
@@ -1359,8 +1406,29 @@ def run_native_fill(
     if skip_phase3_5:
         log.info(
             "phase3.5 SKIPPED by skip_phase3_5=True "
-            "(boteng-style nested-SVG compatibility)"
+            "(boteng-style nested-SVG compatibility); "
+            "running source-ref fixup only"
         )
+        # Even when skipping phase3.5 we still need to strip invalid
+        # ``data-pptx-source-ref`` attributes — the boteng round-trip
+        # emits refs like ``slide:22`` for a 5-slide deck which
+        # svg_to_pptx cannot resolve. We run JUST the source-ref fix
+        # (no picture_structure rewrite, no gradient/font rewrite).
+        try:
+            valid = set(range(1, 100))  # best-effort permissive set
+            for svg_path in sorted(
+                (state.workspace / "authoring-svg-flat").glob("*.svg")
+            ):
+                for rec in autofix.fix_invalid_source_ref(
+                    svg_path, valid, strip_all=True,
+                ):
+                    state.context.setdefault(
+                        "fix_iterations", []
+                    ).append(rec.to_dict())
+        except Exception as exc:
+            log.warning(
+                "phase3.5-bypass source-ref fixup failed: %s", exc,
+            )
     else:
         state = phase3_5_pre_export_fixes(state, source_pptx=source_pptx)
         if state.stage == "failed":
@@ -1371,6 +1439,7 @@ def run_native_fill(
         state,
         auto_fix=auto_fix,
         max_fix_iterations=max_fix_iterations,
+        strict=quality_strict,
     )
     if state.stage == "failed":
         return _finalize(state)
@@ -1845,6 +1914,8 @@ def run_with_mapping(
     expand_body_bounds: str = "0 0 1280 720",
     expand_ending_svg: str | None = None,
     expand_part_names: list[str] | None = None,
+    expand_divider_subtitle_template: dict[str, str] | None = None,
+    expand_exclude_source_slides: list[int] | None = None,
     # Workaround toggles (opt-in)
     fix_nested_picture: bool = False,
     skip_phase3_5: bool = False,
@@ -1852,6 +1923,7 @@ def run_with_mapping(
     auto_fix: bool = True,
     max_fix_iterations: int = 3,
     validate_strict: bool = True,
+    quality_strict: bool = False,
     clean_workspace: bool = False,
 ) -> dict[str, Any]:
     """One-stop driver for the "manual mapping + markdown section cloning" workflow.
@@ -1961,16 +2033,37 @@ def run_with_mapping(
             body_bounds=expand_body_bounds,
             ending_svg=expand_ending_svg,
             part_names=expand_part_names,
+            divider_subtitle_template=expand_divider_subtitle_template,
+            exclude_source_slides=expand_exclude_source_slides,
         )
 
     # Delegate phase 3 re-apply / 3.5 / 4 / 5 to run_native_fill.
     # run_native_fill will re-apply text edits (idempotent), optionally
     # skip phase 3.5, and run quality_check + svg_to_pptx.
+    #
+    # If we just expanded the workspace from markdown, forward the
+    # resulting page_plan.json so phase3_author's write_page_plan
+    # doesn't clobber it with the original-roster-only version.
+    effective_page_plan = page_plan
+    if expansions.get("page_plan_path"):
+        plan_json = expansions["page_plan_path"]
+        if plan_json.is_file():
+            try:
+                payload = json.loads(
+                    plan_json.read_text(encoding="utf-8")
+                )
+                if isinstance(payload.get("pages"), list):
+                    effective_page_plan = payload["pages"]
+            except (json.JSONDecodeError, OSError) as exc:
+                log.warning(
+                    "run_with_mapping: could not parse expanded page_plan: %s",
+                    exc,
+                )
     result = run_native_fill(
         source_pptx=source_pptx,
         workspace=workspace,
         output_pptx=output_pptx,
-        page_plan=page_plan,
+        page_plan=effective_page_plan,
         content_mapping=content_mapping,
         new_content_blocks=new_content_blocks,
         content_markdown=content_markdown,
@@ -1979,6 +2072,7 @@ def run_with_mapping(
         max_fix_iterations=max_fix_iterations,
         validate_strict=validate_strict,
         skip_phase3_5=skip_phase3_5,
+        quality_strict=quality_strict,
     )
     # Augment result with the pre-delegation work that the caller
     # asked about (edit_summary, strip_report, expansions).
@@ -2009,6 +2103,8 @@ def expand_workspace_from_markdown(
     layout: str = "3-column-cards",
     ending_svg: str | None = None,
     part_names: list[str] | None = None,
+    divider_subtitle_template: dict[str, str] | None = None,
+    exclude_source_slides: list[int] | None = None,
 ) -> dict[str, Any]:
     """Clone skeleton slides for each markdown H1 section.
 
@@ -2048,6 +2144,27 @@ def expand_workspace_from_markdown(
         Optional ordered list of section titles. Default ``None`` →
         auto-extract every H1 from the markdown. Caller may supply a
         subset to cap cloning (e.g. take only the first 4 H1s).
+    divider_subtitle_template:
+        Optional second-pass text edits applied to each cloned divider
+        AFTER ``divider_edits_template``. Same shape-id → text-format
+        format (``{nn}`` / ``{n}`` / ``{title}`` placeholders). Use
+        this for shapes the main title template doesn't cover — e.g.
+        boteng's English subtitle shape::
+
+            divider_subtitle_template={"shape-70": "{title_en}"}
+
+        Caller is responsible for picking the right shape ids and
+        supplying the value data; this function makes no assumption
+        about which shape ids exist on the template.
+    exclude_source_slides:
+        Optional list of 1-based slide numbers to drop from the
+        original roster in ``page_plan.json``. The skeleton slide used
+        for cloning (``skeleton_divider`` / ``skeleton_content``) is
+        usually a design sample whose on-deck counterpart would
+        duplicate the cloned per-section pages — boteng callers pass
+        ``[skeleton_divider]`` so the divider sample is cloned but
+        not also emitted as a standalone page. Default ``None``
+        preserves every original.
 
     Returns
     -------
@@ -2084,6 +2201,11 @@ def expand_workspace_from_markdown(
             div_edits = _format(divider_edits_template,
                                 nn=nn, n=i, title=title)
             svg_edits.apply_text_edits(auth / div_svg_name, div_edits)
+            # Optional subtitle second-pass (e.g. English subtitle shape).
+            if divider_subtitle_template:
+                sub_edits = _format(divider_subtitle_template,
+                                    nn=nn, n=i, title=title)
+                svg_edits.apply_text_edits(auth / div_svg_name, sub_edits)
             cloned.append(div_svg_name)
         else:
             log.warning(
@@ -2132,7 +2254,13 @@ def expand_workspace_from_markdown(
                 cont_skeleton.name, cont_svg_name,
             )
 
-    # Re-seal page_plan.json with original roster + cloned, ending last
+    # Re-seal page_plan.json with original roster + cloned, ending last.
+    # Caller may opt to drop skeleton source slides from the roster —
+    # those are design samples consumed by cloning and would
+    # duplicate the cloned per-section pages if left in.
+    exclude_filenames: frozenset[str] = frozenset(
+        f"slide_{n:02d}.svg" for n in (exclude_source_slides or [])
+    )
     additions_dicts = [
         {
             "source_slide": skeleton_divider if n.endswith("_div.svg")
@@ -2141,7 +2269,9 @@ def expand_workspace_from_markdown(
         }
         for n in cloned
     ]
-    original_roster = _seed_original_roster(auth)
+    original_roster = _seed_original_roster(
+        auth, exclude=exclude_filenames,
+    )
     pages = original_roster + additions_dicts
     if ending_svg:
         idx = next(

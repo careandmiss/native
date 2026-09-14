@@ -272,6 +272,35 @@ TOOL_NATIVE_FILL: dict[str, Any] = {
                             "extracts all H1 from content_markdown."
                         ),
                     },
+                    "expand_divider_subtitle_template": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": (
+                            "Optional second-pass text edits applied to "
+                            "each cloned divider AFTER "
+                            "expand_divider_edits_template. Same "
+                            "{shape_id: text_format} shape; supports "
+                            "{nn}/{n}/{title} placeholders. Use for "
+                            "shapes the main title template doesn't "
+                            "cover (e.g. English subtitle shape). "
+                            "Caller picks which shape ids to target — "
+                            "this server makes no template assumption."
+                        ),
+                    },
+                    "expand_exclude_source_slides": {
+                        "type": "array",
+                        "items": {"type": "integer", "minimum": 1},
+                        "description": (
+                            "Optional list of 1-based slide numbers to "
+                            "drop from page_plan.json's original roster. "
+                            "Use when a skeleton slide is also a "
+                            "design sample that cloning consumed — "
+                            "e.g. boteng callers pass [skeleton_divider] "
+                            "to drop slide_03 so the original 'PART 01 "
+                            "/ <template title>' doesn't appear in the "
+                            "deck alongside cloned per-section dividers."
+                        ),
+                    },
                     "clean_workspace": {
                         "type": "boolean",
                         "default": False,
@@ -315,6 +344,10 @@ def _execute_native_fill(arguments: dict) -> dict:
     expand_body_bounds = options.get("expand_body_bounds", "0 0 1280 720")
     expand_ending_svg = options.get("expand_ending_svg")
     expand_part_names = options.get("expand_part_names")
+    expand_divider_subtitle_template = options.get(
+        "expand_divider_subtitle_template"
+    )
+    expand_exclude_source_slides = options.get("expand_exclude_source_slides")
 
     content_markdown_raw = arguments.get("content_markdown")
     content_markdown: Path | None = (
@@ -384,6 +417,8 @@ def _execute_native_fill(arguments: dict) -> dict:
             expand_body_bounds=expand_body_bounds,
             expand_ending_svg=expand_ending_svg,
             expand_part_names=expand_part_names,
+            expand_divider_subtitle_template=expand_divider_subtitle_template,
+            expand_exclude_source_slides=expand_exclude_source_slides,
             fix_nested_picture=fix_nested_picture,
             skip_phase3_5=skip_phase3_5,
             auto_fix=auto_fix,

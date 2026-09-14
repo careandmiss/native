@@ -2861,6 +2861,167 @@ class TestExpandWorkspaceFromMarkdown(unittest.TestCase):
             )
 
 
+class TestSplitMarkdownSections(unittest.TestCase):
+    """Bug fix: H1 inline markdown (**bold** / *italic* / `code`) must be
+    stripped before the title is injected into a PPT shape, otherwise the
+    literal asterisks render in the slide.
+
+    Generic — not boteng-specific.
+    """
+
+    def test_strips_bold_asterisks(self):
+        sections = pl._split_markdown_sections(
+            "# **一、目的**\nbody 1\n\n# **二、范围**\nbody 2\n"
+        )
+        self.assertEqual(sections[0]["title"], "一、目的")
+        self.assertEqual(sections[1]["title"], "二、范围")
+
+    def test_strips_nested_bold_pairs(self):
+        # boteng markdown uses patterns like **一、****目的** (closing then
+        # opening bold around the comma).
+        sections = pl._split_markdown_sections(
+            "# **一、****目的**\nbody\n"
+        )
+        self.assertEqual(sections[0]["title"], "一、目的")
+
+    def test_strips_underscore_bold_and_inline_code(self):
+        sections = pl._split_markdown_sections(
+            "# __三、原则__\nbody\n\n# 四、`code` 占位\nbody\n"
+        )
+        self.assertEqual(sections[0]["title"], "三、原则")
+        self.assertEqual(sections[1]["title"], "四、code 占位")
+
+    def test_plain_title_unchanged(self):
+        sections = pl._split_markdown_sections(
+            "# 普通标题\nbody\n\n# 二、适用范围\nbody\n"
+        )
+        self.assertEqual(sections[0]["title"], "普通标题")
+        self.assertEqual(sections[1]["title"], "二、适用范围")
+
+
+class TestExpandDividerExtras(unittest.TestCase):
+    """Phase D: divider subtitle + exclude-source-slides opt-in params.
+
+    Both are zero-impact when omitted (preserves prior behaviour) and
+    fully template-agnostic when supplied. Boteng is one caller.
+    """
+
+    def _make_workspace(self, td: str) -> Path:
+        ws = Path(td)
+        auth = ws / "authoring-svg-flat"
+        auth.mkdir(parents=True)
+        # shape-4/5 are main divider title; shape-70 is the subtitle slot
+        # (boteng calls this out explicitly, but the test is generic —
+        # any other shape id with placeholder text would also work).
+        (auth / "slide_03.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg">'
+            '<g id="shape-4"><text>PLACEHOLDER TITLE</text></g>'
+            '<g id="shape-5"><text>PLACEHOLDER MAIN</text></g>'
+            '<g id="shape-70"><text>PLACEHOLDER SUB</text></g>'
+            '</svg>',
+            encoding="utf-8",
+        )
+        (auth / "slide_04.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg">'
+            '<g id="shape-17"><text>PLACEHOLDER CONTENT</text></g>'
+            '</svg>',
+            encoding="utf-8",
+        )
+        (auth / "slide_05.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg"/>', encoding="utf-8",
+        )
+        return ws
+
+    def test_subtitle_template_applied_after_main_template(self):
+        """divider_subtitle_template edits apply on top of the main edits
+        (e.g. shape-70 placeholder text gets replaced with a formatted
+        English title)."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_workspace(td)
+            md = Path(td) / "m.md"
+            md.write_text("# Section A\nbody\n\n# Section B\nbody\n",
+                          encoding="utf-8")
+            pl.expand_workspace_from_markdown(
+                ws, md,
+                skeleton_divider=3, skeleton_content=4,
+                divider_edits_template={
+                    "shape-4": "PART {nn}",
+                    "shape-5": "{title}",
+                },
+                content_edits_template={"shape-17": "{title}"},
+                divider_subtitle_template={"shape-70": "Section {nn} of N"},
+                exclude_source_slides=None,
+            )
+            div1 = (ws / "authoring-svg-flat" /
+                    "slide_part01_div.svg").read_text(encoding="utf-8")
+            self.assertIn("PART 01", div1)
+            self.assertIn("Section A", div1)
+            self.assertIn("Section 01 of N", div1)
+            # Original placeholder text for shape-70 must be gone.
+            self.assertNotIn("PLACEHOLDER SUB", div1)
+
+    def test_exclude_source_slides_drops_skeleton_from_roster(self):
+        """exclude_source_slides=[3] drops the original slide_03.svg from
+        page_plan.json — only the cloned per-section dividers remain."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_workspace(td)
+            md = Path(td) / "m.md"
+            md.write_text("# Section A\nbody\n\n# Section B\nbody\n",
+                          encoding="utf-8")
+            pl.expand_workspace_from_markdown(
+                ws, md,
+                skeleton_divider=3, skeleton_content=4,
+                divider_edits_template={"shape-4": "PART {nn}",
+                                        "shape-5": "{title}"},
+                content_edits_template={"shape-17": "{title}"},
+                exclude_source_slides=[3],
+            )
+            plan = json.loads(
+                (ws / "page_plan.json").read_text(encoding="utf-8")
+            )
+            roster = [p["svg"] for p in plan["pages"]]
+            self.assertNotIn("slide_03.svg", roster)
+            # slide_04 (content skeleton) and slide_05 (ending) still
+            # appear — exclude is opt-in per slide number.
+            self.assertIn("slide_04.svg", roster)
+            self.assertIn("slide_05.svg", roster)
+            # Two cloned dividers + two cloned contents still present.
+            self.assertEqual(roster.count("slide_part01_div.svg"), 1)
+            self.assertEqual(roster.count("slide_part02_div.svg"), 1)
+
+    def test_no_subtitle_when_omitted(self):
+        """Without divider_subtitle_template, original placeholder text
+        on shape-70 is preserved (no surprise side effects)."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_workspace(td)
+            md = Path(td) / "m.md"
+            md.write_text("# Section A\nbody\n", encoding="utf-8")
+            pl.expand_workspace_from_markdown(
+                ws, md,
+                skeleton_divider=3, skeleton_content=4,
+                divider_edits_template={"shape-4": "PART {nn}",
+                                        "shape-5": "{title}"},
+                content_edits_template={"shape-17": "{title}"},
+                # divider_subtitle_template omitted on purpose
+            )
+            div1 = (ws / "authoring-svg-flat" /
+                    "slide_part01_div.svg").read_text(encoding="utf-8")
+            self.assertIn("PLACEHOLDER SUB", div1)
+
+    def test_run_with_mapping_forwards_new_kwargs(self):
+        """The two new params must be part of run_with_mapping's
+        signature so callers can pass them through the MCP server."""
+        sig = inspect.signature(pl.run_with_mapping)
+        self.assertIn("expand_divider_subtitle_template", sig.parameters)
+        self.assertIn("expand_exclude_source_slides", sig.parameters)
+        self.assertEqual(
+            sig.parameters["expand_divider_subtitle_template"].default, None,
+        )
+        self.assertEqual(
+            sig.parameters["expand_exclude_source_slides"].default, None,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Phase I3: pipeline.run_with_mapping one-shot driver
 # ---------------------------------------------------------------------------
