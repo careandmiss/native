@@ -2708,6 +2708,86 @@ from mcp_ppt_native_fill.autofix import (  # noqa: E402
 )
 
 
+class TestFixZeroStrokeConnector(unittest.TestCase):
+    """Vendor svg_to_pptx drops <path stroke-width="0"> connectors,
+    silently stripping template underlines. This autofix rewrites
+    those to stroke-width="1" so they survive the round-trip."""
+
+    def _write_svg(self, td: str, body: str) -> Path:
+        p = Path(td) / "slide_02.svg"
+        p.write_text(
+            f'<svg xmlns="http://www.w3.org/2000/svg">{body}</svg>',
+            encoding="utf-8",
+        )
+        return p
+
+    def test_rewrites_zero_stroke_connector(self):
+        with tempfile.TemporaryDirectory() as td:
+            svg = self._write_svg(
+                td,
+                '<g id="shape-60" data-pptx-object="connector" '
+                'data-pptx-frame="0 0 100 0" data-pptx-prst="line">'
+                '<path d="M 0 0 L 100 0" stroke-width="0" '
+                'stroke="#576B93" fill="none" data-pptx-part="geometry"/>'
+                '</g>',
+            )
+            records = autofix.fix_zero_stroke_connector(svg)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].issue, "zero_stroke_connector")
+            new = svg.read_text(encoding="utf-8")
+            self.assertIn('stroke-width="1"', new)
+            self.assertNotIn('stroke-width="0"', new)
+
+    def test_leaves_non_connector_alone(self):
+        """Paths inside <g data-pptx-object="shape"> must not be touched."""
+        with tempfile.TemporaryDirectory() as td:
+            svg = self._write_svg(
+                td,
+                '<g id="shape-69" data-pptx-object="shape" '
+                'data-pptx-frame="0 0 100 50">'
+                '<path d="M 0 0 L 100 0" stroke-width="0" '
+                'stroke="#fff" fill="none"/>'
+                '</g>',
+            )
+            records = autofix.fix_zero_stroke_connector(svg)
+            self.assertEqual(records, [])
+            new = svg.read_text(encoding="utf-8")
+            self.assertIn('stroke-width="0"', new)
+
+    def test_skips_connectors_with_nonzero_stroke(self):
+        """Connectors that already have a real stroke are not touched."""
+        with tempfile.TemporaryDirectory() as td:
+            svg = self._write_svg(
+                td,
+                '<g id="shape-62" data-pptx-object="connector" '
+                'data-pptx-frame="0 0 0 100">'
+                '<path d="M 0 0 L 0 100" stroke-width="8" '
+                'stroke="#576B93" fill="none"/>'
+                '</g>',
+            )
+            records = autofix.fix_zero_stroke_connector(svg)
+            self.assertEqual(records, [])
+            new = svg.read_text(encoding="utf-8")
+            self.assertIn('stroke-width="8"', new)
+
+    def test_handles_multiple_connectors(self):
+        with tempfile.TemporaryDirectory() as td:
+            svg = self._write_svg(
+                td,
+                '<g id="shape-60" data-pptx-object="connector" '
+                'data-pptx-frame="0 0 100 0">'
+                '<path d="M 0 0 L 100 0" stroke-width="0" '
+                'stroke="#576B93" fill="none"/></g>'
+                '<g id="shape-74" data-pptx-object="connector" '
+                'data-pptx-frame="0 50 100 0">'
+                '<path d="M 0 50 L 100 50" stroke-width="0" '
+                'stroke="#576B93" fill="none"/></g>',
+            )
+            records = autofix.fix_zero_stroke_connector(svg)
+            self.assertEqual(len(records), 1)
+            self.assertIn("rewrote 2 connector", records[0].detail)
+
+
 class TestFixNestedPictureDataAttrs(unittest.TestCase):
     """boteng 兼容性:vendor svg_to_pptx 的 _require_project_nested_svg_crops
     要求嵌套形态下只有外层 <g> 可带 data-pptx-* 属性,内层 <image>/<svg> 不允许。
@@ -3041,10 +3121,16 @@ class TestRunWithMapping(unittest.TestCase):
             "expand_body_bounds", "expand_ending_svg", "expand_part_names",
             "clean_workspace",
             "expand_toc_from_markdown",
-            "expand_toc_slot_title_ids",
-            "expand_toc_slot_subtitle_ids",
+            "expand_toc_slot_grid",
         ):
             self.assertIn(p, sig.parameters, f"missing param: {p}")
+        # Legacy list-based fields must be gone.
+        for legacy in ("expand_toc_slot_title_ids",
+                       "expand_toc_slot_subtitle_ids"):
+            self.assertNotIn(
+                legacy, sig.parameters,
+                f"legacy param still present: {legacy}",
+            )
 
     def test_no_hardcoded_boteng_in_run_with_mapping(self):
         """run_with_mapping 体内不得硬编码 boteng 特有字段。"""
@@ -3219,7 +3305,9 @@ class TestExpandWorkspaceFromToc(unittest.TestCase):
 
     def test_lt_n_fills_first_n_clears_rest_keeps_g(self):
         """4 H1s into 6-slot TOC: first 4 filled, last 2 cleared but
-        their <g id="..."> shape must remain in the SVG."""
+        their <g id="..."> shape is preserved. Smart TOC does NOT
+        make structural decisions (delete vs preserve) — that belongs
+        to caller / LLM-driven path."""
         with tempfile.TemporaryDirectory() as td:
             ws = self._make_toc_workspace(td, slots=6)
             md = Path(td) / "m.md"
@@ -3237,20 +3325,24 @@ class TestExpandWorkspaceFromToc(unittest.TestCase):
             for title in ("Alpha", "Bravo", "Charlie", "Delta"):
                 self.assertIn(f">{title}<", svg_text,
                               f"expected {title!r} in TOC slide")
-            # Slots 4-5 must NOT contain the placeholder title
+            # Slots 4-5 placeholder text is gone
             self.assertNotIn("单击添加大标题 4", svg_text)
             self.assertNotIn("单击添加大标题 5", svg_text)
-            # Slots 4-5 subtitle cleared too
-            self.assertNotIn("单击添加小标题 4", svg_text)
-            self.assertNotIn("单击添加小标题 5", svg_text)
-            # <g> shapes for slots 4-5 must still exist (we clear text, not shape)
+            # <g> shapes for slots 4-5 are PRESERVED (smart TOC only
+            # clears text, not structural decisions)
             self.assertIn('id="shape-title-4"', svg_text)
             self.assertIn('id="shape-title-5"', svg_text)
             self.assertIn('id="shape-sub-4"', svg_text)
             self.assertIn('id="shape-sub-5"', svg_text)
-            # Some text node in slots 4-5 must be empty
-            # (ET self-closes <text></text> as <text ... />)
-            self.assertRegex(svg_text, r'<g id="shape-title-4"[^>]*>\s*<text[^>]*/>')
+            # <text> nodes in slots 4-5 are emptied (ET self-closes
+            # them as <text ... />)
+            self.assertRegex(
+                svg_text,
+                r'<g id="shape-title-4"[^>]*>\s*<text[^>]*/>',
+            )
+            # No marker file written (smart TOC doesn't make
+            # structural decisions for phase3_author to re-apply)
+            self.assertFalse((ws / "toc_deletions.json").is_file())
 
     def test_lt_n_returns_summary(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3314,16 +3406,20 @@ class TestExpandWorkspaceFromToc(unittest.TestCase):
                 self.assertIn(f">Title{i}<", original_text)
             self.assertNotIn(">Title7<", original_text)
 
-            # Clone: titles 7, 8 in slots 0, 1; slots 2-5 cleared
+            # Clone: titles 7, 8 in slots 0, 1; slots 2-5 cleared (text
+            # emptied, <g> preserved — smart TOC doesn't make
+            # structural decisions)
             clone_text = (auth / "slide_part02_toc.svg").read_text(encoding="utf-8")
             self.assertIn(">Title7<", clone_text)
             self.assertIn(">Title8<", clone_text)
             # Slots 2-5 placeholders gone (text cleared)
             for i in range(2, 6):
                 self.assertNotIn(f"单击添加大标题 {i}", clone_text)
-            # <g> shapes preserved on clone (cleared text, not deleted shape)
+            # <g> shapes for empty slots are PRESERVED on clone
             self.assertIn('id="shape-title-2"', clone_text)
             self.assertIn('id="shape-title-5"', clone_text)
+            self.assertIn('id="shape-sub-2"', clone_text)
+            self.assertIn('id="shape-sub-5"', clone_text)
 
     # --- T6: real boteng TOC structure ---
 
@@ -3402,6 +3498,159 @@ class TestExpandWorkspaceFromToc(unittest.TestCase):
                 if f"{ch} " in svg_text
             )
             self.assertEqual(chapter_with_body, 6)
+
+
+class TestDetectTocSlotShapeIds(unittest.TestCase):
+    """grid-based auto-detection of title/subtitle ids from SVG geometry.
+
+    Replaces caller-supplied expand_toc_slot_title_ids /
+    expand_toc_slot_subtitle_ids lists with a structural {rows, cols}
+    descriptor. The function walks data-pptx-frame attrs and returns ids
+    in row-major order.
+    """
+
+    def _make_grid_workspace(
+        self, td: str, *, rows: int, cols: int,
+    ) -> Path:
+        """Synthesize a real rows×cols TOC grid: each cell has one title
+        <g> (h=46) and one subtitle <g> (h=30) directly below it.
+        Plus a decoration <g data-pptx-object="picture"> that the
+        detector must skip."""
+        ws = Path(td)
+        auth = ws / "authoring-svg-flat"
+        auth.mkdir(parents=True)
+        parts = ['<svg xmlns="http://www.w3.org/2000/svg">',
+                 '<text>目录</text>']
+        parts.append(
+            '<g id="shape-deco" data-pptx-object="picture" '
+            'data-pptx-frame="0 0 1280 50">'
+            '<rect width="1280" height="50"/></g>'
+        )
+        for r in range(rows):
+            for c in range(cols):
+                x_l = 100 + c * 500
+                y_t = 100 + r * 150
+                parts.append(
+                    f'<g id="shape-t-{r}-{c}" '
+                    f'data-pptx-frame="{x_l} {y_t} 400 46">'
+                    f'<text>title {r},{c}</text></g>'
+                )
+                parts.append(
+                    f'<g id="shape-s-{r}-{c}" '
+                    f'data-pptx-frame="{x_l} {y_t + 60} 400 30">'
+                    f'<text>sub {r},{c}</text></g>'
+                )
+        parts.append('</svg>')
+        (auth / "slide_02.svg").write_text(
+            "\n".join(parts), encoding="utf-8",
+        )
+        return ws
+
+    def test_grid_3x2_returns_row_major_title_ids(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_grid_workspace(td, rows=3, cols=2)
+            titles, subs = pl._detect_toc_slot_shape_ids(
+                ws / "authoring-svg-flat" / "slide_02.svg",
+                rows=3, cols=2,
+            )
+            self.assertEqual(len(titles), 6)
+            self.assertEqual(len(subs), 6)
+            # Row-major: r0c0, r0c1, r1c0, r1c1, r2c0, r2c1
+            self.assertEqual(
+                titles,
+                ["shape-t-0-0", "shape-t-0-1",
+                 "shape-t-1-0", "shape-t-1-1",
+                 "shape-t-2-0", "shape-t-2-1"],
+            )
+            self.assertEqual(
+                subs,
+                [f"shape-s-{r}-{c}" for r in range(3) for c in range(2)],
+            )
+
+    def test_grid_2x4_wider_than_tall(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_grid_workspace(td, rows=2, cols=4)
+            titles, _ = pl._detect_toc_slot_shape_ids(
+                ws / "authoring-svg-flat" / "slide_02.svg",
+                rows=2, cols=4,
+            )
+            self.assertEqual(len(titles), 8)
+            self.assertEqual(titles[0], "shape-t-0-0")
+            self.assertEqual(titles[3], "shape-t-0-3")
+            self.assertEqual(titles[4], "shape-t-1-0")
+            self.assertEqual(titles[7], "shape-t-1-3")
+
+    def test_grid_mismatch_raises(self):
+        """Caller says 4x2 but SVG only has 3 rows → ValueError."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_grid_workspace(td, rows=3, cols=2)
+            with self.assertRaises(ValueError) as cm:
+                pl._detect_toc_slot_shape_ids(
+                    ws / "authoring-svg-flat" / "slide_02.svg",
+                    rows=4, cols=2,
+                )
+            self.assertIn("4x2", str(cm.exception))
+            self.assertIn("6", str(cm.exception))  # expected count
+
+    def test_grid_skips_picture_decoration(self):
+        """data-pptx-object="picture" shape must be excluded."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            auth = ws / "authoring-svg-flat"
+            auth.mkdir(parents=True)
+            (auth / "slide_02.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg">'
+                '<text>目录</text>'
+                '<g id="shape-bg" data-pptx-object="picture" '
+                'data-pptx-frame="0 0 1280 720">'
+                '<image href="bg.png"/></g>'
+                '<g id="shape-t-0-0" data-pptx-frame="100 100 400 46">'
+                '<text>title</text></g>'
+                '</svg>',
+                encoding="utf-8",
+            )
+            titles, subs = pl._detect_toc_slot_shape_ids(
+                auth / "slide_02.svg", rows=1, cols=1,
+            )
+            self.assertEqual(titles, ["shape-t-0-0"])
+            # No subtitle → empty string in that cell.
+            self.assertEqual(subs, [""])
+
+    def test_subtitle_empty_string_when_cell_has_no_subtitle(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            auth = ws / "authoring-svg-flat"
+            auth.mkdir(parents=True)
+            (auth / "slide_02.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg">'
+                '<text>目录</text>'
+                '<g id="shape-t-0-0" data-pptx-frame="100 100 400 46">'
+                '<text>only title</text></g>'
+                '</svg>',
+                encoding="utf-8",
+            )
+            titles, subs = pl._detect_toc_slot_shape_ids(
+                auth / "slide_02.svg", rows=1, cols=1,
+            )
+            self.assertEqual(titles, ["shape-t-0-0"])
+            self.assertEqual(subs, [""])
+
+    def test_invalid_grid_dimensions_raise(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            auth = ws / "authoring-svg-flat"
+            auth.mkdir(parents=True)
+            (auth / "slide_02.svg").write_text(
+                '<svg><text>目录</text></svg>', encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                pl._detect_toc_slot_shape_ids(
+                    auth / "slide_02.svg", rows=0, cols=2,
+                )
+            with self.assertRaises(ValueError):
+                pl._detect_toc_slot_shape_ids(
+                    auth / "slide_02.svg", rows=2, cols=0,
+                )
 
 
 if __name__ == "__main__":

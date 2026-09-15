@@ -696,6 +696,65 @@ def fix_unsafe_font(svg_path: Path) -> list[AutoFixRecord]:
 
 
 # ---------------------------------------------------------------------------
+# Fix 5: zero-stroke-width connector loss.
+#
+# Vendor pptx_to_svg emits connector lines as <path stroke-width="0" ...>
+# when the source PPTX connector had <a:ln w="0"> (PowerPoint default
+# for a thin visible underline). Vendor svg_to_pptx (line 1547) drops
+# any <path> with stroke-width=0, so these "0-width" connectors silently
+# disappear from the exported deck — even though PowerPoint rendered
+# them as visible thin lines in the source.
+#
+# This fix rewrites stroke-width="0" to stroke-width="1" (≈1 EMU per
+# vendor convention, renders as a hairline visible line) for any
+# <path> whose parent <g> declares data-pptx-object="connector". The
+# rewrite is generic (no template-specific shape ids) and only affects
+# the connector's stroke-width attribute; sibling attributes and geometry
+# are untouched.
+# ---------------------------------------------------------------------------
+
+_ZERO_STROKE_RE = re.compile(
+    r'(<g\b[^>]*\bdata-pptx-object="connector"[^>]*>'
+    r'(?:(?!</g>).)*?'
+    r'<path\b[^>]*?\bstroke-width="0")',
+    re.DOTALL,
+)
+
+
+def fix_zero_stroke_connector(svg_path: Path) -> list[AutoFixRecord]:
+    """Restore zero-stroke connector paths that svg_to_pptx would drop."""
+    try:
+        raw = svg_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        log.warning("autofix: cannot read %s: %s", svg_path.name, exc)
+        return []
+
+    new_raw, n = _ZERO_STROKE_RE.subn(
+        lambda m: m.group(1)[:-len('stroke-width="0"')] + 'stroke-width="1"',
+        raw,
+    )
+    if n == 0 or new_raw == raw:
+        return []
+    try:
+        svg_path.write_text(new_raw, encoding="utf-8")
+    except OSError as exc:
+        log.warning("autofix: cannot write %s: %s", svg_path.name, exc)
+        return []
+    log.info(
+        "autofix: rewrote stroke-width=0 → 1 on %d connector <path> in %s",
+        n, svg_path.name,
+    )
+    return [AutoFixRecord(
+        slide=svg_path.name,
+        issue="zero_stroke_connector",
+        action="stroke_width_0_to_1",
+        before="stroke-width=\"0\"",
+        after="stroke-width=\"1\"",
+        detail=f"rewrote {n} connector path(s)",
+    )]
+
+
+# ---------------------------------------------------------------------------
 # Orchestration.
 # ---------------------------------------------------------------------------
 

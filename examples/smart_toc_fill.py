@@ -30,18 +30,10 @@ DEFAULT_MD = Path(r"D:\Code\tst\native_fill\3山西柏腾科技有限公司采�
 DEFAULT_OUTPUT = HERE.parent / "projects" / "smart_toc_boteng_out.pptx"
 DEFAULT_WORKSPACE = HERE.parent / "projects" / "smart_toc_boteng_workspace"
 
-# Boteng slide_02 TOC slot ids (verified earlier — 3 rows × 2 cols)
-# row-major fill order: r1c1, r1c2, r2c1, r2c2, r3c1, r3c2
-TOC_TITLE_IDS = [
-    "shape-69", "shape-72",
-    "shape-77", "shape-80",
-    "shape-86", "shape-89",
-]
-TOC_SUBTITLE_IDS = [
-    "shape-70", "shape-73",
-    "shape-78", "shape-81",
-    "shape-87", "shape-90",
-]
+# Boteng slide_02 TOC layout — 3 rows × 2 cols. Caller only declares
+# grid dimensions; the function auto-locates title + subtitle shape ids
+# from the SVG geometry.
+TOC_TOP = {"rows": 3, "cols": 2}
 
 # Divider / content skeleton (boteng: slide_03 = divider, slide_04 = content)
 DIVIDER_EDITS = {
@@ -104,10 +96,10 @@ def run(template: Path, md_path: Path, workspace: Path, output: Path) -> int:
         "content_markdown": str(md_path),
         "options": {
             "validate_strict": False,
-            # Smart TOC fill
+            # Smart TOC fill — caller declares grid only; shape ids are
+            # auto-detected from SVG geometry.
             "expand_toc_from_markdown": True,
-            "expand_toc_slot_title_ids": TOC_TITLE_IDS,
-            "expand_toc_slot_subtitle_ids": TOC_SUBTITLE_IDS,
+            "expand_toc_slot_grid": TOC_TOP,
             # Divider / content cloning (existing)
             "expand_skeleton_divider": 3,
             "expand_skeleton_content": 4,

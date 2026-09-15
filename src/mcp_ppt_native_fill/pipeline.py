@@ -331,6 +331,166 @@ def _is_toc_slot_placeholder(text: str) -> bool:
     return False
 
 
+def _detect_toc_slot_shape_ids(
+    toc_svg_path: Path,
+    *,
+    rows: int,
+    cols: int,
+    subtitle_offset: float | None = None,
+) -> tuple[list[str], list[str]]:
+    """Auto-detect title + subtitle shape-* ids for an N×M TOC grid.
+
+    Walks the TOC slide's ``<g id="shape-*" data-pptx-frame="x y w h">``
+    elements, clusters them by y-coordinate into rows and by
+    x-coordinate into columns, and returns the title/subtitle shape ids
+    in row-major fill order (r1c1, r1c2, r2c1, r2c2, ...).
+
+    Caller declares the grid dimensions (``rows``, ``cols``); the
+    function never assumes a specific template layout. Title shapes are
+    identified by frame height ∈ [35, 60] (matches
+    :func:`_remove_empty_toc_slots`'s heuristic so detection agrees
+    with the LLM-cleanup path). Subtitle per cell is the nearest shape
+    (by y) within ``±50 px`` of ``title_y + subtitle_offset`` and inside
+    a ``±50 px`` x-band of ``title_x``. If no subtitle is found the
+    cell's subtitle id is the empty string.
+
+    Parameters
+    ----------
+    toc_svg_path:
+        Path to the TOC slide's SVG. Must already exist (post
+        phase2_import) and contain ``<g id="shape-*" data-pptx-frame=…>``
+        elements.
+    rows, cols:
+        Grid dimensions declared by the caller. ``rows * cols`` is the
+        total slot count.
+    subtitle_offset:
+        Optional y-offset (px) below the title within each cell where
+        the subtitle sits. Default ``30`` (matches the synthetic test
+        fixture); boteng's ``~52 px`` works without override because
+        the x-band + nearest-y pick resolves it.
+
+    Returns
+    -------
+    ``(title_ids, subtitle_ids)`` — both lists have length
+    ``rows * cols`` in row-major order. ``subtitle_ids[i]`` is the id
+    of the subtitle shape inside the same cell as ``title_ids[i]``,
+    or ``""`` when no subtitle was found.
+
+    Raises
+    ------
+    ValueError
+        * ``rows < 1`` or ``cols < 1``.
+        * SVG has fewer than ``rows * cols`` title candidates.
+        * A row anchor has fewer than ``cols`` titles.
+    """
+    if rows < 1 or cols < 1:
+        raise ValueError(f"rows={rows}, cols={cols} must be >= 1")
+
+    raw = toc_svg_path.read_text(encoding="utf-8")
+    # Match any shape-* id (digits, hyphens, underscores). The
+    # ``shape-`` prefix is the ppt-master convention; the suffix can be
+    # anything (``69`` for boteng, ``title-0`` for synthetic fixtures).
+    shape_re = re.compile(
+        r'<g id="(shape-[^"]+)"[^>]*data-pptx-frame="([^"]+)"[^>]*>(.*?)</g>',
+        re.DOTALL,
+    )
+    # gid -> (x_l, y_top, x_r, y_bot, h)
+    parsed: dict[str, tuple[float, float, float, float, float]] = {}
+    for m in shape_re.finditer(raw):
+        gid = m.group(1)
+        parts = m.group(2).split()
+        if len(parts) < 4:
+            continue
+        try:
+            x, y, w, h = (float(p) for p in parts[:4])
+        except ValueError:
+            continue
+        body = m.group(3)
+        if "<image" in body:
+            continue
+        if 'data-pptx-object="picture"' in m.group(0):
+            continue
+        parsed[gid] = (x, y, x + w, y + h, h)
+
+    if not parsed:
+        raise ValueError(
+            f"no shape-* <g> with frame in {toc_svg_path}"
+        )
+
+    # Title candidates: frame height ∈ [35, 60] (matches
+    # _remove_empty_toc_slots heuristic so detection agrees with the
+    # LLM-driven cleanup path).
+    title_candidates: list[tuple[str, float, float, float]] = [
+        (g, xl, yt, h) for g, (xl, yt, xr, yb, h) in parsed.items()
+        if 35.0 <= h <= 60.0
+    ]
+    if len(title_candidates) < rows * cols:
+        raise ValueError(
+            f"grid {rows}x{cols} needs {rows * cols} title shapes "
+            f"(height 35-60), found {len(title_candidates)} in "
+            f"{toc_svg_path}. Adjust the grid spec or check the SVG."
+        )
+
+    # Cluster title candidates by y_top with ±5 px tolerance to
+    # produce row anchors. Same dedup rule as _remove_empty_toc_slots.
+    title_candidates.sort(key=lambda t: t[2])
+    row_anchors: list[float] = []
+    for _g, _xl, y, _h in title_candidates:
+        if row_anchors and abs(row_anchors[-1] - y) < 5.0:
+            continue
+        row_anchors.append(y)
+        if len(row_anchors) >= rows:
+            break
+    if len(row_anchors) < rows:
+        raise ValueError(
+            f"expected {rows} distinct row anchors, found "
+            f"{len(row_anchors)} in {toc_svg_path}"
+        )
+
+    # For each row anchor, take `cols` leftmost titles by x_left.
+    title_ids: list[str] = []
+    title_xs: list[float] = []
+    title_ys: list[float] = []
+    for anchor in row_anchors[:rows]:
+        row_titles = sorted(
+            [(g, xl, yt, h) for g, xl, yt, h in title_candidates
+             if abs(yt - anchor) < 30.0],
+            key=lambda t: t[1],
+        )[:cols]
+        if len(row_titles) < cols:
+            raise ValueError(
+                f"row at y={anchor} has only {len(row_titles)} title "
+                f"shape(s); grid wants {cols}"
+            )
+        for gid, xl, yt, _h in row_titles:
+            title_ids.append(gid)
+            title_xs.append(xl)
+            title_ys.append(yt)
+
+    # Subtitle per cell: nearest shape (by y) within x-band ±50 px
+    # of title_x, y close to title_y + subtitle_offset. Skip if the
+    # nearest is already a title.
+    subtitle_ids: list[str] = []
+    target_offset = subtitle_offset if subtitle_offset is not None else 30.0
+    title_set = set(title_ids)
+    for tx, ty in zip(title_xs, title_ys):
+        best: str = ""
+        best_dist = float("inf")
+        target_y = ty + target_offset
+        for gid, (xl, yt, _xr, _yb, _h) in parsed.items():
+            if gid in title_set:
+                continue
+            if abs(xl - tx) > 50.0:
+                continue
+            d = abs(yt - target_y)
+            if d < best_dist:
+                best_dist = d
+                best = gid
+        subtitle_ids.append(best)
+
+    return title_ids, subtitle_ids
+
+
 def _remove_empty_toc_slots(
     authoring_dir: Path,
     state: PipelineState,
@@ -1150,6 +1310,7 @@ def phase3_5_pre_export_fixes(
             autofix.fix_gradient_unexportable,
             autofix.fix_picture_structure,
             autofix.fix_unsafe_font,
+            autofix.fix_zero_stroke_connector,
         ):
             try:
                 for rec in fn(svg_path):
@@ -1494,6 +1655,10 @@ def run_native_fill(
         # emits refs like ``slide:22`` for a 5-slide deck which
         # svg_to_pptx cannot resolve. We run JUST the source-ref fix
         # (no picture_structure rewrite, no gradient/font rewrite).
+        # Also run fix_zero_stroke_connector: vendor svg_to_pptx drops
+        # <path stroke-width="0"> elements, which silently strips
+        # template underlines (e.g. boteng TOC header bar). Safe —
+        # only touches connector paths.
         try:
             valid = set(range(1, 100))  # best-effort permissive set
             for svg_path in sorted(
@@ -1502,6 +1667,10 @@ def run_native_fill(
                 for rec in autofix.fix_invalid_source_ref(
                     svg_path, valid, strip_all=True,
                 ):
+                    state.context.setdefault(
+                        "fix_iterations", []
+                    ).append(rec.to_dict())
+                for rec in autofix.fix_zero_stroke_connector(svg_path):
                     state.context.setdefault(
                         "fix_iterations", []
                     ).append(rec.to_dict())
@@ -2001,8 +2170,7 @@ def run_with_mapping(
     skip_phase3_5: bool = False,
     # Smart TOC fill (opt-in; auto-detects TOC slide from 目录/CONTENTS)
     expand_toc_from_markdown: bool = False,
-    expand_toc_slot_title_ids: list[str] | None = None,
-    expand_toc_slot_subtitle_ids: list[str] | None = None,
+    expand_toc_slot_grid: dict[str, Any] | None = None,
     # run_native_fill params
     auto_fix: bool = True,
     max_fix_iterations: int = 3,
@@ -2077,17 +2245,47 @@ def run_with_mapping(
     # any manual content_mapping entries that target TOC slot shape ids.
     # Otherwise those manual entries would stomp the auto-generated TOC.
     toc_dropped_count = 0
-    if (
-        expand_toc_from_markdown
-        and (expand_toc_slot_title_ids or expand_toc_slot_subtitle_ids)
-    ):
-        toc_shape_ids = list(
-            (expand_toc_slot_title_ids or []) +
-            (expand_toc_slot_subtitle_ids or [])
-        )
-        content_mapping, toc_dropped_count = _filter_toc_manual_mapping(
-            content_mapping, toc_shape_ids,
-        )
+    resolved_toc: dict[str, list[str]] = {
+        "title_ids": [], "subtitle_ids": [], "toc_svg": None,
+    }
+    if expand_toc_slot_grid is not None:
+        toc_svg_explicit = expand_toc_slot_grid.get("toc_svg")
+        toc_svg_name: str | None = None
+        if toc_svg_explicit and (auth / toc_svg_explicit).is_file():
+            toc_svg_name = toc_svg_explicit
+        else:
+            try:
+                toc_svg_name = _find_toc_svg(auth)
+            except ValueError:
+                toc_svg_name = None
+        if toc_svg_name:
+            try:
+                detected_titles, detected_subs = _detect_toc_slot_shape_ids(
+                    auth / toc_svg_name,
+                    rows=int(expand_toc_slot_grid["rows"]),
+                    cols=int(expand_toc_slot_grid["cols"]),
+                    subtitle_offset=expand_toc_slot_grid.get("subtitle_offset"),
+                )
+            except (ValueError, OSError) as exc:
+                log.warning(
+                    "smart TOC grid detection failed for %s: %s: %s",
+                    toc_svg_name, type(exc).__name__, exc,
+                )
+            else:
+                resolved_toc = {
+                    "title_ids": detected_titles,
+                    "subtitle_ids": detected_subs,
+                    "toc_svg": toc_svg_name,
+                }
+                if expand_toc_from_markdown and (
+                    detected_titles or detected_subs
+                ):
+                    content_mapping, toc_dropped_count = (
+                        _filter_toc_manual_mapping(
+                            content_mapping,
+                            list(detected_titles) + list(detected_subs),
+                        )
+                    )
 
     # Phase 3 (pre): apply text edits to the original skeleton SVGs
     edit_summary: list[dict[str, Any]] = []
@@ -2149,12 +2347,16 @@ def run_with_mapping(
         expand_toc_from_markdown
         and content_markdown is not None
         and content_markdown.is_file()
-        and expand_toc_slot_title_ids
+        and resolved_toc["title_ids"]
     ):
+        toc_subtitle_ids = [
+            sid for sid in resolved_toc["subtitle_ids"] if sid
+        ] or None
         toc_summary = expand_workspace_from_toc(
             workspace, content_markdown,
-            toc_slot_title_ids=expand_toc_slot_title_ids,
-            toc_slot_subtitle_ids=expand_toc_slot_subtitle_ids,
+            toc_slot_title_ids=resolved_toc["title_ids"],
+            toc_slot_subtitle_ids=toc_subtitle_ids,
+            toc_svg=resolved_toc["toc_svg"],
         )
         # Also merge the TOC fill into content_mapping for the TOC slide
         # so phase3_author's re-apply (idempotent) restores the fill
@@ -2163,8 +2365,8 @@ def run_with_mapping(
         toc_svg_name = toc_summary["toc_svg"]
         toc_edits_for_phase3 = _build_toc_phase3_edits(
             workspace, content_markdown,
-            toc_slot_title_ids=expand_toc_slot_title_ids,
-            toc_slot_subtitle_ids=expand_toc_slot_subtitle_ids,
+            toc_slot_title_ids=resolved_toc["title_ids"],
+            toc_slot_subtitle_ids=toc_subtitle_ids,
         )
         if toc_edits_for_phase3:
             existing = content_mapping.get(toc_svg_name, {})
@@ -2510,6 +2712,45 @@ def _build_toc_phase3_edits(
     )
 
 
+def _toc_deletion_marker_path(workspace: Path) -> Path:
+    """Unused — kept as a no-op stub for backwards compatibility with
+    any external callers that referenced it. smart TOC no longer
+    performs structural deletions; that decision belongs to the
+    caller or the LLM-driven content_mapping path.
+    """
+    raise NotImplementedError(
+        "smart TOC deletion marker removed: structural decisions "
+        "(delete vs preserve slot shape) belong to caller/LLM"
+    )
+
+
+def _apply_toc_deletion_marker(
+    authoring_dir: Path,
+    state: PipelineState,
+) -> None:
+    """No-op. Smart TOC fill preserves slot shapes; caller/LLM decides
+    whether to delete the cleared slots.
+    """
+    return None
+
+
+def _strip_toc_slot_g_elements(
+    svg_path: Path,
+    slot_indices: list[int],
+    title_ids: list[str],
+    sub_ids: list[str] | None,
+) -> None:
+    """Unused — kept as a no-op stub for backwards compatibility.
+    Smart TOC fill preserves slot shapes; structural deletion is
+    caller/LLM's responsibility (see ``_remove_empty_toc_slots`` for
+    the LLM-driven cleanup).
+    """
+    raise NotImplementedError(
+        "smart TOC slot <g> deletion removed: structural decisions "
+        "belong to caller/LLM"
+    )
+
+
 def expand_workspace_from_toc(
     workspace: Path,
     md_path: Path,
@@ -2546,7 +2787,9 @@ def expand_workspace_from_toc(
     * N <= slots_total: edit ``toc_svg`` in place. Fill first N slots;
       clear remaining slots' title text (and subtitle text if subtitle
       ids were supplied). Slot ``<g>`` shapes are preserved — only
-      ``<text>`` nodes are emptied.
+      ``<text>`` nodes are emptied. Structural cleanup (delete empty
+      slot shapes) is the caller's responsibility; the LLM-driven
+      path handles it via :func:`_remove_empty_toc_slots`.
     * N > slots_total: fill first batch in ``toc_svg``; for each
       subsequent batch of ``slots_total`` items, clone ``toc_svg`` as
       ``slide_partNN_toc.svg`` and fill. page_plan.json is updated so

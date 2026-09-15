@@ -317,36 +317,54 @@ TOOL_NATIVE_FILL: dict[str, Any] = {
                             "markdown H1s (after manual content_mapping "
                             "edits). TOC slide is auto-detected (the "
                             "first slide containing '目录' or "
-                            "'CONTENTS'). Caller must supply "
-                            "expand_toc_slot_title_ids. Manual mapping "
-                            "entries that target TOC slot shape ids "
-                            "are silently dropped to avoid stomping the "
-                            "auto-fill."
+                            "'CONTENTS'). Caller must also supply "
+                            "expand_toc_slot_grid so the function knows "
+                            "the slot grid. Manual mapping entries that "
+                            "target TOC slot shape ids are silently "
+                            "dropped to avoid stomping the auto-fill."
                         ),
                     },
-                    "expand_toc_slot_title_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
+                    "expand_toc_slot_grid": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "rows": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 12,
+                            },
+                            "cols": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 12,
+                            },
+                            "toc_svg": {
+                                "type": "string",
+                                "description": (
+                                    "Optional explicit TOC SVG filename. "
+                                    "Defaults to the first slide containing "
+                                    "'目录' or 'CONTENTS'."
+                                ),
+                            },
+                            "subtitle_offset": {
+                                "type": "number",
+                                "description": (
+                                    "Optional y-offset (px) below the "
+                                    "title within each cell where the "
+                                    "subtitle sits. Default 30; boteng's "
+                                    "~52 also works (x-band + nearest-y "
+                                    "pick resolves it)."
+                                ),
+                            },
+                        },
+                        "required": ["rows", "cols"],
                         "description": (
-                            "Required when expand_toc_from_markdown is "
-                            "true: ordered list of shape-* ids that "
-                            "receive the chapter titles in row-major "
-                            "fill order. Caller picks the ids for "
-                            "their template (e.g. boteng: "
-                            "['shape-69','shape-72','shape-77',"
-                            "'shape-80','shape-86','shape-89'])."
-                        ),
-                    },
-                    "expand_toc_slot_subtitle_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": (
-                            "Optional parallel list of shape-* ids for "
-                            "subtitle text. Same length as "
-                            "expand_toc_slot_title_ids. If given, "
-                            "subtitles mirror the title text (caller "
-                            "can post-edit). If omitted, subtitle "
-                            "slots are left untouched."
+                            "Required when expand_toc_from_markdown=true: "
+                            "declares the TOC slot grid (rows × cols). "
+                            "Title/subtitle shape ids are auto-detected "
+                            "from SVG geometry in row-major fill order. "
+                            "Replaces the older expand_toc_slot_title_ids "
+                            "/ expand_toc_slot_subtitle_ids fields."
                         ),
                     },
                 },
@@ -393,8 +411,7 @@ def _execute_native_fill(arguments: dict) -> dict:
     expand_toc_from_markdown = bool(
         options.get("expand_toc_from_markdown", False)
     )
-    expand_toc_slot_title_ids = options.get("expand_toc_slot_title_ids")
-    expand_toc_slot_subtitle_ids = options.get("expand_toc_slot_subtitle_ids")
+    expand_toc_slot_grid = options.get("expand_toc_slot_grid")
 
     content_markdown_raw = arguments.get("content_markdown")
     content_markdown: Path | None = (
@@ -438,7 +455,7 @@ def _execute_native_fill(arguments: dict) -> dict:
     )
     needs_toc_expand = (
         expand_toc_from_markdown
-        and expand_toc_slot_title_ids is not None
+        and expand_toc_slot_grid is not None
     )
     if needs_expand or needs_toc_expand:
         if not content_markdown:
@@ -472,8 +489,7 @@ def _execute_native_fill(arguments: dict) -> dict:
             expand_divider_subtitle_template=expand_divider_subtitle_template,
             expand_exclude_source_slides=expand_exclude_source_slides,
             expand_toc_from_markdown=expand_toc_from_markdown,
-            expand_toc_slot_title_ids=expand_toc_slot_title_ids,
-            expand_toc_slot_subtitle_ids=expand_toc_slot_subtitle_ids,
+            expand_toc_slot_grid=expand_toc_slot_grid,
             fix_nested_picture=fix_nested_picture,
             skip_phase3_5=skip_phase3_5,
             auto_fix=auto_fix,
