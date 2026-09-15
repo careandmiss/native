@@ -594,7 +594,14 @@ def phase3_author(
             )
             continue
         try:
-            audit = svg_edits.apply_text_edits(svg_path, edits)
+            # mark_empty_as_carrier=True so re-cleared TOC slot <text>
+            # elements (post-phase2_import overwrite) survive vendor
+            # convert_text compilation. Only fires for new_text == "";
+            # filled edits are unaffected. Idempotent — running again
+            # just sets the same attr.
+            audit = svg_edits.apply_text_edits(
+                svg_path, edits, mark_empty_as_carrier=True,
+            )
             for entry in audit:
                 if entry.get("status") != "applied":
                     state.warnings.append(
@@ -1380,7 +1387,14 @@ def run_with_mapping(
                 "applied": 0, "total": len(edits),
             })
             continue
-        audit = svg_edits.apply_text_edits(p, edits)
+        # mark_empty_as_carrier=True so re-cleared TOC slot <text>
+        # elements (post-phase2_import overwrite) survive convert_text
+        # compilation. The flag is no-op on filled edits — only fires
+        # for new_text == "". Idempotent with the earlier
+        # expand_workspace_from_toc pass which already marked the
+        # cleared slots.
+        audit = svg_edits.apply_text_edits(p, edits,
+                                           mark_empty_as_carrier=True)
         ok = sum(1 for r in audit if r.get("status") == "applied")
         edit_summary.append({
             "svg": fn, "status": "applied",

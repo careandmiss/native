@@ -412,7 +412,14 @@ def expand_workspace_from_toc(
         toc_slot_title_ids,
         toc_slot_subtitle_ids,
     )
-    svg_edits.apply_text_edits(auth / toc_svg, edits)
+    # mark_empty_as_carrier=True: cleared TOC slot <text> elements get
+    # data-pptx-carrier="true" so vendor svg_to_pptx convert_text
+    # substitutes a zero-width space instead of returning None (which
+    # would raise "Semantic shape text component produced no native
+    # text body" at export time).
+    svg_edits.apply_text_edits(
+        auth / toc_svg, edits, mark_empty_as_carrier=True,
+    )
 
     # --- > N case: clone per overflow batch ---
     cloned: list[str] = []
@@ -430,7 +437,9 @@ def expand_workspace_from_toc(
                 toc_slot_title_ids,
                 toc_slot_subtitle_ids,
             )
-            svg_edits.apply_text_edits(auth / clone_name, clone_edits)
+            svg_edits.apply_text_edits(
+                auth / clone_name, clone_edits, mark_empty_as_carrier=True,
+            )
             cloned.append(clone_name)
 
     # --- Update page_plan.json: clones follow the original TOC ---

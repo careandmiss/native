@@ -70,6 +70,7 @@ def apply_text_edits(
     edits: dict[str, str],
     *,
     preserve_whitespace: bool = True,
+    mark_empty_as_carrier: bool = False,
 ) -> list[dict]:
     """Replace the visible text inside each <text> referenced by edits.
 
@@ -84,6 +85,24 @@ def apply_text_edits(
     preserve_whitespace:
         If True, set ``xml:space="preserve"`` on the text element to keep
         leading/trailing spaces (this is the ppt-master default).
+    mark_empty_as_carrier:
+        When True AND ``new_text`` is empty, REMOVE the cleared ``<text>``
+        element from the slot ``<g>``. This avoids the vendor
+        ``Semantic shape text component produced no native text body``
+        error in :func:`_semantic_shape_text_body` (``converter.py:744``):
+        with no ``<text>`` child, that function returns ``None`` and the
+        semantic shape compiles as pure geometry. The alternative —
+        leaving the ``<text>`` empty with ``data-pptx-carrier="true"`` —
+        fails vendor's placement lint (``template_structure.py:1866-1876``)
+        because boteng's slot ``<g>`` is not a ``data-pptx-placeholder``
+        slot. Used by the smart TOC fill path when clearing unused slots
+        (4-chapter scenario, 7-chapter overflow clone, …). Other callers
+        leave the default ``False`` so non-TOC edits are unaffected.
+
+        .. note::
+           Param name kept (``mark_empty_as_carrier``) for grep
+           stability with downstream autofixes and earlier Wave 1 patches.
+           Effective behaviour is now: remove the empty ``<text>``.
 
     Returns
     -------
@@ -132,6 +151,32 @@ def apply_text_edits(
             # rejects as ``duplicate attribute: line N, column M``).
             text_elem.set("{http://www.w3.org/XML/1998/namespace}space",
                           "preserve")
+
+        # Smart-TOC slot clearing: drop the empty <text> entirely.
+        # Vendor ``_semantic_shape_text_body`` (``converter.py:744``)
+        # raises ``Semantic shape text component produced no native text
+        # body`` when a semantic shape's only <text> child is empty.
+        # Carrying ``data-pptx-carrier="true"`` would dodge the
+        # ``convert_text`` empty-text guard, but vendor's placement lint
+        # (``template_structure.py:1866-1876``) rejects any structure
+        # attribute under a non-placeholder <g>; boteng's slot <g> is not
+        # a placeholder. Deleting the empty <text> makes
+        # ``_semantic_shape_text_body`` return None (no <text> child)
+        # and the shape compiles as pure geometry. Idempotent: removing
+        # an already-removed element is a no-op via the ``status: applied``
+        # audit pattern below — we still audit it as applied.
+        if new_text == "" and mark_empty_as_carrier:
+            g.remove(text_elem)
+            audit.append(
+                {
+                    "shape_id": shape_id,
+                    "status": "applied",
+                    "old": old_text,
+                    "new": "",
+                    "carrier_removed": True,
+                }
+            )
+            continue
 
         audit.append(
             {

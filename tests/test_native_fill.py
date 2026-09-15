@@ -164,6 +164,97 @@ class SvgEditsTests(unittest.TestCase):
             self.assertEqual(text.count('xml:space="preserve"'), 1,
                              "xml:space must not be duplicated")
 
+    def test_apply_text_edits_empty_with_carrier_flag_removes_text(self):
+        """Clearing a slot <text> to '' with mark_empty_as_carrier=True
+        REMOVES the cleared element entirely. The ppt-master converter's
+        ``_semantic_shape_text_body`` raises when a semantic shape has
+        exactly one empty <text> child. Removing the <text> makes that
+        function return None (no <text> child) and the shape compiles
+        as pure geometry. Required for boteng TOC slots where empty
+        slots must not raise during svg_to_pptx export."""
+        import re
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            svg = self._write_sample(td)
+            audit = svg_edits.apply_text_edits(
+                svg, {"shape-1": ""}, mark_empty_as_carrier=True,
+            )
+            self.assertEqual(audit[0]["status"], "applied")
+            self.assertEqual(audit[0]["new"], "")
+            content = svg.read_text(encoding="utf-8")
+            # shape-1 <g> must no longer contain a <text> child — but
+            # shape-2 and shape-3 still have their <text>s, so we check
+            # the shape-1 block specifically.
+            shape1_block = re.search(
+                r'<g id="shape-1"[^>]*>(.*?)</g>',
+                content, re.DOTALL,
+            ).group(1)
+            self.assertNotIn(
+                "<text", shape1_block,
+                "cleared slot <text> must be removed",
+            )
+            # No carrier marker must be added anywhere (lint-forbidden)
+            self.assertNotIn(
+                "data-pptx-carrier", content,
+                "no carrier marker must be added (lint-forbidden)",
+            )
+
+    def test_apply_text_edits_empty_without_flag_keeps_empty_text(self):
+        """Default behavior (mark_empty_as_carrier=False) must leave the
+        cleared <text> element in place (empty but present). Non-TOC
+        callers may rely on the <text> structure being preserved."""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            svg = self._write_sample(td)
+            svg_edits.apply_text_edits(svg, {"shape-1": ""})
+            content = svg.read_text(encoding="utf-8")
+            self.assertIn(
+                "<text", content,
+                "default behavior must keep the <text> element",
+            )
+
+    def test_apply_text_edits_nonempty_with_carrier_flag_keeps_text(self):
+        """mark_empty_as_carrier must only fire for empty new_text. A
+        real title value should be written normally even when the flag
+        is set, so divider/content edits are unaffected."""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            svg = self._write_sample(td)
+            svg_edits.apply_text_edits(
+                svg, {"shape-1": "实际标题"}, mark_empty_as_carrier=True,
+            )
+            content = svg.read_text(encoding="utf-8")
+            self.assertIn("实际标题", content)
+            self.assertIn(
+                "<text", content,
+                "non-empty edits must keep the <text> element",
+            )
+
+    def test_apply_text_edits_carrier_idempotent(self):
+        """Running apply_text_edits twice with mark_empty_as_carrier=True
+        on the same shape must remain a no-op the second time around
+        (the <text> is already gone, so the second pass just reports
+        no_text_node and leaves the file unchanged)."""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            svg = self._write_sample(td)
+            svg_edits.apply_text_edits(
+                svg, {"shape-1": ""}, mark_empty_as_carrier=True,
+            )
+            content_first = svg.read_text(encoding="utf-8")
+            audit_second = svg_edits.apply_text_edits(
+                svg, {"shape-1": ""}, mark_empty_as_carrier=True,
+            )
+            content_second = svg.read_text(encoding="utf-8")
+            self.assertEqual(
+                content_first, content_second,
+                "second pass must leave the file unchanged",
+            )
+            self.assertEqual(
+                audit_second[0]["status"], "no_text_node",
+                "second pass must report no_text_node (text already removed)",
+            )
+
     def test_unknown_shape_id_reported(self):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
@@ -3551,6 +3642,7 @@ class TestExpandWorkspaceFromToc(unittest.TestCase):
         their <g id="..."> shape is preserved. Smart TOC does NOT
         make structural decisions (delete vs preserve) — that belongs
         to caller / LLM-driven path."""
+        import re
         with tempfile.TemporaryDirectory() as td:
             ws = self._make_toc_workspace(td, slots=6)
             md = Path(td) / "m.md"
@@ -3577,11 +3669,56 @@ class TestExpandWorkspaceFromToc(unittest.TestCase):
             self.assertIn('id="shape-title-5"', svg_text)
             self.assertIn('id="shape-sub-4"', svg_text)
             self.assertIn('id="shape-sub-5"', svg_text)
-            # <text> nodes in slots 4-5 are emptied (ET self-closes
-            # them as <text ... />)
+            # <text> nodes in slots 4-5 are REMOVED (not just emptied).
+            # Vendor ``_semantic_shape_text_body`` raises when a semantic
+            # shape's only <text> child is empty; removing it makes that
+            # function return None (no <text> child) and the shape
+            # compiles as pure geometry. Carrying data-pptx-carrier
+            # would be lint-forbidden (template_structure.py:1866-1876).
+            self.assertNotIn(
+                "data-pptx-carrier", svg_text,
+                "no carrier marker must be added (lint-forbidden on boteng)",
+            )
+            # shape-title-4 <g> contains NO <text> child at all (the
+            # whole <g> may be self-closing after the <text> is removed).
             self.assertRegex(
                 svg_text,
-                r'<g id="shape-title-4"[^>]*>\s*<text[^>]*/>',
+                r'<g id="shape-title-4"[^>]*/?>',
+                "cleared slot title <g> must exist (preserved)",
+            )
+            # Check there's no <text> child in shape-title-4 by searching
+            # for the title-id followed by either a closing tag or a
+            # self-closing tag without <text> in between.
+            title4_match = re.search(
+                r'<g id="shape-title-4"[^>]*?(/>|>(.*?)</g>)',
+                svg_text, re.DOTALL,
+            )
+            self.assertIsNotNone(title4_match, "shape-title-4 must exist")
+            if title4_match.group(1) == "/>":
+                title4_inner = ""
+            else:
+                title4_inner = title4_match.group(2)
+            self.assertNotIn(
+                "<text", title4_inner,
+                "cleared slot title <text> must be removed",
+            )
+            # Filled slots retain their <text> child with the title text
+            title0_match = re.search(
+                r'<g id="shape-title-0"[^>]*?(/>|>(.*?)</g>)',
+                svg_text, re.DOTALL,
+            )
+            self.assertIsNotNone(title0_match, "shape-title-0 must exist")
+            title0_inner = (
+                "" if title0_match.group(1) == "/>"
+                else title0_match.group(2)
+            )
+            self.assertIn(
+                "<text", title0_inner,
+                "filled slot title <text> must be retained",
+            )
+            self.assertIn(
+                ">Alpha<", title0_inner,
+                "filled slot title <text> must contain chapter title",
             )
             # No marker file written (smart TOC doesn't make
             # structural decisions for phase3_author to re-apply)
@@ -3664,6 +3801,67 @@ class TestExpandWorkspaceFromToc(unittest.TestCase):
             self.assertIn('id="shape-sub-2"', clone_text)
             self.assertIn('id="shape-sub-5"', clone_text)
 
+    def test_gt_n_overflow_clone_removes_cleared_slot_text(self):
+        """The > N overflow clone (slide_part02_toc.svg) must have its
+        cleared slot <text> elements REMOVED. Without removal, svg_to_pptx
+        raises "Semantic shape text component produced no native text
+        body" because the clone is byte-identical to slide_02.svg and
+        inherits the slot <g> structure (with empty <text> children)
+        that vendor's semantic-shape conversion can't compile."""
+        import re
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_toc_workspace(td, slots=6)
+            md = Path(td) / "m.md"
+            md.write_text(
+                "\n".join(f"# Title{i}" for i in range(1, 9)),
+                encoding="utf-8",
+            )
+            pl.expand_workspace_from_toc(
+                workspace=ws, md_path=md,
+                toc_slot_title_ids=self._title_ids(6),
+                toc_slot_subtitle_ids=self._sub_ids(6),
+                toc_svg="slide_02.svg",
+            )
+            clone_text = (ws / "authoring-svg-flat"
+                          / "slide_part02_toc.svg").read_text(encoding="utf-8")
+            # No carrier marker must be set anywhere (lint-forbidden)
+            self.assertNotIn(
+                "data-pptx-carrier", clone_text,
+                "no carrier marker must be added (lint-forbidden)",
+            )
+            # Filled slots 0, 1 retain their <text> with the chapter title
+            for i in (0, 1):
+                m = re.search(
+                    rf'<g id="shape-title-{i}"[^>]*?(/>|>(.*?)</g>)',
+                    clone_text, re.DOTALL,
+                )
+                self.assertIsNotNone(
+                    m, f"shape-title-{i} must exist in clone",
+                )
+                inner = "" if m.group(1) == "/>" else m.group(2)
+                self.assertIn(
+                    f">Title{i + 7}<", inner,
+                    f"filled overflow slot {i} must contain chapter text",
+                )
+            # Cleared slots 2-5 (and their subtitles) must have their
+            # <text> children REMOVED — empty <g> body aside from the
+            # geometry <rect>.
+            for i in range(2, 6):
+                for sid_prefix in ("shape-title", "shape-sub"):
+                    m = re.search(
+                        rf'<g id="{sid_prefix}-{i}"[^>]*?(/>|>(.*?)</g>)',
+                        clone_text, re.DOTALL,
+                    )
+                    self.assertIsNotNone(
+                        m, f"{sid_prefix}-{i} must exist in clone",
+                    )
+                    inner = "" if m.group(1) == "/>" else m.group(2)
+                    self.assertNotIn(
+                        "<text", inner,
+                        f"cleared overflow {sid_prefix}-{i} <text> "
+                        "must be removed",
+                    )
+
     # --- T6: real boteng TOC structure ---
 
     def test_real_boteng_toc_fills_from_markdown(self):
@@ -3741,6 +3939,88 @@ class TestExpandWorkspaceFromToc(unittest.TestCase):
                 if f"{ch} " in svg_text
             )
             self.assertEqual(chapter_with_body, 6)
+
+    def test_real_boteng_clears_unused_slots_by_removing_text(self):
+        """End-to-end against the real boteng slide_02 template: 4
+        chapters into 6 slots must REMOVE the cleared slot <text>
+        elements. This is the canonical reproduction of the bug fixed
+        in this PR — before the fix, svg_to_pptx raised
+        'Failed to convert <g id="shape-86">: Semantic shape text
+        component produced no native text body'."""
+        import re
+        boteng_ws = (
+            Path(__file__).resolve().parent.parent
+            / "projects" / "baseline_workspace"
+        )
+        if not (boteng_ws / "authoring-svg-flat" / "slide_02.svg").is_file():
+            self.skipTest("boteng baseline_workspace not present")
+
+        with tempfile.TemporaryDirectory() as td:
+            shutil.copytree(boteng_ws / "authoring-svg-flat",
+                            Path(td) / "authoring-svg-flat")
+            ws = Path(td)
+            md = Path(td) / "m.md"
+            md.write_text(
+                "# 第一章 项目概述\nbody\n\n"
+                "# 第二章 实施计划\nbody\n\n"
+                "# 第三章 团队分工\nbody\n\n"
+                "# 第四章 风险控制\nbody",
+                encoding="utf-8",
+            )
+            title_ids = ["shape-69", "shape-72", "shape-77",
+                         "shape-80", "shape-86", "shape-89"]
+            sub_ids = ["shape-70", "shape-73", "shape-78",
+                       "shape-81", "shape-87", "shape-90"]
+            pl.expand_workspace_from_toc(
+                workspace=ws, md_path=md,
+                toc_slot_title_ids=title_ids,
+                toc_slot_subtitle_ids=sub_ids,
+                toc_svg="slide_02.svg",
+            )
+            svg_text = (ws / "authoring-svg-flat"
+                        / "slide_02.svg").read_text(encoding="utf-8")
+            # No carrier marker must be set anywhere (lint-forbidden
+            # on boteng's non-placeholder slot <g>s).
+            self.assertNotIn(
+                "data-pptx-carrier", svg_text,
+                "no carrier marker must be added (lint-forbidden)",
+            )
+            # Filled slots 0-3 (shape-69, shape-72, shape-77, shape-80)
+            # retain their <text> with chapter title text.
+            for sid, ch in (
+                ("shape-69", "第一章"),
+                ("shape-72", "第二章"),
+                ("shape-77", "第三章"),
+                ("shape-80", "第四章"),
+            ):
+                m = re.search(
+                    rf'<g id="{sid}"[^>]*?(/>|>(.*?)</g>)',
+                    svg_text, re.DOTALL,
+                )
+                self.assertIsNotNone(m, f"{sid} must exist")
+                inner = "" if m.group(1) == "/>" else m.group(2)
+                self.assertIn(
+                    "<text", inner,
+                    f"filled {sid} must retain <text>",
+                )
+                self.assertIn(
+                    ch, inner,
+                    f"filled {sid} must contain chapter {ch!r}",
+                )
+            # Cleared slots 4 (shape-86) and 5 (shape-89) must have
+            # their <text> children REMOVED. This is the exact bug:
+            # shape-86 raised the vendor error before this fix.
+            for sid in ("shape-86", "shape-89"):
+                m = re.search(
+                    rf'<g id="{sid}"[^>]*?(/>|>(.*?)</g>)',
+                    svg_text, re.DOTALL,
+                )
+                self.assertIsNotNone(m, f"{sid} must exist")
+                inner = "" if m.group(1) == "/>" else m.group(2)
+                self.assertNotIn(
+                    "<text", inner,
+                    f"cleared {sid} <text> must be removed",
+                )
 
 
 class TestDetectTocSlotShapeIds(unittest.TestCase):
