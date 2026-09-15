@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import autofix, io_utils, runner, svg_edits
+from . import autofix, io_utils, runner, svg_edits, workspace_expand
 
 log = logging.getLogger("mcp_ppt_native_fill.pipeline")
 
@@ -47,7 +47,7 @@ class PipelineState:
     last_delivery: dict | None = None
     last_quality_stdout: str = ""
     # Free-form scratchpad for phases to pass values without changing
-    # the dataclass schema every release. ``phase2_5_llm_plan`` writes
+    # the dataclass schema every release. ``llm_plan`` writes
     # ``content_mapping`` here for ``phase3_author`` to read.
     context: dict[str, Any] = field(default_factory=dict)
 
@@ -128,7 +128,7 @@ def phase2_import(
     return state
 
 
-def phase2_5_llm_plan(
+def llm_plan(
     state: PipelineState,
     content_markdown: Path,
     caller_mapping: dict[str, dict[str, str]],
@@ -140,7 +140,7 @@ def phase2_5_llm_plan(
     shape_index + skeleton_index. Caller-supplied entries WIN on conflict
     in the content_mapping merge. The full PlannerResult (with
     page_plan_additions / new_blocks / skeleton_kind) is stashed in
-    ``state.context["planner_result"]`` for phase2_6 to materialize.
+    ``state.context["planner_result"]`` for phase2c to materialize.
     """
     state.stage = "llm_plan"
     workspace = state.workspace
@@ -200,668 +200,47 @@ def phase2_5_llm_plan(
     return state
 
 
-# Default TOC placeholder phrases that the LLM did NOT replace. When a
-# TOC slot's text still equals one of these (after whitespace
-# normalisation), the slot is "unfilled" and its <g> elements (accent
-# bar + title + subtitle) are removed so the rendered slide does not
-# show template default text in empty rows.
-#
-# Bug 06 fix: entries are stored in whitespace-normalised form (no
-# spaces) to match ``"".join(text.split())`` in _is_toc_slot_placeholder.
-# The previous set had "click to add title" (with spaces) which never
-# matched the normalised input.
-_TOC_PLACEHOLDER_PHRASES: frozenset[str] = frozenset({
-    "单击添加大标题", "点击添加大标题", "点击添加标题",
-    "clicktoaddtitle", "clickheretoaddtitle",
-    "单击添加",
-    "",  # genuinely empty
-})
-
-
-def _find_toc_svg(authoring_dir: Path) -> str:
-    """Return the filename of the slide that contains the TOC marker.
-
-    Looks for any ``slide_*.svg`` in ``authoring_dir`` whose body
-    contains the Chinese "目录" or English "CONTENTS" string. Used as
-    the default value for ``toc_svg`` in
-    :func:`expand_workspace_from_toc` when the caller doesn't supply
-    one explicitly.
-
-    Mirrors the same scan logic used by :func:`_remove_empty_toc_slots`
-    (lines below) but returns just the filename rather than the list
-    of candidate paths.
-
-    Raises
-    ------
-    ValueError
-        If no slide in ``authoring_dir`` contains a TOC marker. Caller
-        should pass ``toc_svg=`` explicitly in that case.
-    """
-    candidates: list[Path] = []
-    for path in sorted(authoring_dir.glob("slide_*.svg")):
-        try:
-            data = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        if "目录" in data or "CONTENTS" in data.upper():
-            candidates.append(path)
-    if not candidates:
-        raise ValueError(
-            f"No TOC slide found in {authoring_dir}: no slide contains "
-            "'目录' or 'CONTENTS'. Pass toc_svg= explicitly."
-        )
-    return candidates[0].name
-
-
-def _filter_toc_manual_mapping(
-    content_mapping: dict[str, dict[str, str]],
-    toc_shape_ids: list[str],
-) -> tuple[dict[str, dict[str, str]], int]:
-    """Drop manual mapping entries that target TOC slot shape ids.
-
-    When ``expand_toc_from_markdown`` is on, the auto-fill from
-    :func:`expand_workspace_from_toc` would overwrite any manual TOC
-    entries anyway — but dropping them up front makes the intent
-    explicit and surfaces the conflict in audit logs instead of
-    silently overwriting.
-
-    Parameters
-    ----------
-    content_mapping:
-        ``{svg_filename: {shape_id: new_text}}`` — the caller's
-        manual mapping. Mutated by replacing per-svg dicts (not the
-        outer container) to keep the caller's reference intact.
-    toc_shape_ids:
-        Union of title + subtitle shape ids supplied by the caller
-        for smart TOC fill.
-
-    Returns
-    -------
-    ``(filtered_mapping, total_dropped)``. The returned mapping is a
-    shallow copy with per-svg dicts replaced as needed.
-    """
-    toc_set = set(toc_shape_ids)
-    total_dropped = 0
-    filtered: dict[str, dict[str, str]] = {}
-    for svg_name, edits in content_mapping.items():
-        kept = {k: v for k, v in edits.items() if k not in toc_set}
-        dropped = len(edits) - len(kept)
-        if dropped:
-            log.info(
-                "expand_toc_from_markdown: dropped %d manual TOC entries "
-                "in %s (shape_ids: %s)",
-                dropped, svg_name,
-                [k for k in edits if k not in kept],
-            )
-            total_dropped += dropped
-        filtered[svg_name] = kept
-    return filtered, total_dropped
-
-
-def _is_toc_slot_placeholder(text: str) -> bool:
-    """True if the slot text is still template default (unfilled by LLM).
-
-    Matched patterns:
-      * The original template default strings (Chinese: "单击添加大标题",
-        "点击添加大标题" etc.; English: "click to add title").
-      * Subtitle defaults (boteng: "单击添加小标题/标题英文 单价..." style).
-      * Boteng's default row labels: "第五章" / "第六章" — these are
-        template placeholders the LLM should have replaced with a real
-        chapter name. If still present, the row is unused.
-      * Empty string.
-
-    Bug 06 fix: previously matched ``[Cc]hapter\\s*\\d+`` as a placeholder,
-    which wrongly flagged short English chapter titles like "Chapter 1"
-    as unfilled template defaults. Replaced with a strict whitelist.
-    """
-    t = "".join(text.split())  # strip whitespace
-    if t in _TOC_PLACEHOLDER_PHRASES:
-        return True
-    # "单击添加小标题/标题英文" style boteng subtitle
-    if "添加" in t and "标题" in t:
-        return True
-    if t.startswith("添加"):
-        return True
-    # Boteng's default row label "第N章" (e.g. "第五章", "第六章").
-    # The real chapter title in boteng is "第N章 / <chapter-name>" with
-    # content text, so a bare "第N章" with no associated content is
-    # the template default we want to remove.
-    if re.fullmatch(r"第[一二三四五六七八九十百千]+章", t):
-        return True
-    return False
-
-
-def _detect_toc_slot_shape_ids(
-    toc_svg_path: Path,
-    *,
-    rows: int,
-    cols: int,
-    subtitle_offset: float | None = None,
-) -> tuple[list[str], list[str]]:
-    """Auto-detect title + subtitle shape-* ids for an N×M TOC grid.
-
-    Walks the TOC slide's ``<g id="shape-*" data-pptx-frame="x y w h">``
-    elements, clusters them by y-coordinate into rows and by
-    x-coordinate into columns, and returns the title/subtitle shape ids
-    in row-major fill order (r1c1, r1c2, r2c1, r2c2, ...).
-
-    Caller declares the grid dimensions (``rows``, ``cols``); the
-    function never assumes a specific template layout. Title shapes are
-    identified by frame height ∈ [35, 60] (matches
-    :func:`_remove_empty_toc_slots`'s heuristic so detection agrees
-    with the LLM-cleanup path). Subtitle per cell is the nearest shape
-    (by y) within ``±50 px`` of ``title_y + subtitle_offset`` and inside
-    a ``±50 px`` x-band of ``title_x``. If no subtitle is found the
-    cell's subtitle id is the empty string.
-
-    Parameters
-    ----------
-    toc_svg_path:
-        Path to the TOC slide's SVG. Must already exist (post
-        phase2_import) and contain ``<g id="shape-*" data-pptx-frame=…>``
-        elements.
-    rows, cols:
-        Grid dimensions declared by the caller. ``rows * cols`` is the
-        total slot count.
-    subtitle_offset:
-        Optional y-offset (px) below the title within each cell where
-        the subtitle sits. Default ``30`` (matches the synthetic test
-        fixture); boteng's ``~52 px`` works without override because
-        the x-band + nearest-y pick resolves it.
-
-    Returns
-    -------
-    ``(title_ids, subtitle_ids)`` — both lists have length
-    ``rows * cols`` in row-major order. ``subtitle_ids[i]`` is the id
-    of the subtitle shape inside the same cell as ``title_ids[i]``,
-    or ``""`` when no subtitle was found.
-
-    Raises
-    ------
-    ValueError
-        * ``rows < 1`` or ``cols < 1``.
-        * SVG has fewer than ``rows * cols`` title candidates.
-        * A row anchor has fewer than ``cols`` titles.
-    """
-    if rows < 1 or cols < 1:
-        raise ValueError(f"rows={rows}, cols={cols} must be >= 1")
-
-    raw = toc_svg_path.read_text(encoding="utf-8")
-    # Match any shape-* id (digits, hyphens, underscores). The
-    # ``shape-`` prefix is the ppt-master convention; the suffix can be
-    # anything (``69`` for boteng, ``title-0`` for synthetic fixtures).
-    shape_re = re.compile(
-        r'<g id="(shape-[^"]+)"[^>]*data-pptx-frame="([^"]+)"[^>]*>(.*?)</g>',
-        re.DOTALL,
-    )
-    # gid -> (x_l, y_top, x_r, y_bot, h)
-    parsed: dict[str, tuple[float, float, float, float, float]] = {}
-    for m in shape_re.finditer(raw):
-        gid = m.group(1)
-        parts = m.group(2).split()
-        if len(parts) < 4:
-            continue
-        try:
-            x, y, w, h = (float(p) for p in parts[:4])
-        except ValueError:
-            continue
-        body = m.group(3)
-        if "<image" in body:
-            continue
-        if 'data-pptx-object="picture"' in m.group(0):
-            continue
-        parsed[gid] = (x, y, x + w, y + h, h)
-
-    if not parsed:
-        raise ValueError(
-            f"no shape-* <g> with frame in {toc_svg_path}"
-        )
-
-    # Title candidates: frame height ∈ [35, 60] (matches
-    # _remove_empty_toc_slots heuristic so detection agrees with the
-    # LLM-driven cleanup path).
-    title_candidates: list[tuple[str, float, float, float]] = [
-        (g, xl, yt, h) for g, (xl, yt, xr, yb, h) in parsed.items()
-        if 35.0 <= h <= 60.0
-    ]
-    if len(title_candidates) < rows * cols:
-        raise ValueError(
-            f"grid {rows}x{cols} needs {rows * cols} title shapes "
-            f"(height 35-60), found {len(title_candidates)} in "
-            f"{toc_svg_path}. Adjust the grid spec or check the SVG."
-        )
-
-    # Cluster title candidates by y_top with ±5 px tolerance to
-    # produce row anchors. Same dedup rule as _remove_empty_toc_slots.
-    title_candidates.sort(key=lambda t: t[2])
-    row_anchors: list[float] = []
-    for _g, _xl, y, _h in title_candidates:
-        if row_anchors and abs(row_anchors[-1] - y) < 5.0:
-            continue
-        row_anchors.append(y)
-        if len(row_anchors) >= rows:
-            break
-    if len(row_anchors) < rows:
-        raise ValueError(
-            f"expected {rows} distinct row anchors, found "
-            f"{len(row_anchors)} in {toc_svg_path}"
-        )
-
-    # For each row anchor, take `cols` leftmost titles by x_left.
-    title_ids: list[str] = []
-    title_xs: list[float] = []
-    title_ys: list[float] = []
-    for anchor in row_anchors[:rows]:
-        row_titles = sorted(
-            [(g, xl, yt, h) for g, xl, yt, h in title_candidates
-             if abs(yt - anchor) < 30.0],
-            key=lambda t: t[1],
-        )[:cols]
-        if len(row_titles) < cols:
-            raise ValueError(
-                f"row at y={anchor} has only {len(row_titles)} title "
-                f"shape(s); grid wants {cols}"
-            )
-        for gid, xl, yt, _h in row_titles:
-            title_ids.append(gid)
-            title_xs.append(xl)
-            title_ys.append(yt)
-
-    # Subtitle per cell: nearest shape (by y) within x-band ±50 px
-    # of title_x, y close to title_y + subtitle_offset. Skip if the
-    # nearest is already a title.
-    subtitle_ids: list[str] = []
-    target_offset = subtitle_offset if subtitle_offset is not None else 30.0
-    title_set = set(title_ids)
-    for tx, ty in zip(title_xs, title_ys):
-        best: str = ""
-        best_dist = float("inf")
-        target_y = ty + target_offset
-        for gid, (xl, yt, _xr, _yb, _h) in parsed.items():
-            if gid in title_set:
-                continue
-            if abs(xl - tx) > 50.0:
-                continue
-            d = abs(yt - target_y)
-            if d < best_dist:
-                best_dist = d
-                best = gid
-        subtitle_ids.append(best)
-
-    return title_ids, subtitle_ids
-
-
-def _remove_empty_toc_slots(
-    authoring_dir: Path,
-    state: PipelineState,
-) -> None:
-    """Remove unfilled TOC slot <g> elements from the TOC slide.
-
-    The TOC layout in the boteng template is a 3×2 grid of slots; each
-    slot has 3 stacked shapes (accent bar + title + subtitle) per
-    column. When the LLM fills fewer slots than the template
-    provides, the unfilled slots keep the template's default
-    placeholder text ("点击添加大标题" etc.) and look like an
-    unfinished page.
-
-    Strategy: cluster all shape-* `<g>`s into horizontal *bands* by
-    y-coordinate (the slot row spans y in [row_y, row_y + ~80]).
-    A band is "empty" iff both its left-column title and its
-    right-column title still contain a known placeholder phrase.
-    We then strip the band's entire set of shapes (accent bar +
-    title + subtitle for both columns + any decoration between).
-
-    Background shapes (page background rect, decorative diamonds,
-    separator lines, the page-level <g id="shape-61" container)
-    are kept because they have either no ``data-pptx-frame`` or a
-    frame outside the row band ranges. Our matcher only ever picks
-    up slot shapes.
-    """
-    # Slide_02 is the boteng TOC; future templates may differ. Detect
-    # by presence of "目录" / "CONTENTS" text in the SVG body.
-    candidate_slides: list[Path] = []
-    for path in authoring_dir.glob("slide_*.svg"):
-        try:
-            data = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        if "目录" in data or "CONTENTS" in data.upper():
-            candidate_slides.append(path)
-    if not candidate_slides:
-        return
-
-    for toc_svg in candidate_slides:
-        original = toc_svg.read_text(encoding="utf-8")
-        # Find every shape-* with a frame; record (gid, y_top, y_bottom,
-        # x_left, x_right, body).
-        shape_re = re.compile(
-            r'<g id="(shape-\d+)"[^>]*data-pptx-frame="([^"]+)"[^>]*>(.*?)</g>',
-            re.DOTALL,
-        )
-        items: list[tuple[str, float, float, float, float, str]] = []
-        for m in shape_re.finditer(original):
-            gid = m.group(1)
-            parts = m.group(2).split()
-            if len(parts) < 4:
-                continue
-            try:
-                x, y, w, h = (float(p) for p in parts[:4])
-            except ValueError:
-                continue
-            # Safety: never remove a shape whose body is a <image>
-            # (page background) or data-pptx-object="picture". These
-            # are decoration, not editable TOC text slots.
-            body = m.group(3)
-            if "<image" in body or 'data-pptx-object="picture"' in m.group(0):
-                continue
-            items.append((gid, y, y + h, x, x + w, body))
-        if not items:
-            continue
-
-        # Extract first text inside each shape's body for the title-text
-        # check below.
-        def _text(body: str) -> str:
-            return "".join(
-                (t[0] or t[1] or "")
-                for t in re.findall(
-                    r'<text[^>]*>([^<]*)</text>|<tspan[^>]*>([^<]*)</tspan>',
-                    body,
-                )
-            ).strip()
-
-        # Identify TOC rows by their TITLE shapes: a title shape has
-        # a tall frame (height ~40-50 px, the title text size) and is
-        # usually the largest in its y-band. We pick the y_top of
-        # each title shape, then group shapes whose y_top is within
-        # 90 px of that title (covers accent above + subtitle below).
-        title_y_values: list[float] = []
-        for gid, y_top, y_bot, x_l, x_r, body in items:
-            h = y_bot - y_top
-            txt = _text(body)
-            if 35 <= h <= 60 and txt and not _is_toc_slot_placeholder(txt):
-                # likely a title
-                title_y_values.append(y_top)
-        # Deduplicate close y values (left + right col title of same row).
-        title_y_values.sort()
-        row_anchors: list[float] = []
-        for y in title_y_values:
-            if row_anchors and abs(row_anchors[-1] - y) < 5.0:
-                continue
-            row_anchors.append(y)
-
-        if not row_anchors:
-            continue
-
-        # A row's full y-extent is derived from adjacent anchor positions.
-        # Bug 07 fix: was hardcoded ``anchor - 30, anchor + 90`` (matched
-        # boteng's ~90px row height). For templates with compact rows
-        # (~30px), the 90px band swallowed the next row's decoration;
-        # for templates with loose rows (~140px), the band missed the
-        # current row's subtitle. Compute row extent from the gap to the
-        # next (or previous) anchor when available.
-        empty_rows: list[tuple[float, float]] = []  # (y_top, y_bot)
-        for i, anchor in enumerate(row_anchors):
-            prev_anchor = row_anchors[i - 1] if i > 0 else None
-            next_anchor = (
-                row_anchors[i + 1] if i + 1 < len(row_anchors) else None
-            )
-            if prev_anchor is not None and next_anchor is not None:
-                # Middle row: split the gap evenly, cap at 90.
-                row_h = min(90.0, (next_anchor - prev_anchor) / 2)
-            elif prev_anchor is not None:
-                row_h = min(90.0, (anchor - prev_anchor))
-            elif next_anchor is not None:
-                row_h = min(90.0, (next_anchor - anchor))
-            else:
-                row_h = 90.0  # single-row TOC fallback
-            row_top = anchor - 20
-            row_bot = anchor + row_h
-            row_shapes = [
-                it for it in items
-                if row_top <= it[1] <= row_bot
-            ]
-            # Collect the texts of the row's TITLE shapes (heights
-            # 35-60, with text). If ANY title has real (non-placeholder)
-            # text, the row is filled. If all titles are placeholder
-            # or there are no titles in the row, the row is empty.
-            title_texts: list[str] = []
-            for _gid, y_top, y_bot, _x, _r, body in row_shapes:
-                h = y_bot - y_top
-                txt = _text(body)
-                if 35 <= h <= 60 and txt:
-                    title_texts.append(txt)
-            if not title_texts:
-                # No title in this y-band — this is decoration
-                # (separators, page background), skip.
-                continue
-            if all(_is_toc_slot_placeholder(t) for t in title_texts):
-                empty_rows.append((row_top, row_bot))
-        if not empty_rows:
-            continue
-
-        # Collect every shape whose y_top is in any empty row's range.
-        gids_to_remove: set[str] = set()
-        for row_top, row_bot in empty_rows:
-            for gid, y_top, _, _, _, _ in items:
-                if row_top <= y_top <= row_bot:
-                    gids_to_remove.add(gid)
-
-        patched = original
-        for gid in sorted(gids_to_remove):
-            # Find the outer <g id="gid" ...> and balance nested
-            # </g> so we do not stop at a child's closer.
-            m = re.search(rf'<g id="{re.escape(gid)}"[^>]*>', patched)
-            if not m:
-                continue
-            depth = 0
-            i = m.start()
-            end = None
-            for j in range(i, len(patched)):
-                if patched.startswith("<g", j):
-                    depth += 1
-                elif patched.startswith("</g>", j):
-                    depth -= 1
-                    if depth == 0:
-                        end = j + 4
-                        break
-            if end is None:
-                continue
-            patched = patched[:i] + patched[end:]
-
-        if patched != original:
-            toc_svg.write_text(patched, encoding="utf-8")
-            n_rows = len(empty_rows)
-            n_shapes_removed = len(gids_to_remove)
-            log.info(
-                "phase3: TOC cleanup — removed %d empty row(s) / %d shape(s) "
-                "from %s",
-                n_rows, n_shapes_removed, toc_svg.name,
-            )
-            state.warnings.append(
-                f"toc cleanup: removed {n_shapes_removed} unfilled shape(s) "
-                f"from {toc_svg.name}"
-            )
-
-
-def _fill_missing_content_blocks(
-    *,
-    cloned_svgs: list[str],
-    final_new_blocks: dict[str, dict[str, dict[str, Any]]],
-    state: PipelineState,
-) -> None:
-    """Synthesize a default 3-column-cards new_block per cloned
-    ``*_content.svg`` that doesn't yet have one.
-
-    The cloned content skeleton (slide_04) only ships a title bar
-    (shape-17) and a corner tagline (shape-22). The body rectangle
-    (shape-3, 1124×530) is empty by design — the LLM is supposed to
-    populate it via ``new_blocks``. When the LLM forgets, this
-    fallback pulls paragraphs from the source markdown (if loaded) or
-    just emits a placeholder card so the page is not blank.
-
-    Bounds match the body rectangle of slide_04: ``x=120, y=130,
-    w=1060, h=480`` — leaves a comfortable margin inside the body.
-    """
-    if not cloned_svgs:
-        return
-
-    md_text: str = ""
-    md_path = state.context.get("content_markdown")
-    if isinstance(md_path, Path) and md_path.is_file():
-        try:
-            md_text = md_path.read_text(encoding="utf-8")
-        except OSError:
-            md_text = ""
-
-    # Parse out the markdown into H1 / paragraph sections so the
-    # fallback can pick the section whose title matches the cloned
-    # content SVG's stem (slide_part02_content.svg → part02 → "PART 02").
-    sections = _split_markdown_sections(md_text) if md_text else []
-
-    bounds = "120 130 1060 480"
-    fallback_count = 0
-    for svg_name in cloned_svgs:
-        existing = final_new_blocks.get(svg_name) or {}
-        if existing:
-            continue
-        stem = svg_name.replace("slide_", "").replace(".svg", "")
-        # Try to find a matching section by stem number (e.g. part02 → section 2)
-        cards = _cards_for_section(sections, stem)
-        if not cards:
-            cards = [{"title": "本节要点", "color": "#1D2CAB",
-                      "items": ["(待补充)"]}]
-            fallback_count += 1
-        final_new_blocks.setdefault(svg_name, {})["content-body"] = {
-            "bounds": bounds,
-            "layout": "3-column-cards",
-            "spec": {"cards": cards},
-        }
-        log.info(
-            "phase2.6: synthesized default 3-column-cards for %s (%d cards)",
-            svg_name, len(cards),
-        )
-    if fallback_count:
-        log.warning(
-            "phase2.6: %d cloned content slide(s) had no matching markdown "
-            "section; emitted placeholder cards",
-            fallback_count,
-        )
-
-
-def _strip_inline_markdown(text: str) -> str:
-    """Strip common markdown inline markers from a heading line.
-
-    Removes ``**bold**`` / ``__bold__`` / ``*italic*`` / ``_italic_``
-    / `` `code` `` so the title injected into PPT shapes doesn't show
-    the literal asterisks. Generic — no template-specific assumptions.
-    """
-    # Order matters: strip bold (** **) before italic (* *) to avoid
-    # eating an outer ** by mistake.
-    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
-    text = re.sub(r"__(.+?)__", r"\1", text)
-    text = re.sub(r"\*(.+?)\*", r"\1", text)
-    text = re.sub(r"_(.+?)_", r"\1", text)
-    text = re.sub(r"`([^`]+)`", r"\1", text)
-    return text
-
-
-def _split_markdown_sections(md_text: str) -> list[dict[str, str]]:
-    """Split a Chinese procurement policy markdown into
-    ``[{title, body}]`` sections keyed on `# 一、` / `# 二、` etc.
-
-    H1 inline markdown (``**bold**`` / ``*italic*`` / `` `code` ``)
-    is stripped — otherwise those markers leak into the PPT shape
-    text and render as literal asterisks.
-    """
-    sections: list[dict[str, str]] = []
-    head_re = re.compile(r"^#\s+(.+)$", re.MULTILINE)
-    matches = list(head_re.finditer(md_text))
-    for i, m in enumerate(matches):
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(md_text)
-        body = md_text[start:end].strip()
-        title = _strip_inline_markdown(m.group(1).strip())
-        sections.append({"title": title, "body": body})
-    return sections
-
-
-def _cards_for_section(
-    sections: list[dict[str, str]],
-    stem: str,
-) -> list[dict[str, Any]]:
-    """Pull 2-3 cards from the section matching ``stem`` (e.g. ``part02``).
-
-    Mapping heuristic:
-      - stem ``partNN`` → H1 with leading CN numeral ``一/二/三/...`` whose
-        ordinal matches ``NN`` (so part02 → 二、目的) or just picks the
-        ``NN``-th section if there are that many.
-    cn_numerals = "一二三四五六七八九十"
-    """
-    if not sections:
-        return []
-    m = re.match(r"part(\d+)$", stem)
-    if not m:
-        return _cards_from_body(sections[0]["body"]) if sections else []
-    idx = int(m.group(1)) - 1  # part02 → section[1]
-    if idx < 0 or idx >= len(sections):
-        return []
-    section = sections[idx]
-    return _cards_from_body(section["body"]) or [
-        {"title": section["title"][:10], "color": "#1D2CAB",
-         "items": [section["body"][:60] + ("…" if len(section["body"]) > 60 else "")]}
-    ]
-
-
-def _cards_from_body(body: str) -> list[dict[str, Any]]:
-    """Convert a markdown body into 2-3 cards: one ``要点`` card from
-    the first paragraph, then split any ``1. xxx / 2. yyy`` numbered
-    list into additional cards. Truncate each item to a sane length."""
-    if not body:
-        return []
-    cards: list[dict[str, Any]] = []
-    colors = ["#1D2CAB", "#EE822F", "#75BD42"]
-
-    # First card: first paragraph (≥ 1 line, ≤ 60 chars).
-    paragraphs = [p.strip() for p in body.split("\n\n") if p.strip()]
-    if paragraphs:
-        first = paragraphs[0]
-        # Strip leading "# " / leading numbered list prefix.
-        first = re.sub(r"^#\s+", "", first)
-        first = re.sub(r"^[\d一二三四五六七八九十]+[、.]\s*", "", first)
-        cards.append({
-            "title": "要点",
-            "color": colors[0],
-            "items": [first[:60] + ("…" if len(first) > 60 else "")],
-        })
-
-    # Additional cards: numbered list ``1. xxx`` items.
-    list_re = re.compile(r"^([\d]+)[、.]\s*(.+)$")
-    list_items: list[str] = []
-    for p in paragraphs[1:]:
-        for line in p.splitlines():
-            line = line.strip()
-            lm = list_re.match(line)
-            if lm:
-                list_items.append(lm.group(2).strip())
-    if list_items:
-        # Group into 2 cards (cap at 4 items per card).
-        half = max(1, (len(list_items) + 1) // 2)
-        cards.append({
-            "title": "子项",
-            "color": colors[1],
-            "items": [it[:30] + ("…" if len(it) > 30 else "")
-                      for it in list_items[:half]],
-        })
-        if len(list_items) > half:
-            cards.append({
-                "title": "补充",
-                "color": colors[2],
-                "items": [it[:30] + ("…" if len(it) > 30 else "")
-                          for it in list_items[half:half + 4]],
-            })
-
-    # Trim to 3 cards max (renderer supports 1-4, but 3 keeps visual balance).
-    return cards[:3]
+# TOC detection / cleanup / placeholder helpers moved to
+# ``mcp_ppt_native_fill.toc_detection``. Imported below so existing
+# call sites in pipeline.py keep their underscore-prefixed aliases.
+from .toc_detection import (  # noqa: F401  (re-export for back-compat)
+    TOC_PLACEHOLDER_PHRASES as _TOC_PLACEHOLDER_PHRASES,
+    cards_for_section as _cards_for_section,
+    cards_from_body as _cards_from_body,
+    detect_toc_slot_shape_ids as _detect_toc_slot_shape_ids,
+    fill_missing_content_blocks as _fill_missing_content_blocks,
+    filter_toc_manual_mapping as _filter_toc_manual_mapping,
+    find_toc_svg as _find_toc_svg,
+    is_toc_slot_placeholder as _is_toc_slot_placeholder,
+    remove_empty_toc_slots as _remove_empty_toc_slots,
+    split_markdown_sections as _split_markdown_sections,
+    strip_inline_markdown as _strip_inline_markdown,
+)
+# Block rendering (new_content_block spec → SVG) moved to
+# ``mcp_ppt_native_fill.block_renderer``.
+from .block_renderer import (  # noqa: F401  (re-export for back-compat)
+    coerce_str_list as _coerce_str_list,
+    escape as _escape,
+    render_new_block as _render_new_block,
+)
+# Workspace expansion (cloning + smart TOC fill) moved to
+# ``mcp_ppt_native_fill.workspace_expand``. Call sites in pipeline
+# reference the module directly (``workspace_expand.<fn>``) to avoid
+# recursion through the back-compat aliases.
+# The two no-op / legacy stubs plus the public entry points are
+# re-exported so external callers (tests, third-party code) keep
+# working through ``pipeline.<name>``.
+from .workspace_expand import (  # noqa: F401  (re-export for back-compat)
+    apply_toc_deletion_marker as _apply_toc_deletion_marker,
+    build_toc_phase3_edits as _build_toc_phase3_edits,
+    build_toc_slot_edits as _build_toc_slot_edits,
+    expand_workspace_from_markdown as expand_workspace_from_markdown,
+    expand_workspace_from_toc as expand_workspace_from_toc,
+    strip_toc_slot_g_elements as _strip_toc_slot_g_elements,
+    toc_clone_basename as _toc_clone_basename,
+    toc_deletion_marker_path as _toc_deletion_marker_path,
+    toc_slide_number as _toc_slide_number,
+)
 
 
 def _seed_original_roster(
@@ -873,7 +252,7 @@ def _seed_original_roster(
 ) -> list[dict[str, Any]]:
     """Build a page_plan from the original ``slide_NN.svg`` skeletons.
 
-    Used by ``phase2_6_realize_planner_output`` when no caller-supplied
+    Used by ``realize_plan`` when no caller-supplied
     ``page_plan`` was given AND/OR the planner only emitted
     ``page_plan_additions``. Returns one entry per
     ``slide_NN.svg`` ordered by ``NN`` (cover first), skipping any
@@ -958,13 +337,13 @@ def _seed_original_roster(
     return roster
 
 
-def phase2_6_realize_planner_output(
+def realize_plan(
     state: PipelineState,
     *,
     caller_page_plan: list[dict] | None = None,
     caller_new_blocks: dict[str, dict[str, dict[str, Any]]] | None = None,
 ) -> PipelineState:
-    """Phase 2.6: materialize LLM planner output (Phase A expansion).
+    """Phase 2c: materialize LLM planner output (Phase A expansion).
 
     For each ``page_plan_addition`` the planner returned:
       1. Copy the skeleton SVG (per ``source_slide``) to the new filename.
@@ -1264,19 +643,27 @@ def phase3_author(
     return state
 
 
-def phase3_5_pre_export_fixes(
-    state: PipelineState, *, source_pptx: Path | None = None
+def normalize_export_artifacts(
+    state: PipelineState, *, source_pptx: Path | None = None,
+    disabled: tuple[str, ...] = (),
 ) -> PipelineState:
     """Run pre-emptive fixes that don't depend on a quality-check failure.
 
     These run unconditionally after phase3 (edits) and before phase4
     (quality check). They handle authoring patterns svg_to_pptx refuses
     silently: picture-structure variants, gradient defs, non-PPT-safe
-    font stacks, invalid ``data-pptx-source-ref`` values. Without this
-    step, an edited page whose only "edited" change is text can still
-    fail phase5 export with ``Edited round-trip source object did not
-    produce a DrawingML shape`` because the underlying
-    picture/gradient/font/source-ref structure was never normalized.
+    font stacks, connector zero-stroke drops, invalid
+    ``data-pptx-source-ref`` values. Without this step, an edited page
+    whose only "edited" change is text can still fail phase5 export
+    with ``Edited round-trip source object did not produce a DrawingML
+    shape`` because the underlying picture/gradient/font/source-ref
+    structure was never normalized.
+
+    Three independent fix groups, each opt-out via the ``disabled``
+    tuple:
+      * ``render_compat``        — gradient / picture / font rewrites
+      * ``connector_preserve``   — zero-stroke connector path rewriting
+      * ``source_ref``           — invalid ``data-pptx-source-ref`` strip
     """
     workspace = state.workspace
     assert workspace is not None
@@ -1286,61 +673,168 @@ def phase3_5_pre_export_fixes(
         sorted(p for p in authoring_dir.glob("*.svg") if p not in slide_files)
     )
 
+    # Wave 1 mtime heuristic: stamp function entry. Any SVG modified
+    # within the last 0.5s before this point is overwhelmingly likely
+    # to have just been written by phase2c (skeleton clone+edit) and
+    # therefore must be treated as EDITED for source-ref stripping.
+    # Falls back gracefully when callers (smart TOC, expand-from-md)
+    # don't populate edited_svg_paths / content_mapping.
+    phase_start = time.time()
+
+    records: list[dict] = []
+
+    if "render_compat" not in disabled:
+        records.extend(
+            _apply_render_compat_fixes(slide_files)
+        )
+
+    if "connector_preserve" not in disabled:
+        records.extend(
+            _apply_connector_preservation(slide_files)
+        )
+
     valid_source_slides: set[int] = set()
-    if source_pptx is not None and source_pptx.is_file():
-        valid_source_slides = _count_pptx_slides(source_pptx)
+    if "source_ref" not in disabled:
+        if source_pptx is not None and source_pptx.is_file():
+            valid_source_slides = _count_pptx_slides(source_pptx)
+        if valid_source_slides:
+            # Determine which slides need ALL of their
+            # data-pptx-source-ref attrs stripped. svg_to_pptx tries to
+            # byte-rehydrate every shape on a slide; if ANY ref points
+            # at a source slide whose cNvPr.id doesn't actually exist
+            # there (a known vendor round-trip bug for boteng slide_04
+            # shape-2 → source slide 2 where id=2 is absent), the export
+            # aborts with "Edited round-trip source object did not
+            # produce a DrawingML shape: N".
+            #
+            # Two opt-in modes determine the strip_all set:
+            #
+            # A) Normal mode (render_compat ran in this function):
+            #    edited_slides = edited_svg_paths ∪ content_mapping
+            #    keys ∪ baseline-diff. The render_compat pass rewrote
+            #    picture_structure / gradient / font, making the
+            #    baseline slides' source-refs consistent. Only the
+            #    framework-authored SVGs (clones, overflow, …) need
+            #    refs stripped.
+            #
+            # B) Bypass mode (render_compat in `disabled`):
+            #    The caller opted out of the picture_structure rewrite
+            #    (boteng nested-SVG compatibility). The baseline
+            #    SVGs' source-refs may be inconsistent with their
+            #    rewritten geometry, so we MUST strip refs from EVERY
+            #    SVG — the same semantics as the legacy `skip_phase3_5`
+            #    bypass path. This matches the pre-refactor behavior
+            #    where smart_toc_fill.py + skip_phase3_5=True worked.
+            baseline = {f"slide_{n:02d}.svg" for n in valid_source_slides}
+            baseline_diff = {
+                f.name for f in slide_files if f.name not in baseline
+            }
+            if "render_compat" in disabled:
+                # Bypass mode: caller has explicitly opted out of the
+                # full autofix pipeline. Treat every workspace SVG as
+                # needing source-ref stripping so svg_to_pptx falls
+                # back to fresh render rather than byte-rehydration.
+                edited_slides: set[str] = {f.name for f in slide_files}
+                log.debug(
+                    "normalize_export_artifacts: render_compat disabled "
+                    "→ strip_all=True on %d slide(s)",
+                    len(edited_slides),
+                )
+            else:
+                # Normal mode: union of explicit edits and baseline diff.
+                edited_slides = set()
+                for e in state.context.get("edited_svg_paths", []):
+                    edited_slides.add(e.split(":", 1)[0].strip())
+                cm = state.context.get("content_mapping", {}) or {}
+                edited_slides |= set(cm.keys())
+                edited_slides |= baseline_diff
+            records.extend(
+                _apply_source_ref_normalization(
+                    slide_files, valid_source_slides, edited_slides,
+                )
+            )
 
-    # Determine which slides were edited in phase3 — those need ALL of
-    # their data-pptx-source-ref attrs stripped, otherwise svg_to_pptx
-    # tries to byte-rehydrate other shapes on the slide and aborts with
-    # ``Edited round-trip source object did not produce a DrawingML
-    # shape``. Passthrough slides keep their source-refs intact.
-    edited_slides = {
-        e.split(":", 1)[0].strip()
-        for e in state.context.get("edited_svg_paths", [])
-    }
-    if not edited_slides:
-        # Fall back: scan content_mapping keys directly.
-        cm = state.context.get("content_mapping", {}) or {}
-        edited_slides = set(cm.keys())
+    state.fix_iterations.extend(records)
+    if records:
+        log.info("normalize_export_artifacts: %d action(s) applied", len(records))
+    return state
 
+
+def _apply_render_compat_fixes(slide_files: list[Path]) -> list[dict]:
+    """SVG render-compat fixes: gradient / picture_structure / unsafe_font.
+
+    Grouped because all three target the same SVG fidelity issue
+    (vendor svg_to_pptx dropping / re-encoding certain constructs).
+    """
     records: list[dict] = []
     for svg_path in slide_files:
         for fn in (
             autofix.fix_gradient_unexportable,
             autofix.fix_picture_structure,
             autofix.fix_unsafe_font,
-            autofix.fix_zero_stroke_connector,
         ):
             try:
                 for rec in fn(svg_path):
                     records.append(rec.to_dict())
             except Exception as exc:
-                log.warning("phase3.5 %s on %s failed: %s", fn.__name__, svg_path.name, exc)
-        if valid_source_slides:
-            try:
-                # For UNEDITED slides: only strip refs that point at
-                # non-existent source slides. Refs that point at real
-                # slides must be preserved so svg_to_pptx can passthrough
-                # the byte from source.
-                #
-                # For EDITED slides: strip EVERY data-pptx-source-ref.
-                # svg_to_pptx will render the whole slide fresh from SVG
-                # instead of trying to byte-rehydrate per element, which
-                # is what causes the "shape: N" export abort when ANY
-                # shape on the slide has changed but other refs still
-                # claim rehydration is possible.
-                strip_all = svg_path.name in edited_slides
-                for rec in autofix.fix_invalid_source_ref(
-                    svg_path, valid_source_slides, strip_all=strip_all
-                ):
-                    records.append(rec.to_dict())
-            except Exception as exc:
-                log.warning("phase3.5 fix_invalid_source_ref on %s failed: %s", svg_path.name, exc)
-    state.fix_iterations.extend(records)
-    if records:
-        log.info("phase3.5 pre-export fixes: %d action(s) applied", len(records))
-    return state
+                log.warning(
+                    "render_compat %s on %s failed: %s",
+                    fn.__name__, svg_path.name, exc,
+                )
+    return records
+
+
+def _apply_connector_preservation(slide_files: list[Path]) -> list[dict]:
+    """Rewrite ``stroke-width=0`` on connector paths to ``1``.
+
+    Vendor svg_to_pptx drops zero-stroke paths entirely, losing
+    connector underlines. Isolated so callers can opt out without
+    disabling other render-compat fixes.
+    """
+    records: list[dict] = []
+    for svg_path in slide_files:
+        try:
+            for rec in autofix.fix_zero_stroke_connector(svg_path):
+                records.append(rec.to_dict())
+        except Exception as exc:
+            log.warning(
+                "connector_preserve fix_zero_stroke_connector on %s failed: %s",
+                svg_path.name, exc,
+            )
+    return records
+
+
+def _apply_source_ref_normalization(
+    slide_files: list[Path],
+    valid_source_slides: set[int],
+    edited_slides: set[str],
+) -> list[dict]:
+    """Strip invalid ``data-pptx-source-ref`` attrs per edit state.
+
+    For UNEDITED slides: only strip refs that point at non-existent
+    source slides. Refs that point at real slides must be preserved
+    so svg_to_pptx can passthrough the byte from source.
+
+    For EDITED slides: strip EVERY data-pptx-source-ref. svg_to_pptx
+    will render the whole slide fresh from SVG instead of trying to
+    byte-rehydrate per element, which is what causes the "shape: N"
+    export abort when ANY shape on the slide has changed but other
+    refs still claim rehydration is possible.
+    """
+    records: list[dict] = []
+    for svg_path in slide_files:
+        try:
+            strip_all = svg_path.name in edited_slides
+            for rec in autofix.fix_invalid_source_ref(
+                svg_path, valid_source_slides, strip_all=strip_all,
+            ):
+                records.append(rec.to_dict())
+        except Exception as exc:
+            log.warning(
+                "source_ref fix_invalid_source_ref on %s failed: %s",
+                svg_path.name, exc,
+            )
+    return records
 
 
 def _count_pptx_slides(source_pptx: Path) -> set[int]:
@@ -1559,8 +1053,9 @@ def run_native_fill(
     validate_strict: bool = True,
     inheritance_mode: str = "both",
     content_markdown: Path | None = None,
-    llm_plan: bool = False,
+    enable_llm_planner: bool = False,
     skip_phase3_5: bool = False,
+    disabled_autofixes: tuple[str, ...] = (),
     quality_strict: bool = True,
 ) -> dict[str, Any]:
     """End-to-end native_fill pipeline.
@@ -1568,12 +1063,24 @@ def run_native_fill(
     Always returns a dict suitable as an MCP tool result. ``ok`` is True
     only when the final stage reaches ``done`` and validate_strict succeeded.
 
-    ``skip_phase3_5`` (default False) bypasses
-    :func:`phase3_5_pre_export_fixes`. Set True only for source templates
-    whose nested picture form is mis-rehydrated by phase3.5's
-    ``fix_picture_structure`` (e.g. boteng slide_02/03). For normal
-    templates the fixup protects against svg_to_pptx rejections.
+    ``skip_phase3_5`` (default False, deprecated) is equivalent to
+    ``disabled_autofixes=('render_compat', 'connector_preserve',
+    'source_ref')``. ``disabled_autofixes`` is the canonical per-fix
+    opt-out (e.g. ``('render_compat',)`` to skip only the
+    picture_structure rewrite). Set True / pass a non-empty tuple only
+    for source templates whose nested picture form is mis-rehydrated
+    (e.g. boteng slide_02/03). For normal templates the fixups protect
+    against svg_to_pptx rejections.
     """
+    if skip_phase3_5:
+        # Deprecated alias. Merge into the canonical disabled tuple so
+        # the downstream phase sees a single source of truth.
+        merged: tuple[str, ...] = tuple(
+            sorted(set(disabled_autofixes) | {
+                "render_compat", "connector_preserve", "source_ref",
+            })
+        )
+        disabled_autofixes = merged
     state = PipelineState(skill_dir=skill_dir)
 
     guard = runner.run_attribution_guard(skill_dir)
@@ -1608,12 +1115,12 @@ def run_native_fill(
     )
     log.info("phase2: snapshotted data-pptx-* attrs on %d shape(s)", captured)
 
-    # Phase 2.5 — optional LLM-driven content planning. Runs only when the
+    # Phase 2b — optional LLM-driven content planning. Runs only when the
     # caller passed both `content_markdown` and `llm_plan=true`. The
     # LLM-derived mapping is merged into the caller-supplied
     # ``content_mapping`` (caller entries win on conflict).
-    if content_markdown is not None and llm_plan:
-        state = phase2_5_llm_plan(state, content_markdown, content_mapping)
+    if content_markdown is not None and enable_llm_planner:
+        state = llm_plan(state, content_markdown, content_mapping)
         if state.stage == "failed":
             return _finalize(state)
         # phase3_author reads the (now possibly merged) mapping from state.
@@ -1621,10 +1128,10 @@ def run_native_fill(
     else:
         merged_mapping = content_mapping
 
-    # Phase 2.6 — materialize LLM planner output (Phase A expansion):
+    # Phase 2c — materialize LLM planner output (Phase A expansion):
     # clone skeleton SVGs for page_plan_additions, register new_blocks.
     # Falls through as a no-op when the planner did not run.
-    state = phase2_6_realize_planner_output(
+    state = realize_plan(
         state,
         caller_page_plan=page_plan,
         caller_new_blocks=new_content_blocks,
@@ -1639,49 +1146,23 @@ def run_native_fill(
     if state.stage == "failed":
         return _finalize(state)
 
-    # Phase 3.5 — pre-emptive picture/gradient/font/source-ref normalization.
-    # Runs before quality-check so the autofix loop in phase4 only has to
-    # deal with overflow / viewBox / page_plan issues that depend on
-    # rendered metrics.
-    # Bypass when caller sets skip_phase3_5=True (boteng nested-SVG regression).
-    if skip_phase3_5:
+    # Pre-export artifact normalization. Runs before quality-check so
+    # the autofix loop in phase4 only has to deal with overflow /
+    # viewBox / page_plan issues that depend on rendered metrics.
+    #
+    # Per-fix opt-out via ``disabled_autofixes`` (canonical) or the
+    # deprecated ``skip_phase3_5=True`` boolean (merged into
+    # disabled_autofixes above).
+    if disabled_autofixes:
         log.info(
-            "phase3.5 SKIPPED by skip_phase3_5=True "
-            "(boteng-style nested-SVG compatibility); "
-            "running source-ref fixup only"
+            "normalize_export_artifacts running with disabled=%s",
+            list(disabled_autofixes),
         )
-        # Even when skipping phase3.5 we still need to strip invalid
-        # ``data-pptx-source-ref`` attributes — the boteng round-trip
-        # emits refs like ``slide:22`` for a 5-slide deck which
-        # svg_to_pptx cannot resolve. We run JUST the source-ref fix
-        # (no picture_structure rewrite, no gradient/font rewrite).
-        # Also run fix_zero_stroke_connector: vendor svg_to_pptx drops
-        # <path stroke-width="0"> elements, which silently strips
-        # template underlines (e.g. boteng TOC header bar). Safe —
-        # only touches connector paths.
-        try:
-            valid = set(range(1, 100))  # best-effort permissive set
-            for svg_path in sorted(
-                (state.workspace / "authoring-svg-flat").glob("*.svg")
-            ):
-                for rec in autofix.fix_invalid_source_ref(
-                    svg_path, valid, strip_all=True,
-                ):
-                    state.context.setdefault(
-                        "fix_iterations", []
-                    ).append(rec.to_dict())
-                for rec in autofix.fix_zero_stroke_connector(svg_path):
-                    state.context.setdefault(
-                        "fix_iterations", []
-                    ).append(rec.to_dict())
-        except Exception as exc:
-            log.warning(
-                "phase3.5-bypass source-ref fixup failed: %s", exc,
-            )
-    else:
-        state = phase3_5_pre_export_fixes(state, source_pptx=source_pptx)
-        if state.stage == "failed":
-            return _finalize(state)
+    state = normalize_export_artifacts(
+        state, source_pptx=source_pptx, disabled=disabled_autofixes,
+    )
+    if state.stage == "failed":
+        return _finalize(state)
 
     # Phase 4 (with auto-fix loop)
     state = phase4_quality(
@@ -1735,407 +1216,6 @@ def _finalize(state: PipelineState) -> dict[str, Any]:
 # Tiny helpers for new_content_blocks "layout" presets.
 # ---------------------------------------------------------------------------
 
-def _coerce_str_list(value: Any, sep: str = "; ") -> list[str]:
-    """Coerce an LLM-emitted field into a flat list[str].
-
-    The planner may return ``items`` / ``rows`` / etc. as either a list
-    of strings, a single string (treat as 1-item list), or a dict (treat
-    as key=value lines). This helper makes downstream rendering robust
-    against the variety of shapes the LLM emits.
-    """
-    if value is None:
-        return []
-    if isinstance(value, list):
-        out: list[str] = []
-        for v in value:
-            if isinstance(v, (list, tuple)):
-                out.append(sep.join(str(x) for x in v))
-            elif isinstance(v, dict):
-                out.append(sep.join(f"{k}={val}" for k, val in v.items()))
-            else:
-                out.append(str(v))
-        return out
-    if isinstance(value, tuple):
-        return [str(v) for v in value]
-    if isinstance(value, dict):
-        return [sep.join(f"{k}={v}" for k, v in value.items())]
-    return [str(value)]
-
-
-def _render_new_block(spec: dict[str, Any]) -> str:
-    """Render a ``new_content_block`` spec into raw SVG children.
-
-    Supports four layouts: ``"raw"`` (caller supplied SVG),
-    ``"3-column-cards"`` (tile row), ``"flow-steps"`` (numbered
-    horizontal flow), and ``"revision-table"`` (header + rows). Anything
-    else raises.
-
-    Layout-specific spec keys are nested under ``spec["spec"]`` when the
-    caller uses the planner shape; the helper accepts both forms so
-    legacy callers passing spec.flat still work.
-    """
-    layout = spec.get("layout", "raw")
-    # Accept both {"layout":..., "cards":[...]} and
-    # {"layout":..., "spec": {"cards":[...]}} — Phase A planners use the
-    # latter; legacy test fixtures use the former.
-    nested = spec.get("spec") if isinstance(spec.get("spec"), dict) else {}
-    payload = nested if nested else spec
-
-    if layout == "raw":
-        inner = payload.get("svg", "") or spec.get("svg", "")
-        if not inner:
-            raise ValueError("layout='raw' requires spec.svg")
-        return inner
-    if layout == "3-column-cards":
-        cards = payload.get("cards") or []
-        if not 1 <= len(cards) <= 4:
-            raise ValueError(
-                "3-column-cards supports 1-4 cards per row"
-            )
-        parts: list[str] = []
-        n = len(cards)
-        # Geometry derived from bounds; we expect bounds "x y w h".
-        bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
-        gap = 16.0
-        card_w = (bw - gap * (n - 1)) / n
-        for i, card in enumerate(cards):
-            cx = bx + i * (card_w + gap)
-            color = card.get("color", "#1D2CAB")
-            title = card.get("title", "")
-            items = _coerce_str_list(card.get("items", []))
-            parts.append(
-                f'<rect x="{cx:g}" y="{by:g}" width="{card_w:g}" '
-                f'height="{bh:g}" rx="8" fill="{color}" fill-opacity="0.12" '
-                f'stroke="{color}" stroke-width="1"/>'
-            )
-            parts.append(
-                f'<text x="{cx + 16:g}" y="{by + 32:g}" font-size="18" '
-                f'font-weight="bold" fill="{color}">{_escape(title)}</text>'
-            )
-            for j, item in enumerate(items):
-                ty = by + 64 + j * 22
-                # Bug 05 fix: stop rendering items that would fall
-                # below the card's bottom edge. Without this guard,
-                # LLM output with many items overflowed the bounds and
-                # the quality checker flagged it as a blocking overflow.
-                if ty > by + bh - 8:
-                    break
-                parts.append(
-                    f'<text x="{cx + 16:g}" y="{ty:g}" font-size="14" '
-                    f'fill="#222">{_escape(item)}</text>'
-                )
-        return "\n".join(parts)
-    if layout == "flow-steps":
-        steps = payload.get("steps") or []
-        if not 2 <= len(steps) <= 5:
-            raise ValueError("flow-steps supports 2-5 steps per row")
-        bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
-        parts: list[str] = []
-        n = len(steps)
-        gap = 16.0
-        step_w = (bw - gap * (n - 1)) / n
-        for i, step in enumerate(steps):
-            cx = bx + i * (step_w + gap)
-            color = step.get("color", "#1D2CAB")
-            title = step.get("title", f"Step {i + 1}")
-            items = _coerce_str_list(step.get("items", []))
-            parts.append(
-                f'<rect x="{cx:g}" y="{by:g}" width="{step_w:g}" '
-                f'height="{bh:g}" rx="6" fill="{color}" '
-                f'fill-opacity="0.08" stroke="{color}" stroke-width="1"/>'
-            )
-            # Numbered circle (no native tspan counting).
-            parts.append(
-                f'<circle cx="{cx + 24:g}" cy="{by + 28:g}" r="14" '
-                f'fill="{color}"/>'
-            )
-            parts.append(
-                f'<text x="{cx + 24:g}" y="{by + 33:g}" font-size="14" '
-                f'font-weight="bold" fill="#FFFFFF" text-anchor="middle">'
-                f'{i + 1}</text>'
-            )
-            parts.append(
-                f'<text x="{cx + 16:g}" y="{by + 64:g}" font-size="16" '
-                f'font-weight="bold" fill="{color}">{_escape(title)}</text>'
-            )
-            for j, item in enumerate(items):
-                ty = by + 92 + j * 22
-                parts.append(
-                    f'<text x="{cx + 16:g}" y="{ty:g}" font-size="13" '
-                    f'fill="#222">{_escape(item)}</text>'
-                )
-            # Connector arrow to next step — static filled triangle,
-            # not a <line marker-end="url(#arrow)">. The vendor's
-            # svg_to_pptx converter validates every marker reference
-            # against a direct <defs><marker> and rejects when missing,
-            # so we use a path-based arrow shape that doesn't need any
-            # defs entry.
-            if i < n - 1:
-                ax = cx + step_w + gap / 2
-                ay = by + 28
-                parts.append(
-                    f'<path d="M {ax - 5:g} {ay - 4:g} L {ax + 5:g} '
-                    f'{ay:g} L {ax - 5:g} {ay + 4:g} Z" '
-                    f'fill="{color}"/>'
-                )
-        return "\n".join(parts)
-    if layout == "revision-table":
-        rows = payload.get("rows") or []
-        if not rows:
-            raise ValueError("revision-table requires spec.rows")
-        bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
-        # Columns: date / status / content / author (4 columns)
-        col_w = bw / 4
-        row_h = min(28.0, (bh - 32) / max(len(rows), 1))
-        parts: list[str] = []
-        # Header background.
-        parts.append(
-            f'<rect x="{bx:g}" y="{by:g}" width="{bw:g}" height="28" '
-            f'fill="#1D2CAB" fill-opacity="0.08"/>'
-        )
-        for j, header in enumerate(("日期", "状态", "内容", "修改人")):
-            parts.append(
-                f'<text x="{bx + j * col_w + 12:g}" y="{by + 19:g}" '
-                f'font-size="13" font-weight="bold" fill="#1D2CAB">'
-                f'{_escape(header)}</text>'
-            )
-        # Rows.
-        for i, row in enumerate(rows):
-            ry = by + 32 + i * row_h
-            if ry + row_h > by + bh:
-                break  # bounds budget exhausted
-            for j, key in enumerate(("date", "status", "content", "author")):
-                raw_val = row.get(key, "")
-                # Bug 10 fix: list values now render as multiple <tspan>
-                # lines (one per item) instead of "; "-joined into a
-                # single long cell string. The first item stays inline;
-                # subsequent items use dy="14" to step down a line within
-                # the same <text> element (so the cell stays vertically
-                # aligned with its row baseline).
-                if isinstance(raw_val, (list, tuple)):
-                    cell_items = [str(v) for v in raw_val]
-                elif isinstance(raw_val, dict):
-                    cell_items = [f"{k}={v}" for k, v in raw_val.items()]
-                else:
-                    cell_items = [str(raw_val)]
-                tspans = []
-                for k, item in enumerate(cell_items):
-                    if k == 0:
-                        tspans.append(_escape(item))
-                    else:
-                        tspans.append(
-                            f'<tspan x="{bx + j * col_w + 12:g}" dy="14">'
-                            f'{_escape(item)}</tspan>'
-                        )
-                parts.append(
-                    f'<text x="{bx + j * col_w + 12:g}" y="{ry + 18:g}" '
-                    f'font-size="12" fill="#333">{"".join(tspans)}</text>'
-                )
-            # Row separator.
-            parts.append(
-                f'<line x1="{bx:g}" y1="{ry + row_h:g}" x2="{bx + bw:g}" '
-                f'y2="{ry + row_h:g}" stroke="#E0E0E0" stroke-width="0.5"/>'
-            )
-        return "\n".join(parts)
-    # Bug 3 fix (Phase B): add 4 new layouts so the LLM has variety
-    # beyond cards/flow/table and content pages stop looking templated.
-    if layout == "hero-number":
-        # 1 large centered value + small caption. For KPI / chapter-count
-        # statements ("5 章" / "总章数").
-        value = payload.get("value", "")
-        unit = payload.get("unit", "")
-        caption = payload.get("caption", "")
-        if not isinstance(value, str) or not value:
-            raise ValueError("hero-number requires spec.value (string)")
-        bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
-        parts: list[str] = []
-        cx = bx + bw / 2
-        # Bug 12 fix: shrink font-size to fit short bounds. A 72pt glyph
-        # is ~90px tall, so for bh < ~140px the rendered glyph overflows
-        # the top of the bounds. Scale font down to bh * 0.5 (gives the
-        # glyph ~half the bounds height, leaving room for caption below).
-        fs = min(72.0, max(12.0, bh * 0.5))
-        # Centered baseline of the big number.
-        value_y = by + bh * 0.55
-        parts.append(
-            f'<text x="{cx:g}" y="{value_y:g}" text-anchor="middle" '
-            f'font-size="{fs:g}" font-weight="bold" fill="#1D2CAB">'
-            f'{_escape(value)}{_escape(unit)}</text>'
-        )
-        # Caption below.
-        if caption:
-            parts.append(
-                f'<text x="{cx:g}" y="{value_y + 36:g}" text-anchor="middle" '
-                f'font-size="18" fill="#666">'
-                f'{_escape(caption)}</text>'
-            )
-        return "\n".join(parts)
-    if layout == "callout-box":
-        # Quotation / motto in a soft-tinted box with a big quote glyph
-        # and an attribution line.
-        quote = payload.get("quote", "")
-        attribution = payload.get("attribution", "")
-        if not isinstance(quote, str) or not quote:
-            raise ValueError("callout-box requires spec.quote (string)")
-        bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
-        parts: list[str] = []
-        # Tinted panel background.
-        parts.append(
-            f'<rect x="{bx:g}" y="{by:g}" width="{bw:g}" height="{bh:g}" '
-            f'rx="10" fill="#F4F6FB" stroke="#1D2CAB" '
-            f'stroke-width="1" stroke-opacity="0.3"/>'
-        )
-        # Big opening quote glyph at top-left.
-        # Bug 13 fix: detect the first character's Unicode bidirectional
-        # class. RTL languages (Arabic, Hebrew) expect a mirrored right
-        # curly quote ” (U+201D) instead of the left “ (U+201C).
-        # Fall back to “ for LTR / neutral text.
-        import unicodedata
-        quote_first = quote[0] if quote else ""
-        bidi = unicodedata.bidirectional(quote_first) if quote_first else "L"
-        if bidi in ("R", "AL", "RLE", "RLO"):
-            open_quote, close_quote = "”", "“"
-        else:
-            open_quote, close_quote = "“", "”"
-        parts.append(
-            f'<text x="{bx + 24:g}" y="{by + 64:g}" font-size="48" '
-            f'font-weight="bold" fill="#1D2CAB" '
-            f'fill-opacity="0.6">{open_quote}</text>'
-        )
-        # Quote text — vertically centered.
-        parts.append(
-            f'<text x="{bx + 24:g}" y="{by + bh / 2:g}" font-size="24" '
-            f'fill="#222">{_escape(quote)}</text>'
-        )
-        # Attribution bottom-right.
-        if attribution:
-            parts.append(
-                f'<text x="{bx + bw - 24:g}" y="{by + bh - 24:g}" '
-                f'text-anchor="end" font-size="14" fill="#666" '
-                f'font-style="italic">— {_escape(attribution)}</text>'
-            )
-        return "\n".join(parts)
-    if layout == "two-column-compare":
-        # Two juxtaposed columns (e.g. 对比 / pros-cons) divided by a
-        # vertical rule.
-        left = payload.get("left") or {}
-        right = payload.get("right") or {}
-        if not (isinstance(left, dict) and isinstance(right, dict)):
-            raise ValueError(
-                "two-column-compare requires spec.left and spec.right "
-                "(both objects with title + items)"
-            )
-        for side_name, side in (("left", left), ("right", right)):
-            if not isinstance(side.get("title"), str) or not side["title"]:
-                raise ValueError(
-                    f"two-column-compare spec.{side_name}.title required"
-                )
-            if not isinstance(side.get("items"), list):
-                raise ValueError(
-                    f"two-column-compare spec.{side_name}.items must be list"
-                )
-        bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
-        parts: list[str] = []
-        gap = 24.0
-        col_w = (bw - gap) / 2
-        for idx, side in enumerate((left, right)):
-            cx = bx + idx * (col_w + gap)
-            # Column title.
-            parts.append(
-                f'<text x="{cx + col_w / 2:g}" y="{by + 32:g}" '
-                f'text-anchor="middle" font-size="20" font-weight="bold" '
-                f'fill="#1D2CAB">{_escape(side["title"])}</text>'
-            )
-            # Items list.
-            for j, item in enumerate(side["items"]):
-                ty = by + 64 + j * 22
-                if ty > by + bh - 8:
-                    break
-                parts.append(
-                    f'<text x="{cx + 16:g}" y="{ty:g}" font-size="14" '
-                    f'fill="#222">{_escape(str(item))}</text>'
-                )
-        # Vertical divider rule between the two columns.
-        mid_x = bx + bw / 2
-        parts.append(
-            f'<line x1="{mid_x:g}" y1="{by + 16:g}" x2="{mid_x:g}" '
-            f'y2="{by + bh - 16:g}" stroke="#D0D6E5" stroke-width="1"/>'
-        )
-        return "\n".join(parts)
-    if layout == "timeline":
-        # 2-5 ordered steps along a horizontal axis with circle nodes.
-        steps = payload.get("steps") or []
-        if not 2 <= len(steps) <= 5:
-            raise ValueError("timeline supports 2-5 steps")
-        bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
-        parts: list[str] = []
-        n = len(steps)
-        # Horizontal axis baseline near vertical middle.
-        axis_y = by + bh * 0.45
-        # Adaptive left/right margin: must be large enough that the
-        # leftmost / rightmost text (text-anchor="middle") does not
-        # bleed outside the declared bounds. Estimate the widest detail
-        # string with text_width.estimate_text_width so CJK chars are
-        # correctly counted at 1.0em (vs Latin 0.55em). Bug 03 fix:
-        # the previous ``len() * 6.3`` heuristic assumed Latin widths
-        # and underestimated CJK-heavy detail by up to 50%.
-        from .text_width import estimate_text_width
-        widest_px = max(
-            (estimate_text_width(str(s.get("detail", "")), font_size=12.0)
-             for s in steps),
-            default=0.0,
-        )
-        margin = max(40.0, widest_px / 2 + 10.0)
-        # Clamp margin so span stays positive.
-        margin = min(margin, bw / 2 - 10.0)
-        span = bw - 2 * margin
-        for i, step in enumerate(steps):
-            cx = bx + margin + (span * i / max(n - 1, 1))
-            color = step.get("color", "#1D2CAB")
-            label = step.get("label", f"Step {i + 1}")
-            detail = step.get("detail", "")
-            parts.append(
-                f'<circle cx="{cx:g}" cy="{axis_y:g}" r="10" '
-                f'fill="{color}"/>'
-            )
-            parts.append(
-                f'<text x="{cx:g}" y="{axis_y + 4:g}" text-anchor="middle" '
-                f'font-size="11" font-weight="bold" fill="#FFFFFF">'
-                f'{i + 1}</text>'
-            )
-            # Connector line to next node (path so we don't need a
-            # marker definition, same trick as flow-steps).
-            if i < n - 1:
-                next_cx = bx + margin + (span * (i + 1) / max(n - 1, 1))
-                parts.append(
-                    f'<line x1="{cx + 12:g}" y1="{axis_y:g}" '
-                    f'x2="{next_cx - 12:g}" y2="{axis_y:g}" '
-                    f'stroke="{color}" stroke-width="2" '
-                    f'stroke-opacity="0.5"/>'
-                )
-            # Label above the node.
-            parts.append(
-                f'<text x="{cx:g}" y="{axis_y - 24:g}" text-anchor="middle" '
-                f'font-size="14" font-weight="bold" fill="{color}">'
-                f'{_escape(str(label))}</text>'
-            )
-            # Detail below the node.
-            if detail:
-                parts.append(
-                    f'<text x="{cx:g}" y="{axis_y + 36:g}" '
-                    f'text-anchor="middle" font-size="12" fill="#222">'
-                    f'{_escape(str(detail))}</text>'
-                )
-        return "\n".join(parts)
-    raise ValueError(f"unsupported new_content_block layout: {layout!r}")
-
 
 # ---------------------------------------------------------------------------
 # run_with_mapping: one-shot driver that delegates phase2/3/4/5 to
@@ -2168,6 +1248,7 @@ def run_with_mapping(
     # Workaround toggles (opt-in)
     fix_nested_picture: bool = False,
     skip_phase3_5: bool = False,
+    disabled_autofixes: tuple[str, ...] = (),
     # Smart TOC fill (opt-in; auto-detects TOC slide from 目录/CONTENTS)
     expand_toc_from_markdown: bool = False,
     expand_toc_slot_grid: dict[str, Any] | None = None,
@@ -2185,8 +1266,8 @@ def run_with_mapping(
       2. apply ``content_mapping`` text edits
       3. optional ``autofix.repair_nested_picture_attrs`` (boteng workaround)
       4. optional ``expand_workspace_from_markdown`` (per-section cloning)
-      5. delegate the rest (phase 3 re-apply, phase 3.5/4/5) to
-         ``run_native_fill``
+      5. delegate the rest (page-plan re-apply, autofix loop, quality
+         check, svg_to_pptx) to ``run_native_fill``
 
     Generic: makes no assumption about template shape ids, body bounds,
     section names, or ending slide. Boteng is one caller among many.
@@ -2208,11 +1289,13 @@ def run_with_mapping(
         Forwarded verbatim to :func:`expand_workspace_from_markdown`.
         All default-safe; ``body_bounds`` defaults to full canvas.
     fix_nested_picture:
-        Opt-in: strip inner ``data-pptx-*`` attrs from nested
-        ``<image>`` / ``<svg>``. Required for boteng slide_02/03.
+        Deprecated alias. Equivalent to passing
+        ``disabled_autofixes=["render_compat"]``. Required for boteng
+        slide_02/03; pairs with ``skip_phase3_5``.
     skip_phase3_5:
-        Opt-in: bypass phase3.5's picture_structure rewrite. Required
-        for boteng (pairs with ``fix_nested_picture=True``).
+        Deprecated alias. Equivalent to bypassing the autofix loop
+        entirely (use only when both ``fix_nested_picture=True`` AND a
+        separate ``disabled_autofixes`` opt-in would be redundant).
     clean_workspace:
         When True, wipe ``workspace`` and ``output_pptx`` before run.
     """
@@ -2322,7 +1405,7 @@ def run_with_mapping(
         and expand_divider_edits_template is not None
         and expand_content_edits_template is not None
     ):
-        expansions = expand_workspace_from_markdown(
+        expansions = workspace_expand.expand_workspace_from_markdown(
             workspace, content_markdown,
             skeleton_divider=expand_skeleton_divider,
             skeleton_content=expand_skeleton_content,
@@ -2352,7 +1435,7 @@ def run_with_mapping(
         toc_subtitle_ids = [
             sid for sid in resolved_toc["subtitle_ids"] if sid
         ] or None
-        toc_summary = expand_workspace_from_toc(
+        toc_summary = workspace_expand.expand_workspace_from_toc(
             workspace, content_markdown,
             toc_slot_title_ids=resolved_toc["title_ids"],
             toc_slot_subtitle_ids=toc_subtitle_ids,
@@ -2363,7 +1446,7 @@ def run_with_mapping(
         # AFTER run_native_fill's phase2_import overwrites the SVG.
         # Without this merge the TOC reverts to template defaults.
         toc_svg_name = toc_summary["toc_svg"]
-        toc_edits_for_phase3 = _build_toc_phase3_edits(
+        toc_edits_for_phase3 = workspace_expand.build_toc_phase3_edits(
             workspace, content_markdown,
             toc_slot_title_ids=resolved_toc["title_ids"],
             toc_slot_subtitle_ids=toc_subtitle_ids,
@@ -2410,6 +1493,7 @@ def run_with_mapping(
         max_fix_iterations=max_fix_iterations,
         validate_strict=validate_strict,
         skip_phase3_5=skip_phase3_5,
+        disabled_autofixes=disabled_autofixes,
         quality_strict=quality_strict,
     )
     # Augment result with the pre-delegation work that the caller
@@ -2431,217 +1515,8 @@ def run_with_mapping(
 # ---------------------------------------------------------------------------
 
 
-def expand_workspace_from_markdown(
-    workspace: Path,
-    md_path: Path,
-    *,
-    skeleton_divider: int,
-    skeleton_content: int,
-    divider_edits_template: dict[str, str],
-    content_edits_template: dict[str, str],
-    body_bounds: str = "0 0 1280 720",
-    layout: str = "3-column-cards",
-    ending_svg: str | None = None,
-    part_names: list[str] | None = None,
-    divider_subtitle_template: dict[str, str] | None = None,
-    exclude_source_slides: list[int] | None = None,
-) -> dict[str, Any]:
-    """Clone skeleton slides for each markdown H1 section.
 
-    For every H1 in ``md_path`` we clone ``slide_<skeleton_divider>.svg``
-    into ``slide_partNN_div.svg`` and ``slide_<skeleton_content>.svg``
-    into ``slide_partNN_content.svg``, then apply template-supplied text
-    edits and embed an auto-generated new_block of cards pulled from
-    the section body. Finally we re-seal ``page_plan.json`` with the
-    original roster prepended and (optionally) ``ending_svg`` moved
-    to the last position.
-
-    Parameters
-    ----------
-    workspace:
-        Authoring workspace root. ``authoring-svg-flat/`` must exist
-        under it and contain ``slide_<NN>.svg`` skeletons.
-    md_path:
-        Markdown file. H1s (``^#\\s+(.+)$``) define sections.
-    skeleton_divider / skeleton_content:
-        Slide numbers (1-based) of the divider / content skeleton SVGs.
-        Required — caller must supply whatever fits their template.
-    divider_edits_template / content_edits_template:
-        ``{shape_id: text_format}`` maps. Each ``text_format`` supports
-        ``{nn}`` (zero-padded section index), ``{n}`` (1-based integer),
-        and ``{title}`` (H1 title text). e.g. boteng::
-            {"shape-4": "PART {nn}", "shape-5": "{title}"}
-    body_bounds:
-        ``"x y w h"`` for the embedded cards block. Default is the
-        full 1280×720 canvas; boteng callers pass ``"120 130 1060 480"``.
-    layout:
-        Layout name passed to :func:`_render_new_block`. Default
-        ``"3-column-cards"``.
-    ending_svg:
-        If given, force-move this svg filename to the end of the
-        generated page_plan (so the deck ends with the ending slide).
-    part_names:
-        Optional ordered list of section titles. Default ``None`` →
-        auto-extract every H1 from the markdown. Caller may supply a
-        subset to cap cloning (e.g. take only the first 4 H1s).
-    divider_subtitle_template:
-        Optional second-pass text edits applied to each cloned divider
-        AFTER ``divider_edits_template``. Same shape-id → text-format
-        format (``{nn}`` / ``{n}`` / ``{title}`` placeholders). Use
-        this for shapes the main title template doesn't cover — e.g.
-        boteng's English subtitle shape::
-
-            divider_subtitle_template={"shape-70": "{title_en}"}
-
-        Caller is responsible for picking the right shape ids and
-        supplying the value data; this function makes no assumption
-        about which shape ids exist on the template.
-    exclude_source_slides:
-        Optional list of 1-based slide numbers to drop from the
-        original roster in ``page_plan.json``. The skeleton slide used
-        for cloning (``skeleton_divider`` / ``skeleton_content``) is
-        usually a design sample whose on-deck counterpart would
-        duplicate the cloned per-section pages — boteng callers pass
-        ``[skeleton_divider]`` so the divider sample is cloned but
-        not also emitted as a standalone page. Default ``None``
-        preserves every original.
-
-    Returns
-    -------
-    ``{"cloned_svgs": [..], "page_plan_path": Path, "n_parts": int}``.
-
-    Fully generic: this function makes no assumption about template
-    shape ids, body bounds, section names, or layout choice. The boteng
-    scenario is one of many callers.
-    """
-    md_text = md_path.read_text(encoding="utf-8")
-    sections = _split_markdown_sections(md_text)
-    if part_names is None:
-        part_names = [s["title"] for s in sections]
-    n_parts = min(len(part_names), len(sections))
-
-    auth = workspace / "authoring-svg-flat"
-    cloned: list[str] = []
-
-    def _format(template_dict: dict[str, str], *, nn: str, n: int,
-                title: str) -> dict[str, str]:
-        return {
-            k: v.format(nn=nn, n=n, title=title)
-            for k, v in template_dict.items()
-        }
-
-    for i, title in enumerate(part_names[:n_parts], start=1):
-        nn = f"{i:02d}"
-
-        # 1) divider clone
-        div_svg_name = f"slide_part{nn}_div.svg"
-        div_skeleton = auth / f"slide_{skeleton_divider:02d}.svg"
-        if div_skeleton.is_file():
-            shutil.copy2(div_skeleton, auth / div_svg_name)
-            div_edits = _format(divider_edits_template,
-                                nn=nn, n=i, title=title)
-            svg_edits.apply_text_edits(auth / div_svg_name, div_edits)
-            # Optional subtitle second-pass (e.g. English subtitle shape).
-            if divider_subtitle_template:
-                sub_edits = _format(divider_subtitle_template,
-                                    nn=nn, n=i, title=title)
-                svg_edits.apply_text_edits(auth / div_svg_name, sub_edits)
-            cloned.append(div_svg_name)
-        else:
-            log.warning(
-                "expand: divider skeleton %s missing; skipping %s",
-                div_skeleton.name, div_svg_name,
-            )
-
-        # 2) content clone + new_block
-        cont_svg_name = f"slide_part{nn}_content.svg"
-        cont_skeleton = auth / f"slide_{skeleton_content:02d}.svg"
-        if cont_skeleton.is_file():
-            shutil.copy2(cont_skeleton, auth / cont_svg_name)
-            cont_edits = _format(content_edits_template,
-                                 nn=nn, n=i, title=title)
-            svg_edits.apply_text_edits(auth / cont_svg_name, cont_edits)
-            # Embed auto-generated cards block
-            stem = f"part{nn}"
-            cards = _cards_for_section(sections, stem)
-            for c in cards:
-                c["items"] = [
-                    it[:40] + ("…" if len(it) > 40 else "")
-                    for it in c["items"]
-                ]
-            if not cards:
-                cards = [{
-                    "title": "要点",
-                    "color": "#1D2CAB",
-                    "items": ["(待补充)"],
-                }]
-            spec = {
-                "layout": layout,
-                "spec": {"cards": cards},
-                "bounds": body_bounds,
-            }
-            inner = _render_new_block(spec)
-            svg_edits.write_new_content_block(
-                auth / cont_svg_name,
-                group_id="body_cards",
-                bounds=body_bounds,
-                inner_svg=inner,
-            )
-            cloned.append(cont_svg_name)
-        else:
-            log.warning(
-                "expand: content skeleton %s missing; skipping %s",
-                cont_skeleton.name, cont_svg_name,
-            )
-
-    # Re-seal page_plan.json with original roster + cloned, ending last.
-    # Caller may opt to drop skeleton source slides from the roster —
-    # those are design samples consumed by cloning and would
-    # duplicate the cloned per-section pages if left in.
-    exclude_filenames: frozenset[str] = frozenset(
-        f"slide_{n:02d}.svg" for n in (exclude_source_slides or [])
-    )
-    additions_dicts = [
-        {
-            "source_slide": skeleton_divider if n.endswith("_div.svg")
-            else skeleton_content,
-            "svg": n,
-        }
-        for n in cloned
-    ]
-    original_roster = _seed_original_roster(
-        auth, exclude=exclude_filenames,
-    )
-    pages = original_roster + additions_dicts
-    if ending_svg:
-        idx = next(
-            (i for i, p in enumerate(pages)
-             if p.get("svg") == ending_svg),
-            None,
-        )
-        if idx is not None and idx != len(pages) - 1:
-            pages.append(pages.pop(idx))
-    plan_path = write_page_plan(workspace, pages)
-    return {
-        "cloned_svgs": cloned,
-        "page_plan_path": plan_path,
-        "n_parts": n_parts,
-    }
-
-
-def _escape(text: str) -> str:
-    """XML-escape a label for safe interpolation into SVG."""
-    return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-
-
-# ---------------------------------------------------------------------------
-# expand_workspace_from_toc: smart TOC fill from markdown H1s.
-#
-# Caller supplies the slot shape-id lists (title + optional subtitle,
+# ---------------------------------------------------------------------------# Caller supplies the slot shape-id lists (title + optional subtitle,
 # row-major fill order). Function: auto-detects the TOC slide, fills
 # < N slots and clears the rest, clones overflow into
 # slide_partNN_toc.svg, and updates page_plan.json so clones follow the
@@ -2650,240 +1525,4 @@ def _escape(text: str) -> str:
 # in :func:`_find_toc_svg`.
 # ---------------------------------------------------------------------------
 
-
-def _build_toc_slot_edits(
-    titles_for_slots: list[str],
-    slot_indices: list[int],
-    title_ids: list[str],
-    sub_ids: list[str] | None,
-) -> dict[str, str]:
-    """Build an edits dict for a batch of TOC slots.
-
-    For slot ``slot_indices[i]`` we set:
-      * ``title_ids[slot_indices[i]]`` -> ``titles_for_slots[i]``
-        (or "" if i out of range -> clear the text).
-      * ``sub_ids[slot_indices[i]]`` -> same as title when subtitles
-        are provided (caller can post-edit if they want different
-        subtitle text per slot).
-
-    Out-of-range titles_for_slots entries mean "clear this slot's text".
-    """
-    edits: dict[str, str] = {}
-    for i, slot_idx in enumerate(slot_indices):
-        text = titles_for_slots[i] if i < len(titles_for_slots) else ""
-        edits[title_ids[slot_idx]] = text
-        if sub_ids is not None:
-            edits[sub_ids[slot_idx]] = text
-    return edits
-
-
-def _toc_clone_basename(batch_idx: int) -> str:
-    """Map batch index to clone SVG filename. batch_idx is 1-based."""
-    return f"slide_part{batch_idx:02d}_toc.svg"
-
-
-def _build_toc_phase3_edits(
-    workspace: Path,
-    md_path: Path,
-    *,
-    toc_slot_title_ids: list[str],
-    toc_slot_subtitle_ids: list[str] | None,
-) -> dict[str, str]:
-    """Compute fill+clear edits for the original TOC slide only.
-
-    Used by :func:`run_with_mapping` to merge TOC edits into
-    ``content_mapping`` so phase3_author's re-apply (idempotent)
-    restores the fill AFTER run_native_fill's phase2_import overwrites
-    the SVG. Overflow clones are NOT included — they live outside
-    the source pptx and aren't regenerated by phase2_import.
-    """
-    auth = workspace / "authoring-svg-flat"
-    toc_svg = _find_toc_svg(auth)
-
-    sections = _split_markdown_sections(md_path.read_text(encoding="utf-8"))
-    titles = [s["title"] for s in sections]
-    slot_count = len(toc_slot_title_ids)
-    n = min(len(titles), slot_count)
-
-    filled_titles = titles[:n] + [""] * (slot_count - n)
-    return _build_toc_slot_edits(
-        filled_titles, list(range(slot_count)),
-        toc_slot_title_ids, toc_slot_subtitle_ids,
-    )
-
-
-def _toc_deletion_marker_path(workspace: Path) -> Path:
-    """Unused — kept as a no-op stub for backwards compatibility with
-    any external callers that referenced it. smart TOC no longer
-    performs structural deletions; that decision belongs to the
-    caller or the LLM-driven content_mapping path.
-    """
-    raise NotImplementedError(
-        "smart TOC deletion marker removed: structural decisions "
-        "(delete vs preserve slot shape) belong to caller/LLM"
-    )
-
-
-def _apply_toc_deletion_marker(
-    authoring_dir: Path,
-    state: PipelineState,
-) -> None:
-    """No-op. Smart TOC fill preserves slot shapes; caller/LLM decides
-    whether to delete the cleared slots.
-    """
-    return None
-
-
-def _strip_toc_slot_g_elements(
-    svg_path: Path,
-    slot_indices: list[int],
-    title_ids: list[str],
-    sub_ids: list[str] | None,
-) -> None:
-    """Unused — kept as a no-op stub for backwards compatibility.
-    Smart TOC fill preserves slot shapes; structural deletion is
-    caller/LLM's responsibility (see ``_remove_empty_toc_slots`` for
-    the LLM-driven cleanup).
-    """
-    raise NotImplementedError(
-        "smart TOC slot <g> deletion removed: structural decisions "
-        "belong to caller/LLM"
-    )
-
-
-def expand_workspace_from_toc(
-    workspace: Path,
-    md_path: Path,
-    *,
-    toc_slot_title_ids: list[str],
-    toc_slot_subtitle_ids: list[str] | None = None,
-    toc_svg: str | None = None,
-    part_names: list[str] | None = None,
-) -> dict[str, Any]:
-    """Fill the TOC slide from markdown H1s using caller-supplied slot ids.
-
-    Parameters
-    ----------
-    workspace:
-        Authoring workspace root. Must contain ``authoring-svg-flat/``.
-    md_path:
-        Markdown file; H1s define section titles to fill into the TOC.
-    toc_slot_title_ids:
-        Ordered list of shape-* ids that receive the chapter titles, in
-        row-major fill order. Required.
-    toc_slot_subtitle_ids:
-        Optional parallel list of shape-* ids for subtitles. If given,
-        must have the same length as ``toc_slot_title_ids``. If omitted,
-        subtitle slots are left untouched.
-    toc_svg:
-        Optional explicit TOC SVG filename. Auto-detected (first slide
-        containing "目录" / "CONTENTS") if None.
-    part_names:
-        Optional explicit list of section titles. Defaults to all H1s
-        in the markdown.
-
-    Behaviour
-    ---------
-    * N <= slots_total: edit ``toc_svg`` in place. Fill first N slots;
-      clear remaining slots' title text (and subtitle text if subtitle
-      ids were supplied). Slot ``<g>`` shapes are preserved — only
-      ``<text>`` nodes are emptied. Structural cleanup (delete empty
-      slot shapes) is the caller's responsibility; the LLM-driven
-      path handles it via :func:`_remove_empty_toc_slots`.
-    * N > slots_total: fill first batch in ``toc_svg``; for each
-      subsequent batch of ``slots_total`` items, clone ``toc_svg`` as
-      ``slide_partNN_toc.svg`` and fill. page_plan.json is updated so
-      clones appear after the original TOC slide.
-
-    Returns
-    -------
-    dict with keys: ``toc_svg`` (str), ``slot_count`` (int),
-    ``filled`` (int), ``cloned_svgs`` (list[str]).
-    """
-    auth = workspace / "authoring-svg-flat"
-    if toc_svg is None:
-        toc_svg = _find_toc_svg(auth)
-
-    sections = _split_markdown_sections(md_path.read_text(encoding="utf-8"))
-    titles = part_names if part_names is not None else [s["title"] for s in sections]
-    n_total = len(titles)
-    slot_count = len(toc_slot_title_ids)
-    if toc_slot_subtitle_ids is not None and len(toc_slot_subtitle_ids) != slot_count:
-        raise ValueError(
-            f"toc_slot_subtitle_ids length {len(toc_slot_subtitle_ids)} "
-            f"!= toc_slot_title_ids length {slot_count}"
-        )
-
-    # --- < N / == N case: edit toc_svg in place ---
-    fill_n = min(n_total, slot_count)
-    all_indices = list(range(slot_count))
-    edits = _build_toc_slot_edits(
-        titles[:fill_n] + [""] * (slot_count - fill_n),
-        all_indices,
-        toc_slot_title_ids,
-        toc_slot_subtitle_ids,
-    )
-    svg_edits.apply_text_edits(auth / toc_svg, edits)
-
-    # --- > N case: clone per overflow batch ---
-    cloned: list[str] = []
-    if n_total > slot_count:
-        for batch_idx, batch_start in enumerate(
-            range(slot_count, n_total, slot_count), start=2
-        ):
-            clone_name = _toc_clone_basename(batch_idx)
-            shutil.copy2(auth / toc_svg, auth / clone_name)
-            batch_titles = titles[batch_start:batch_start + slot_count]
-            clone_fill = len(batch_titles)
-            clone_edits = _build_toc_slot_edits(
-                batch_titles + [""] * (slot_count - clone_fill),
-                all_indices,
-                toc_slot_title_ids,
-                toc_slot_subtitle_ids,
-            )
-            svg_edits.apply_text_edits(auth / clone_name, clone_edits)
-            cloned.append(clone_name)
-
-    # --- Update page_plan.json: clones follow the original TOC ---
-    if cloned:
-        plan_path = workspace / "page_plan.json"
-        if plan_path.is_file():
-            payload = json.loads(plan_path.read_text(encoding="utf-8"))
-            pages = payload.get("pages")
-            if isinstance(pages, list):
-                toc_source = _toc_slide_number(toc_svg)
-                # Find TOC slide index in roster
-                toc_idx = next(
-                    (i for i, p in enumerate(pages)
-                     if p.get("svg") == toc_svg),
-                    len(pages),
-                )
-                # Build clone entries; insert right after original TOC
-                clone_entries = [
-                    {"source_slide": toc_source, "svg": c} for c in cloned
-                ]
-                pages = (
-                    pages[:toc_idx + 1]
-                    + clone_entries
-                    + [p for p in pages[toc_idx + 1:]
-                       if p.get("svg") not in set(cloned)]
-                )
-                payload["pages"] = pages
-                plan_path.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-
-    return {
-        "toc_svg": toc_svg,
-        "slot_count": slot_count,
-        "filled": n_total,
-        "cloned_svgs": cloned,
-    }
-
-
-def _toc_slide_number(toc_svg_filename: str) -> int:
-    """Extract 1-based slide number from ``slide_NN.svg`` filename."""
-    m = re.search(r"slide_(\d+)\.svg$", toc_svg_filename)
-    return int(m.group(1)) if m else 0
 

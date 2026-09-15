@@ -188,27 +188,54 @@ TOOL_NATIVE_FILL: dict[str, Any] = {
                         "enum": ["both", "layered", "flat"],
                         "default": "both",
                     },
+                    "disabled_autofixes": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": [
+                                "render_compat",
+                                "connector_preserve",
+                                "source_ref",
+                            ],
+                        },
+                        "default": [],
+                        "description": (
+                            "Per-fix opt-out for normalize_export_artifacts. "
+                            "Each entry disables one normalization pass "
+                            "applied after phase3 authoring and before "
+                            "phase4 quality: 'render_compat' (gradient / "
+                            "picture_structure / unsafe_font), "
+                            "'connector_preserve' (zero-stroke connector "
+                            "rewrite), 'source_ref' (invalid "
+                            "data-pptx-source-ref strip). Default [] runs "
+                            "all passes. Replaces skip_phase3_5 (full "
+                            "bypass) and fix_nested_picture (render_compat "
+                            "opt-out) booleans."
+                        ),
+                    },
                     "skip_phase3_5": {
                         "type": "boolean",
                         "default": False,
                         "description": (
-                            "Skip the phase3.5 pre-export fixup pass. "
-                            "Enable only when vendor svg_to_pptx rejects "
-                            "nested-picture rehydration (e.g. boteng "
-                            "slide_02/03). Default False preserves full "
-                            "pipeline safety."
+                            "DEPRECATED alias. When True, all "
+                            "normalize_export_artifacts passes are "
+                            "bypassed (equivalent to disabled_autofixes="
+                            "['render_compat', 'connector_preserve', "
+                            "'source_ref']). Prefer disabled_autofixes "
+                            "for per-fix opt-out."
                         ),
                     },
                     "fix_nested_picture": {
                         "type": "boolean",
                         "default": False,
                         "description": (
-                            "Strip inner data-pptx-* attrs from <image>/<svg> "
-                            "nested inside authoring-svg-flat SVGs before "
-                            "phase4/5. Required for templates whose nested "
-                            "SVG would otherwise be mis-rehydrated by "
-                            "svg_to_pptx. Pairs with skip_phase3_5=True for "
-                            "the boteng regression."
+                            "DEPRECATED. Equivalent to "
+                            "disabled_autofixes=['render_compat']. "
+                            "Strip inner data-pptx-* attrs from "
+                            "<image>/<svg> nested inside authoring-svg-flat "
+                            "SVGs before phase4/5. Required for templates "
+                            "whose nested SVG would otherwise be mis-rehydrated "
+                            "by svg_to_pptx (e.g. boteng slide_02/03)."
                         ),
                     },
                     "expand_skeleton_divider": {
@@ -390,9 +417,43 @@ def _execute_native_fill(arguments: dict) -> dict:
     max_fix_iterations = int(options.get("max_fix_iterations", 3))
     validate_strict = bool(options.get("validate_strict", True))
     inheritance_mode = options.get("inheritance_mode", "both")
-    llm_plan = bool(options.get("llm_plan", False))
-    skip_phase3_5 = bool(options.get("skip_phase3_5", False))
+    # MCP JSON key stays as `llm_plan` for backward compatibility
+    # with existing clients; renamed to `enable_llm_planner` on the
+    # Python kwarg side to avoid colliding with the renamed function
+    # name `pipeline.llm_plan`.
+    enable_llm_planner = bool(options.get("llm_plan", False))
+    # disabled_autofixes is the canonical per-fix opt-out. The two
+    # deprecated booleans (skip_phase3_5, fix_nested_picture) are
+    # accepted as backward-compat aliases and merged below.
+    disabled_autofixes_raw = options.get("disabled_autofixes", []) or []
+    if not isinstance(disabled_autofixes_raw, list):
+        return {
+            "ok": False,
+            "stage": "init",
+            "error": (
+                f"disabled_autofixes must be a list, "
+                f"got {type(disabled_autofixes_raw).__name__}"
+            ),
+        }
+    disabled_autofixes: list[str] = list(disabled_autofixes_raw)
+    deprecation_warnings: list[str] = []
     fix_nested_picture = bool(options.get("fix_nested_picture", False))
+    skip_phase3_5 = bool(options.get("skip_phase3_5", False))
+    if skip_phase3_5:
+        disabled_autofixes.extend(
+            ["render_compat", "connector_preserve", "source_ref"]
+        )
+        deprecation_warnings.append(
+            "skip_phase3_5 is deprecated; use disabled_autofixes for "
+            "per-fix opt-out"
+        )
+    if fix_nested_picture:
+        if "render_compat" not in disabled_autofixes:
+            disabled_autofixes.append("render_compat")
+        deprecation_warnings.append(
+            "fix_nested_picture is deprecated; use "
+            "disabled_autofixes=['render_compat'] instead"
+        )
     clean_workspace = bool(options.get("clean_workspace", False))
 
     expand_skeleton_divider = options.get("expand_skeleton_divider")
@@ -432,7 +493,7 @@ def _execute_native_fill(arguments: dict) -> dict:
         }
     log.info("skill_dir=%s", skill_dir)
 
-    if llm_plan and not content_markdown:
+    if enable_llm_planner and not content_markdown:
         return {
             "ok": False,
             "stage": "init",
@@ -470,7 +531,7 @@ def _execute_native_fill(arguments: dict) -> dict:
                     "/ expand_content_edits_template."
                 ),
             }
-        return pipeline.run_with_mapping(
+        response = pipeline.run_with_mapping(
             skill_dir=skill_dir,
             source_pptx=source_pptx,
             workspace=workspace,
@@ -492,13 +553,22 @@ def _execute_native_fill(arguments: dict) -> dict:
             expand_toc_slot_grid=expand_toc_slot_grid,
             fix_nested_picture=fix_nested_picture,
             skip_phase3_5=skip_phase3_5,
+            disabled_autofixes=tuple(disabled_autofixes),
             auto_fix=auto_fix,
             max_fix_iterations=max_fix_iterations,
             validate_strict=validate_strict,
             clean_workspace=clean_workspace,
         )
+        # Surface deprecation notices to the caller.
+        if deprecation_warnings:
+            existing = list(response.get("warnings") or [])
+            for w in deprecation_warnings:
+                if w not in existing:
+                    existing.append(w)
+            response["warnings"] = existing
+        return response
 
-    return pipeline.run_native_fill(
+    response = pipeline.run_native_fill(
         source_pptx=source_pptx,
         workspace=workspace,
         output_pptx=output_pptx,
@@ -506,14 +576,25 @@ def _execute_native_fill(arguments: dict) -> dict:
         content_mapping=arguments.get("content_mapping") or {},
         new_content_blocks=arguments.get("new_content_blocks"),
         content_markdown=content_markdown,
-        llm_plan=llm_plan,
+        enable_llm_planner=enable_llm_planner,
         skill_dir=skill_dir,
         auto_fix=auto_fix,
         max_fix_iterations=max_fix_iterations,
         validate_strict=validate_strict,
         inheritance_mode=inheritance_mode,
         skip_phase3_5=skip_phase3_5,
+        disabled_autofixes=tuple(disabled_autofixes),
     )
+    # Surface deprecation notices to the caller. The "warnings" list is
+    # the canonical channel for non-fatal advisories and is preserved
+    # in the final MCP payload.
+    if deprecation_warnings:
+        existing = list(response.get("warnings") or [])
+        for w in deprecation_warnings:
+            if w not in existing:
+                existing.append(w)
+        response["warnings"] = existing
+    return response
 
 
 def _execute_tool(name: str, arguments: dict) -> dict:

@@ -111,7 +111,8 @@ def _run_pipeline(
             "expand_body_bounds": BODY_BOUNDS,
             "expand_ending_svg": "slide_05.svg",
             "fix_nested_picture": True,
-            "skip_phase3_5": True,
+            "skip_phase3_5": False,
+            "disabled_autofixes": ["render_compat"],
             "clean_workspace": True,
         },
     }

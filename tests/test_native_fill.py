@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time  # noqa: E402  (Wave 1 mtime tests)
 import sys
 import tempfile
 import unittest
@@ -1506,7 +1507,7 @@ class ServerLLMInputsTests(unittest.TestCase):
 class PipelineLLMPhaseTests(unittest.TestCase):
     """Test the optional LLM phase integrated into run_native_fill."""
 
-    def test_phase2_5_merges_caller_and_llm_mapping_caller_wins(self):
+    def test_phase2b_merges_caller_and_llm_mapping_caller_wins(self):
         from mcp_ppt_native_fill import pipeline
         from mcp_ppt_native_fill.llm_planner import PlannerResult
         from unittest.mock import patch
@@ -1532,7 +1533,7 @@ class PipelineLLMPhaseTests(unittest.TestCase):
                 "mcp_ppt_native_fill.llm_planner.plan_content_mapping",
                 return_value=llm_mapping,
             ):
-                state = pipeline.phase2_5_llm_plan(state, md, caller_mapping)
+                state = pipeline.llm_plan(state, md, caller_mapping)
 
             self.assertNotEqual(state.stage, "failed")
             self.assertEqual(
@@ -1545,10 +1546,10 @@ class PipelineLLMPhaseTests(unittest.TestCase):
                 },
             )
             # Phase-A: full PlannerResult must also be stashed in state for
-            # phase2_6 to materialize page_plan_additions + new_blocks.
+            # phase2c to materialize page_plan_additions + new_blocks.
             self.assertIs(state.context["planner_result"], llm_mapping)
 
-    def test_phase2_5_records_planner_error(self):
+    def test_phase2b_records_planner_error(self):
         from mcp_ppt_native_fill import pipeline, llm_planner
         from unittest.mock import patch
 
@@ -1563,11 +1564,11 @@ class PipelineLLMPhaseTests(unittest.TestCase):
                 "mcp_ppt_native_fill.llm_planner.plan_content_mapping",
                 side_effect=llm_planner.PlannerError("network down"),
             ):
-                state = pipeline.phase2_5_llm_plan(state, md, {})
+                state = pipeline.llm_plan(state, md, {})
             self.assertEqual(state.stage, "failed")
             self.assertIn("network down", state.errors[0])
 
-    def test_phase2_5_records_llm_client_error(self):
+    def test_phase2b_records_llm_client_error(self):
         from mcp_ppt_native_fill import pipeline, llm_client
         from unittest.mock import patch
 
@@ -1582,11 +1583,11 @@ class PipelineLLMPhaseTests(unittest.TestCase):
                 "mcp_ppt_native_fill.llm_planner.plan_content_mapping",
                 side_effect=llm_client.LLMError("HTTP 401"),
             ):
-                state = pipeline.phase2_5_llm_plan(state, md, {})
+                state = pipeline.llm_plan(state, md, {})
             self.assertEqual(state.stage, "failed")
             self.assertIn("HTTP 401", state.errors[0])
 
-    def test_phase2_5_handles_empty_llm_response(self):
+    def test_phase2b_handles_empty_llm_response(self):
         from mcp_ppt_native_fill import pipeline
         from mcp_ppt_native_fill.llm_planner import PlannerResult
         from unittest.mock import patch
@@ -1603,7 +1604,7 @@ class PipelineLLMPhaseTests(unittest.TestCase):
                 "mcp_ppt_native_fill.llm_planner.plan_content_mapping",
                 return_value=PlannerResult(),
             ):
-                state = pipeline.phase2_5_llm_plan(state, md, caller)
+                state = pipeline.llm_plan(state, md, caller)
             self.assertNotEqual(state.stage, "failed")
             self.assertEqual(
                 state.context["content_mapping"], caller
@@ -1871,7 +1872,7 @@ class PipelinePhase26Tests(unittest.TestCase):
             )
         return td
 
-    def test_phase2_6_clones_skeleton_and_applies_edits(self):
+    def test_phase2c_clones_skeleton_and_applies_edits(self):
         from mcp_ppt_native_fill import pipeline
         from mcp_ppt_native_fill.llm_planner import PlannerResult
         with tempfile.TemporaryDirectory() as td:
@@ -1889,7 +1890,7 @@ class PipelinePhase26Tests(unittest.TestCase):
                 skeleton_kind={"slide_03.svg": "divider",
                                "slide_part02_div.svg": "divider"},
             )
-            state = pipeline.phase2_6_realize_planner_output(state)
+            state = pipeline.realize_plan(state)
             self.assertNotEqual(state.stage, "failed")
             clone = ws / "authoring-svg-flat" / "slide_part02_div.svg"
             self.assertTrue(clone.is_file(),
@@ -1918,7 +1919,7 @@ class PipelinePhase26Tests(unittest.TestCase):
                 {"shape-3": "PART 02"},
             )
 
-    def test_phase2_6_warns_on_missing_skeleton(self):
+    def test_phase2c_warns_on_missing_skeleton(self):
         from mcp_ppt_native_fill import pipeline
         from mcp_ppt_native_fill.llm_planner import PlannerResult
         with tempfile.TemporaryDirectory() as td:
@@ -1932,7 +1933,7 @@ class PipelinePhase26Tests(unittest.TestCase):
                      "edits": {}},
                 ],
             )
-            state = pipeline.phase2_6_realize_planner_output(state)
+            state = pipeline.realize_plan(state)
             self.assertTrue(
                 any("missing" in w for w in state.warnings),
                 "missing skeleton must surface as a warning",
@@ -1945,7 +1946,7 @@ class PipelinePhase26Tests(unittest.TestCase):
                               "slide_03.svg", "slide_04.svg",
                               "slide_05.svg"])
 
-    def test_phase2_6_emits_new_blocks_into_state(self):
+    def test_phase2c_emits_new_blocks_into_state(self):
         from mcp_ppt_native_fill import pipeline
         from mcp_ppt_native_fill.llm_planner import PlannerResult
         with tempfile.TemporaryDirectory() as td:
@@ -1965,7 +1966,7 @@ class PipelinePhase26Tests(unittest.TestCase):
                      ]}},
                 ],
             )
-            state = pipeline.phase2_6_realize_planner_output(state)
+            state = pipeline.realize_plan(state)
             blocks = state.context["new_content_blocks"]
             self.assertIn("slide_part02_content.svg", blocks)
             self.assertEqual(
@@ -1973,13 +1974,13 @@ class PipelinePhase26Tests(unittest.TestCase):
                 "3-column-cards",
             )
 
-    def test_phase2_6_noop_when_planner_not_run(self):
+    def test_phase2c_noop_when_planner_not_run(self):
         from mcp_ppt_native_fill import pipeline
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             ws = self._make_workspace(td)
             state = pipeline.PipelineState(workspace=ws)
-            state = pipeline.phase2_6_realize_planner_output(
+            state = pipeline.realize_plan(
                 state,
                 caller_page_plan=[{"source_slide": 1}],
                 caller_new_blocks={"slide_01.svg": {"x": {"bounds": "0 0 1 1"}}},
@@ -1989,7 +1990,7 @@ class PipelinePhase26Tests(unittest.TestCase):
                              [{"source_slide": 1}])
             self.assertIn("slide_01.svg", state.context["new_content_blocks"])
 
-    def test_phase2_6_seeds_originals_when_no_caller_page_plan(self):
+    def test_phase2c_seeds_originals_when_no_caller_page_plan(self):
         """Bug #1 fix: when caller passes no page_plan AND planner
         returned page_plan_additions, originals (cover/toc/divider/
         ending) must be seeded into page_plan_pages. Otherwise they
@@ -2021,7 +2022,7 @@ class PipelinePhase26Tests(unittest.TestCase):
                                 "slide_04.svg": "content",
                                 "slide_05.svg": "ending"},
             )
-            state = pipeline.phase2_6_realize_planner_output(state)
+            state = pipeline.realize_plan(state)
             pages = state.context["page_plan_pages"]
             svgs = [p["svg"] for p in pages]
             # Bug 1: ending slide is the LAST page of the deck.
@@ -2040,7 +2041,7 @@ class PipelinePhase26Tests(unittest.TestCase):
             self.assertEqual(pages[0], {"source_slide": 1,
                                         "svg": "slide_01.svg"})
 
-    def test_phase2_6_no_planner_no_caller_seeds_only_originals(self):
+    def test_phase2c_no_planner_no_caller_seeds_only_originals(self):
         """Path A: no planner ran, no caller page_plan. Originals
         alone (5 slides) are exported — no cloned PART_*."""
         from mcp_ppt_native_fill import pipeline
@@ -2048,7 +2049,7 @@ class PipelinePhase26Tests(unittest.TestCase):
             td = Path(td)
             ws = self._make_workspace(td)
             state = pipeline.PipelineState(workspace=ws)
-            state = pipeline.phase2_6_realize_planner_output(state)
+            state = pipeline.realize_plan(state)
             svgs = [p["svg"] for p in state.context["page_plan_pages"]]
             self.assertEqual(svgs,
                              ["slide_01.svg", "slide_02.svg",
@@ -2086,7 +2087,7 @@ class PipelinePhase26Tests(unittest.TestCase):
                                 "slide_04.svg": "content",
                                 "slide_05.svg": "ending"},
             )
-            state = pipeline.phase2_6_realize_planner_output(state)
+            state = pipeline.realize_plan(state)
             pages = state.context["page_plan_pages"]
             svgs = [p["svg"] for p in pages]
             # The ending slide must be the LAST page.
@@ -2853,7 +2854,249 @@ class TestFixNestedPictureDataAttrs(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Phase I2: pipeline.expand_workspace_from_markdown + run_native_fill.skip_phase3_5
+# Phase I5: normalize_export_artifacts mtime fallback (Wave 1 of
+# PHASE5_SOURCE_REF_FIX_2026-09-15). When neither edited_svg_paths nor
+# content_mapping are populated, fall back to file mtime to detect
+# recently-edited SVGs (e.g. smart-TOC flow that clones skeletons
+# without bookkeeping the edits).
+# ---------------------------------------------------------------------------
+
+import zipfile  # noqa: E402
+
+
+def _make_fake_source_pptx(td: str, n_slides: int = 5) -> Path:
+    """Create a minimal valid PPTX zip with n_slides slide entries."""
+    p = Path(td) / "source.pptx"
+    with zipfile.ZipFile(p, "w") as z:
+        for i in range(1, n_slides + 1):
+            z.writestr(f"ppt/slides/slide{i}.xml", "<xml/>")
+    return p
+
+
+def _make_state(td: str, workspace: Path) -> "pl.PipelineState":
+    state = pl.PipelineState()
+    state.workspace = workspace
+    return state
+
+
+class TestNormalizeEditedSlidesFallback(unittest.TestCase):
+    """Wave 1 mtime heuristic: detect edited slides even when callers
+    don't populate edited_svg_paths / content_mapping.
+
+    Repro: smart_toc_fill.py and test_toc_4_vs_7.py both clone a content
+    skeleton (slide_04.svg) into N copies and edit shape-17 titles, but
+    never write to state.context['edited_svg_paths']. Without this
+    fallback, vendor svg_to_pptx aborts with
+    'Edited round-trip source object did not produce a DrawingML shape: N'
+    on the cloned slides.
+    """
+
+    SVG_WITH_VALID_REF = (
+        '<svg xmlns="http://www.w3.org/2000/svg">'
+        '<g id="shape-2" data-pptx-source-ref="slide:2"/>'
+        '<g id="shape-3" data-pptx-source-ref="slide:3"/>'
+        '</svg>'
+    )
+
+    def _make_workspace(self, td: str) -> Path:
+        ws = Path(td)
+        auth = ws / "authoring-svg-flat"
+        auth.mkdir(parents=True)
+        return ws, auth
+
+    def test_baseline_diff_marks_clones_as_edited(self):
+        """SVGs NOT in the phase-2 baseline (e.g. slide_part*.svg clones)
+        are always treated as edited, regardless of mtime. Their
+        source-refs must be stripped to avoid svg_to_pptx byte-rehydrate
+        mismatches on shapes the framework never authored."""
+        with tempfile.TemporaryDirectory() as td:
+            ws, auth = self._make_workspace(td)
+            # Phase 2 baseline: 5 original slide_NN.svg files
+            for i in range(1, 6):
+                (auth / f"slide_{i:02d}.svg").write_text(
+                    self.SVG_WITH_VALID_REF, encoding="utf-8"
+                )
+            # A cloned/overflow slide that the framework generated.
+            clone = auth / "slide_part01_content.svg"
+            clone.write_text(self.SVG_WITH_VALID_REF, encoding="utf-8")
+
+            src = _make_fake_source_pptx(td, n_slides=5)
+            state = _make_state(td, ws)
+
+            pipeline.normalize_export_artifacts(state, source_pptx=src)
+
+            # Clone is NOT in baseline → source-ref stripped
+            self.assertNotIn(
+                "data-pptx-source-ref",
+                clone.read_text(encoding="utf-8"),
+                "clones outside the phase-2 baseline must have their "
+                "source-refs stripped",
+            )
+            # Baselines (slide_01~05) keep valid source-refs (passthrough)
+            for i in range(1, 6):
+                baseline = auth / f"slide_{i:02d}.svg"
+                self.assertIn(
+                    "data-pptx-source-ref",
+                    baseline.read_text(encoding="utf-8"),
+                    f"baseline slide_{i:02d}.svg should keep valid source-ref",
+                )
+
+    def test_caller_supplied_edited_svg_paths_wins_over_baseline_diff(self):
+        """Caller-supplied edited_svg_paths takes precedence. A baseline
+        slide (slide_NN.svg) explicitly declared by the caller as edited
+        gets its source-ref stripped; non-declared non-baseline slides
+        still get stripped via baseline-diff fallback."""
+        with tempfile.TemporaryDirectory() as td:
+            ws, auth = self._make_workspace(td)
+            for i in range(1, 6):
+                (auth / f"slide_{i:02d}.svg").write_text(
+                    self.SVG_WITH_VALID_REF, encoding="utf-8"
+                )
+            # Caller says slide_02 was edited (it's in baseline but caller
+            # overrides). They don't mention slide_part01_content which
+            # baseline-diff will catch.
+            extra_clone = auth / "slide_part01_content.svg"
+            extra_clone.write_text(
+                self.SVG_WITH_VALID_REF, encoding="utf-8"
+            )
+
+            src = _make_fake_source_pptx(td, n_slides=5)
+            state = _make_state(td, ws)
+            state.context["edited_svg_paths"] = [
+                "slide_02.svg:shape-2:title"
+            ]
+
+            pipeline.normalize_export_artifacts(state, source_pptx=src)
+
+            # Caller-declared baseline slide is stripped
+            self.assertNotIn(
+                "data-pptx-source-ref",
+                (auth / "slide_02.svg").read_text(encoding="utf-8"),
+            )
+            # Other baseline slides KEEP their refs (caller said nothing)
+            for i in (1, 3, 4, 5):
+                path = auth / f"slide_{i:02d}.svg"
+                self.assertIn(
+                    "data-pptx-source-ref",
+                    path.read_text(encoding="utf-8"),
+                )
+            # Non-baseline clone caught by baseline-diff fallback
+            self.assertNotIn(
+                "data-pptx-source-ref",
+                extra_clone.read_text(encoding="utf-8"),
+            )
+
+    def test_pure_baseline_workspace_passthrough(self):
+        """When the workspace contains ONLY baseline slides (no clones),
+        baseline-diff returns an empty set and source-refs are preserved
+        (legitimate passthrough)."""
+        with tempfile.TemporaryDirectory() as td:
+            ws, auth = self._make_workspace(td)
+            for i in range(1, 6):
+                (auth / f"slide_{i:02d}.svg").write_text(
+                    self.SVG_WITH_VALID_REF, encoding="utf-8"
+                )
+
+            src = _make_fake_source_pptx(td, n_slides=5)
+            state = _make_state(td, ws)
+
+            pipeline.normalize_export_artifacts(state, source_pptx=src)
+
+            # All baselines keep their valid source-refs (passthrough)
+            for i in range(1, 6):
+                path = auth / f"slide_{i:02d}.svg"
+                self.assertIn(
+                    "data-pptx-source-ref",
+                    path.read_text(encoding="utf-8"),
+                )
+
+    def test_skips_source_ref_block_when_no_source_pptx(self):
+        """No source_pptx → source_ref normalization skipped entirely
+        (valid_source_slides is empty → baseline set is empty →
+        nothing to compare against)."""
+        with tempfile.TemporaryDirectory() as td:
+            ws, auth = self._make_workspace(td)
+            target = auth / "slide_part01_content.svg"
+            target.write_text(self.SVG_WITH_VALID_REF, encoding="utf-8")
+
+            state = _make_state(td, ws)
+            pipeline.normalize_export_artifacts(state, source_pptx=None)
+
+            # Without source_pptx the whole block is skipped.
+            self.assertIn(
+                "data-pptx-source-ref",
+                target.read_text(encoding="utf-8"),
+            )
+
+    def test_strip_all_records_appear_in_fix_iterations(self):
+        """The strip-all action for an edited slide surfaces as an
+        AutoFixRecord in state.fix_iterations (audit trail)."""
+        with tempfile.TemporaryDirectory() as td:
+            ws, auth = self._make_workspace(td)
+            for i in range(1, 6):
+                (auth / f"slide_{i:02d}.svg").write_text(
+                    self.SVG_WITH_VALID_REF, encoding="utf-8"
+                )
+            target = auth / "slide_part01_content.svg"
+            target.write_text(self.SVG_WITH_VALID_REF, encoding="utf-8")
+
+            src = _make_fake_source_pptx(td, n_slides=5)
+            state = _make_state(td, ws)
+
+            pipeline.normalize_export_artifacts(state, source_pptx=src)
+
+            # 2 shapes had source-refs on the clone → 2 strip_all records
+            source_ref_records = [
+                r for r in state.fix_iterations
+                if r.get("issue") == "invalid_source_ref"
+            ]
+            self.assertGreaterEqual(len(source_ref_records), 2)
+            for rec in source_ref_records:
+                self.assertIn("strip_all", rec.get("detail", ""))
+
+    def test_bypass_mode_strips_all_baseline_refs(self):
+        """When render_compat is in disabled (bypass mode, the legacy
+        skip_phase3_5=True semantics), source-refs are stripped from
+        EVERY workspace SVG including baseline slide_NN.svg. This is
+        the boteng-nested-SVG compatibility path: the caller has opted
+        out of fix_picture_structure, so the baseline SVGs source-refs
+        may be inconsistent with the unrewritten geometry, and only
+        strip_all=True prevents svg_to_pptx from aborting on shape: N.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            ws, auth = self._make_workspace(td)
+            for i in range(1, 6):
+                (auth / f"slide_{i:02d}.svg").write_text(
+                    self.SVG_WITH_VALID_REF, encoding="utf-8"
+                )
+
+            src = _make_fake_source_pptx(td, n_slides=5)
+            state = _make_state(td, ws)
+
+            # Mimic smart_toc_fill.py opt-out: skip render_compat.
+            pipeline.normalize_export_artifacts(
+                state, source_pptx=src, disabled=("render_compat",),
+            )
+
+            # In bypass mode, BASELINE slides ALSO have source-refs stripped.
+            for i in range(1, 6):
+                path = auth / f"slide_{i:02d}.svg"
+                self.assertNotIn(
+                    "data-pptx-source-ref",
+                    path.read_text(encoding="utf-8"),
+                    f"bypass mode must strip refs from baseline slide_{i:02d}.svg",
+                )
+            # Every SVG (5 baselines x 2 source-refs each) gets strip_all records.
+            strip_all_records = [
+                r for r in state.fix_iterations
+                if r.get("issue") == "invalid_source_ref"
+                and "strip_all" in r.get("detail", "")
+            ]
+            self.assertGreaterEqual(len(strip_all_records), 5)
+
+
+# ---------------------------------------------------------------------------
+# Phase I2: pipeline.expand_workspace_from_markdown + run_native_fill.disabled_autofixes
 # ---------------------------------------------------------------------------
 
 import inspect  # noqa: E402

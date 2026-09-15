@@ -11,16 +11,16 @@ package. Only spawns ppt-master scripts as subprocesses.
 
 from __future__ import annotations
 
-from . import autofix, pipeline, runner
+from . import autofix, pipeline, runner, workspace_expand
 from .autofix import (
     fix_nested_picture_data_attrs,
     repair_nested_picture_attrs,
 )
 from .pipeline import (
-    expand_workspace_from_markdown,
     run_with_mapping,
     run_native_fill,
 )
+from .workspace_expand import expand_workspace_from_markdown
 from .runner import (
     run_pptx_to_svg,
     run_svg_quality_check,
@@ -32,7 +32,7 @@ __version__ = "0.1.0"
 __all__ = [
     "__version__",
     # submodules
-    "autofix", "pipeline", "runner",
+    "autofix", "pipeline", "runner", "workspace_expand",
     # autofix public surface
     "fix_nested_picture_data_attrs", "repair_nested_picture_attrs",
     # pipeline public surface

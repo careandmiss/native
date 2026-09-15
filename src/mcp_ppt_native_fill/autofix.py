@@ -868,7 +868,7 @@ def repair_workspace_svgs(
     SVG that needs them. Returns the number of files actually repaired.
 
     ``only_files`` (Phase A) restricts the walk to a set of filenames —
-    used by ``phase2_6_realize_planner_output`` to repair just the
+    used by ``realize_plan`` to repair just the
     freshly-cloned skeleton copies without touching the originals.
 
     Call this once, right after ``pptx_to_svg.py`` produces the round-trip

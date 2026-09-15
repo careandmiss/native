@@ -109,7 +109,8 @@ def run(template: Path, md_path: Path, workspace: Path, output: Path) -> int:
             "expand_ending_svg": "slide_05.svg",
             # Boteng compatibility workarounds
             "fix_nested_picture": True,
-            "skip_phase3_5": True,
+            "skip_phase3_5": False,
+            "disabled_autofixes": ["render_compat"],
             "clean_workspace": True,
         },
     }
