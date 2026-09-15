@@ -619,7 +619,11 @@ def _serve_stdio(stdin=sys.stdin, stdout=sys.stdout) -> None:
                 continue
             response = _dispatch(request)
             if response is not None:
-                stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
+                # default=str so a stray pathlib.Path in the payload
+                # doesn't blow up the JSON-RPC envelope. Tool result
+                # payload is serialised separately in _build_tool_result
+                # which has the same safeguard.
+                stdout.write(json.dumps(response, ensure_ascii=False, default=str) + "\n")
                 stdout.flush()
     except (KeyboardInterrupt, BrokenPipeError):
         log.info("mcp-ppt-native-fill server shutting down")
