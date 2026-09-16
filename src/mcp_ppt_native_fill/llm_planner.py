@@ -109,6 +109,31 @@ on what the section is actually saying:
   * version / revision history (date / status / author) → ``revision-table``
   * dense paragraphs with no clear structure → ``3-column-cards`` (default fallback)
 
+Phase 7+ extended archetypes (ppt-master presentation_core / report_core
+inspired, 2026-09-16). Use these when they fit better than the legacy
+nine:
+
+  * single short sentence (20-79 chars) / chapter intro claim → ``hero_statement``
+    (68px centered headline on a tinted panel with optional subline)
+  * single long paragraph (≥80 chars) / chapter manifesto → ``statement-caption``
+    (256px left rail + right content panel)
+  * 1 card with 2-5 keyword-style items (each ≤12 chars) → ``kpi_row``
+    (N tiles + evidence panel below)
+  * 3+ ordered H2 sub-sections synthesizing macro phases
+    (e.g. 7 procedural steps → 4 macro phases: 申请/审批/采购/验收) →
+    ``procedural-steps`` (numbered circles + takeaway band)
+  * 2 H2 sub-sections → ``three-thesis-cards``
+  * explicit contrast / side-by-side comparison (新 vs 旧, A vs B) →
+    ``comparison`` (two large panels with central divider)
+  * 4 quadrants / SWOT / 矩阵 / 象限 → ``matrix_2x2`` (four panels)
+
+IMPORTANT: Do NOT fabricate chapter numbers like "1目的" / "2适用范围".
+When rendering chapter intros, use the FULL title verbatim as the
+``hero_statement`` headline (e.g. "为了规范公司采购行为..."), NOT a
+synthesized chapter number + keyword concatenation. ``hero-number``
+(layout: hero-number) is reserved for ACTUAL numeric KPIs (e.g. "5"
+with caption "大目标") — not for chapter intros.
+
 At least ONE cloned content page per deck should use a non-default
 layout (``hero-number``, ``callout-box``, ``two-column-compare``, or
 ``timeline``) so the deck doesn't look templated.
@@ -167,6 +192,15 @@ Available layouts for `new_blocks`:
 - `two-column-compare` (juxtaposition; spec.left={title, items}, spec.right={title, items})
 - `timeline` (2-5 ordered nodes on a horizontal axis; spec.steps=[{label, detail, color?}])
 - `raw` (caller supplied SVG; spec.svg = "<svg>...</svg>")
+- Phase 7+:
+  - `statement-caption` (long single paragraph; spec.body=..., spec.title?=..., spec.eyebrow?=...)
+  - `procedural-steps` (N=3-5 macro phases; spec.phases=[{label, detail}], spec.takeaway?=...)
+  - `three-thesis-cards` (exactly 2 H2-driven cards; spec.cards=[{title, items}])
+  - `hero_statement` (single short claim; spec.headline, spec.subline?, spec.eyebrow?)
+  - `kpi_row` (N=2-5 tiles; spec.tiles=[{keyword, descriptor, value?}], spec.evidence?)
+- Phase 9:
+  - `comparison` (two side-by-side panels; spec.left={title, content}, spec.right={title, content})
+  - `matrix_2x2` (four quadrants; spec.x_axis, spec.y_axis, spec.quadrants=[t,r,b,l])
 
 If the markdown has no usable content for any shape, return `{}` for
 content_mapping and page_plan_additions / new_blocks. Never invent facts.
@@ -178,6 +212,7 @@ def plan_content_mapping(
     md_path: Path,
     workspace: Path,
     llm_config: llm_client.LLMConfig | None = None,
+    layout_hints: dict[str, Any] | None = None,
 ) -> PlannerResult:
     """Read the workspace SVGs + markdown, ask the LLM, return PlannerResult.
 
@@ -186,6 +221,20 @@ def plan_content_mapping(
     ``mapping[svg][shape] = text`` keep working). The result also carries
     ``page_plan_additions`` / ``new_blocks`` / ``skeleton_kind`` for the
     Phase-A expansion pipeline to consume.
+
+    ``layout_hints`` (Phase 9, 2026-09-16): caller-supplied dict of
+    preferences propagated to the user prompt. Currently supported
+    keys:
+      * ``force_archetype`` (bool): when true, the LLM must pick one of
+        the layouts in the SYSTEM_PROMPT whitelist, not invent custom
+        SVG fragments.
+      * ``prefer_new`` (bool): when true, the LLM must prefer the
+        Phase 7+ archetypes (statement-caption / procedural-steps /
+        three-thesis-cards / hero_statement / kpi_row / comparison /
+        matrix_2x2) over legacy 9 where either fits.
+      * ``no_fabricate_chapter_numbers`` (bool): when true, the LLM
+        must NOT synthesize chapter numbers like "1目的" — render the
+        full verbatim title.
 
     Raises ``PlannerError`` on hard failures (missing files, malformed
     SVGs, LLM-side error that the planner cannot recover from).
@@ -200,6 +249,7 @@ def plan_content_mapping(
         skeleton_index=skeleton_index,
         md_text=md_text,
         md_path=md_path,
+        layout_hints=layout_hints,
     )
 
     log.info(
@@ -468,14 +518,22 @@ def _build_user_prompt(
     skeleton_index: dict[str, Any],
     md_text: str,
     md_path: Path,
+    layout_hints: dict[str, Any] | None = None,
 ) -> str:
-    """Pack the shape index + skeleton index + markdown into one user msg."""
-    payload = {
+    """Pack the shape index + skeleton index + markdown into one user msg.
+
+    Phase 9 (2026-09-16): if ``layout_hints`` is provided, include it
+    as a top-level key in the JSON payload so the LLM sees caller
+    preferences (force_archetype / prefer_new / no_fabricate_chapter_numbers).
+    """
+    payload: dict[str, Any] = {
         "shape_index": shape_index,
         "skeleton_index": skeleton_index,
         "content_markdown_path": str(md_path.name),
         "content_markdown": md_text,
     }
+    if layout_hints:
+        payload["layout_hints"] = layout_hints
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
@@ -883,7 +941,13 @@ def _normalize_new_blocks(raw: Any) -> list[dict[str, Any]]:
         if layout not in {"3-column-cards", "flow-steps",
                           "revision-table", "raw",
                           "hero-number", "callout-box",
-                          "two-column-compare", "timeline"}:
+                          "two-column-compare", "timeline",
+                          # Phase 7 (2026-09-16)
+                          "statement-caption", "procedural-steps", "three-thesis-cards",
+                          # Phase 8 (2026-09-16)
+                          "hero_statement", "kpi_row",
+                          # Phase 9 (2026-09-16)
+                          "comparison", "matrix_2x2"}:
             log.warning(
                 "new_block %s uses unsupported layout %r; dropping",
                 svg, layout,

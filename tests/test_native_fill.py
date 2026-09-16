@@ -5463,14 +5463,19 @@ class TestPhase8HeroStatement(unittest.TestCase):
         self.assertIn("高效率", svg)
 
     def test_rejects_overlong_headline(self):
+        # Phase 9 (2026-09-16): cap raised 32 → 80 chars SOFT (auto-shrink
+        # down to 36px floor). So 33-char headline now renders instead of
+        # raising. We re-test the actual Phase 8 boundary (the OLD cap
+        # of 32) here as a regression on the legacy behavior — the
+        # 33-char headline should now be accepted.
         from mcp_ppt_native_fill.block_renderer import render_new_block
-        with self.assertRaises(ValueError) as cm:
-            render_new_block({
-                "layout": "hero_statement",
-                "bounds": "120 130 1060 480",
-                "spec": {"headline": "x" * 33},
-            })
-        self.assertIn("too long", str(cm.exception).lower())
+        # Pre-Phase 9 this would raise. Post-Phase 9 it auto-shrinks.
+        svg = render_new_block({
+            "layout": "hero_statement",
+            "bounds": "120 130 1060 480",
+            "spec": {"headline": "x" * 33},
+        })
+        self.assertIn("<text", svg)
 
     def test_no_subline_when_empty(self):
         from mcp_ppt_native_fill.block_renderer import render_new_block
@@ -5681,6 +5686,281 @@ class TestPhase8ClassifyH2(unittest.TestCase):
         ]
         phases = {_classify_h2_to_phase(t) for t in h2_titles}
         self.assertEqual(phases, {"申请", "审批", "采购", "验收"})
+
+
+class TestPhase9LLMWhitelist(unittest.TestCase):
+    """Phase 9: LLM planner must accept all Phase 7/8/9 archetypes."""
+
+    def test_new_layouts_in_whitelist(self):
+        from mcp_ppt_native_fill import llm_planner
+        # Read the whitelist source directly (it's inlined in
+        # _normalize_new_blocks). Cheaper than running the planner.
+        import inspect
+        src = inspect.getsource(llm_planner._normalize_new_blocks)
+        for required in (
+            "statement-caption", "procedural-steps", "three-thesis-cards",
+            "hero_statement", "kpi_row",
+            "comparison", "matrix_2x2",
+        ):
+            self.assertIn(required, src,
+                          f"layout {required!r} missing from "
+                          f"_normalize_new_blocks whitelist")
+
+    def test_system_prompt_lists_composition_patterns(self):
+        from mcp_ppt_native_fill import llm_planner
+        sp = llm_planner.SYSTEM_PROMPT
+        for token in ("hero_statement", "comparison", "matrix_2x2",
+                      "Phase 7+ extended archetypes"):
+            self.assertIn(token, sp,
+                          f"token {token!r} missing from SYSTEM_PROMPT")
+        # Must warn against fabricated chapter numbers.
+        self.assertIn("Do NOT fabricate chapter numbers", sp)
+
+
+class TestPhase9FlowStepsBounds(unittest.TestCase):
+    """Phase 9: flow-steps no longer overflows body_bounds with 5 tiles."""
+
+    def _bounds(self, bw=1060):
+        return f"120 130 {bw} 480"
+
+    def test_5_tiles_fit_within_bw(self):
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        spec = {
+            "layout": "flow-steps",
+            "bounds": self._bounds(1060),
+            "spec": {
+                "steps": [
+                    {"title": f"Step{i}", "items": ["a"]}
+                    for i in range(5)
+                ],
+            },
+        }
+        svg = render_new_block(spec)
+        # Phase 9 formula: step_w = (bw - gap*(n+1))/n, so each step
+        # x_i = bx + gap + i*(step_w + gap). For n=5, bw=1060, gap=16:
+        # step_w = (1060-96)/5 = 192.8; first tile x = bx + 16 = 136;
+        # last tile x = 136 + 4*(192.8+16) = 136 + 835.2 = 971.2;
+        # right edge = 971.2 + 192.8 = 1164.0; < bx+bw=1180 ✓
+        # (Pre-Phase 9: last tile right edge was 1180.0, overflowing
+        # onto the body frame's right edge — visually glued.)
+        self.assertIn("<rect", svg)
+        import re
+        last_rect = re.findall(
+            r'<rect x="([\d.]+)" y="130" width="([\d.]+)"', svg
+        )[-1]
+        right_edge = float(last_rect[0]) + float(last_rect[1])
+        self.assertLessEqual(right_edge, 1180.0,
+                             f"flow-steps 5-tile right edge {right_edge} "
+                             f"overflows 1180 (bx+bw)")
+        # And must NOT be glued to the right edge — must leave at
+        # least 12px gap (which is exactly the gap value used for
+        # n=5 layout).
+        self.assertLessEqual(right_edge, 1180.0 - 12.0,
+                             f"flow-steps 5-tile right edge {right_edge} "
+                             f"still glued to body_bounds right edge "
+                             f"(expected <= 1168)")
+
+    def test_3_tiles_no_regression(self):
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        spec = {
+            "layout": "flow-steps",
+            "bounds": self._bounds(1060),
+            "spec": {
+                "steps": [
+                    {"title": f"Step{i}", "items": ["x"]}
+                    for i in range(3)
+                ],
+            },
+        }
+        svg = render_new_block(spec)
+        # 3 rects, none overflow.
+        import re
+        rects = re.findall(
+            r'<rect x="([\d.]+)" y="130" width="([\d.]+)"', svg
+        )
+        self.assertEqual(len(rects), 3)
+        for x, w in rects:
+            self.assertLessEqual(float(x) + float(w), 1180.0)
+
+
+class TestPhase9HeroStatementCap(unittest.TestCase):
+    """Phase 9: hero_statement cap 32 → 60 chars SOFT (auto-shrink)."""
+
+    def test_headline_60_chars_renders_without_error(self):
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        # Construct a 60-char CJK headline.
+        headline = "为了规范公司采购行为" * 4  # 4 * 10 chars = 40 chars
+        headline += "公开透明公平" * 2  # + 10 = 50
+        headline += "择优选择"  # + 4 = 54
+        headline += "降低风险"  # + 4 = 58
+        headline += "防范风险"  # + 4 = 62, slice to 60
+        headline = headline[:60]
+        self.assertEqual(len(headline), 60)
+        spec = {
+            "layout": "hero_statement",
+            "bounds": "120 130 1060 480",
+            "spec": {"headline": headline, "subline": ""},
+        }
+        svg = render_new_block(spec)
+        # Should not raise; should contain a <text> with font-size
+        # between 36 and 68.
+        import re
+        sizes = [float(s) for s in re.findall(
+            r'<text [^>]*font-size="([\d.]+)"', svg
+        )]
+        self.assertTrue(any(36.0 <= s <= 68.0 for s in sizes),
+                        f"expected font_size in [36,68], got {sizes}")
+
+    def test_headline_70_chars_soft_shrinks(self):
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        # Pre-Phase 9 this would raise ValueError("max 32 chars").
+        headline = ("为了规范公司采购行为" * 5
+                    + "公开透明公平择优选择降低风险防范风险")
+        # 50 + 14 = 64 — bump up to 70.
+        headline += "abcdef"
+        self.assertGreater(len(headline), 60)
+        spec = {
+            "layout": "hero_statement",
+            "bounds": "120 130 1060 480",
+            "spec": {"headline": headline, "subline": ""},
+        }
+        svg = render_new_block(spec)
+        # Soft auto-shrink must land font-size between 36 and 68.
+        import re
+        sizes = [float(s) for s in re.findall(
+            r'<text [^>]*font-size="([\d.]+)"', svg
+        )]
+        self.assertTrue(any(36.0 <= s <= 68.0 for s in sizes),
+                        f"expected shrunk font_size in [36,68], "
+                        f"got {sizes}")
+
+    def test_headline_over_80_chars_still_raises(self):
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        headline = "x" * 100
+        spec = {
+            "layout": "hero_statement",
+            "bounds": "120 130 1060 480",
+            "spec": {"headline": headline, "subline": ""},
+        }
+        with self.assertRaises(ValueError):
+            render_new_block(spec)
+
+
+class TestPhase9EyebrowExtract(unittest.TestCase):
+    """Phase 9: _extract_eyebrow skips markdown list markers."""
+
+    def test_skips_markdown_heading_marker(self):
+        from mcp_ppt_native_fill.workspace_expand import _extract_eyebrow
+        body = "## 采购基本事项\n\n实际正文..."
+        self.assertEqual(_extract_eyebrow(body), "实际正文...")
+
+    def test_skips_numbered_list(self):
+        from mcp_ppt_native_fill.workspace_expand import _extract_eyebrow
+        body = "1. 提高采购效率\n2. 明确岗位职责\n3. 降低成本"
+        # No non-marker line — returns "".
+        self.assertEqual(_extract_eyebrow(body), "")
+
+    def test_caps_to_30_chars(self):
+        from mcp_ppt_native_fill.workspace_expand import _extract_eyebrow
+        body = "abcdefghijklmnopqrstuvwxyz1234567890XYZ"
+        self.assertEqual(len(_extract_eyebrow(body)), 30)
+
+    def test_skips_unordered_list(self):
+        from mcp_ppt_native_fill.workspace_expand import _extract_eyebrow
+        body = "- 采购申请\n- 采购审批\n- 采购实施"
+        self.assertEqual(_extract_eyebrow(body), "")
+
+    def test_skips_blockquote_marker(self):
+        from mcp_ppt_native_fill.workspace_expand import _extract_eyebrow
+        body = "> 这是引用块\n实际正文..."
+        self.assertEqual(_extract_eyebrow(body), "实际正文...")
+
+
+class TestPhase9Comparison(unittest.TestCase):
+    """Phase 9: comparison archetype (ppt-master 05_comparison.svg)."""
+
+    def test_renders_two_panels_with_central_divider(self):
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        spec = {
+            "layout": "comparison",
+            "bounds": "120 130 1060 480",
+            "spec": {
+                "title": "公开招标 vs 邀请招标",
+                "left": {"title": "公开招标", "content": "面向全社会"},
+                "right": {"title": "邀请招标", "content": "定向邀请"},
+            },
+        }
+        svg = render_new_block(spec)
+        # 2 panel rects + 1 central divider rect + multiple text.
+        import re
+        rects = re.findall(r'<rect[^>]*fill="#F4F6F8"', svg)
+        self.assertEqual(len(rects), 2,
+                         f"expected 2 panels with F4F6F8, got {len(rects)}")
+        dividers = re.findall(r'<rect[^>]*fill="#CBD5E1"', svg)
+        self.assertEqual(len(dividers), 1,
+                         f"expected 1 central divider, got {len(dividers)}")
+        # Both titles render.
+        self.assertIn("公开招标", svg)
+        self.assertIn("邀请招标", svg)
+
+    def test_requires_both_titles(self):
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        spec = {
+            "layout": "comparison",
+            "bounds": "120 130 1060 480",
+            "spec": {
+                "left": {"title": "A", "content": ""},
+                "right": {"title": "", "content": ""},
+            },
+        }
+        with self.assertRaises(ValueError):
+            render_new_block(spec)
+
+
+class TestPhase9Matrix2x2(unittest.TestCase):
+    """Phase 9: matrix_2x2 archetype (ppt-master 11_matrix_2x2.svg)."""
+
+    def test_renders_four_quadrants(self):
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        spec = {
+            "layout": "matrix_2x2",
+            "bounds": "120 130 1060 480",
+            "spec": {
+                "title": "SWOT 分析",
+                "y_axis": "重要性",
+                "x_axis": "紧迫性",
+                "quadrants": [
+                    "优势 — 经验丰富",
+                    "机会 — 政策支持",
+                    "劣势 — 资源不足",
+                    "威胁 — 竞争激烈",
+                ],
+            },
+        }
+        svg = render_new_block(spec)
+        # 4 quadrant rects (F8FAFC) + central cross (2 lines).
+        import re
+        quads = re.findall(r'<rect[^>]*fill="#F8FAFC"', svg)
+        self.assertEqual(len(quads), 4,
+                         f"expected 4 quadrants, got {len(quads)}")
+        h_lines = re.findall(r'<line[^>]*stroke="#CBD5E1"', svg)
+        self.assertEqual(len(h_lines), 2,
+                         f"expected 2 axis lines, got {len(h_lines)}")
+        # Content renders.
+        self.assertIn("经验丰富", svg)
+        self.assertIn("政策支持", svg)
+
+    def test_requires_exactly_4_quadrants(self):
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        spec = {
+            "layout": "matrix_2x2",
+            "bounds": "120 130 1060 480",
+            "spec": {
+                "quadrants": ["only one"],
+            },
+        }
+        with self.assertRaises(ValueError):
+            render_new_block(spec)
 
 
 if __name__ == "__main__":

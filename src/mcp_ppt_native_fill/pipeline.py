@@ -149,9 +149,16 @@ def llm_plan(
     from . import llm_planner  # late import to avoid pulling HTTP deps
 
     try:
+        # Phase 9 (2026-09-16): propagate caller-supplied
+        # ``expand_layout_hints`` into the LLM planner so it can bias
+        # toward new archetypes (hero_statement / kpi_row /
+        # procedural-steps / etc.) instead of falling back to the
+        # legacy callout-box / hero-number.
+        layout_hints = (state.context or {}).get("llm_layout_hints")
         planner_result = llm_planner.plan_content_mapping(
             md_path=content_markdown,
             workspace=workspace,
+            layout_hints=layout_hints,
         )
     except llm_planner.PlannerError as exc:
         # Phase 4 (2026-09-16): planner-side errors are recoverable.
@@ -1192,6 +1199,8 @@ def run_native_fill(
     skip_phase3_5: bool = False,
     disabled_autofixes: tuple[str, ...] = (),
     quality_strict: bool = True,
+    # Phase 9 (2026-09-16): layout hints forwarded to the LLM planner.
+    llm_layout_hints: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """End-to-end native_fill pipeline.
 
@@ -1255,6 +1264,11 @@ def run_native_fill(
     # LLM-derived mapping is merged into the caller-supplied
     # ``content_mapping`` (caller entries win on conflict).
     if content_markdown is not None and enable_llm_planner:
+        # Phase 9 (2026-09-16): stash caller-supplied layout hints so
+        # llm_plan → plan_content_mapping can bias toward new
+        # archetypes.
+        if llm_layout_hints:
+            state.context["llm_layout_hints"] = llm_layout_hints
         state = llm_plan(state, content_markdown, content_mapping)
         if state.stage == "failed":
             return _finalize(state)
@@ -1380,6 +1394,10 @@ def run_with_mapping(
     expand_part_names: list[str] | None = None,
     expand_divider_subtitle_template: dict[str, str] | None = None,
     expand_section_title_en_map: dict[str, str] | None = None,
+    # Phase 9 (2026-09-16): propagate layout_hints into the LLM
+    # planner so it can prefer new archetypes (hero_statement /
+    # kpi_row / procedural-steps / etc.).
+    llm_layout_hints: dict[str, Any] | None = None,
     expand_exclude_source_slides: list[int] | None = None,
     # Workaround toggles (opt-in)
     fix_nested_picture: bool = False,
@@ -1649,6 +1667,7 @@ def run_with_mapping(
         disabled_autofixes=disabled_autofixes,
         quality_strict=quality_strict,
         enable_llm_planner=enable_llm_planner,
+        llm_layout_hints=llm_layout_hints,
     )
     # Augment result with the pre-delegation work that the caller
     # asked about (edit_summary, strip_report, expansions, toc_summary).

@@ -140,9 +140,13 @@ def render_new_block(spec: dict[str, Any]) -> str:
         parts: list[str] = []
         n = len(steps)
         gap = 16.0
-        step_w = (bw - gap * (n - 1)) / n
+        # Phase 9 (2026-09-16): divide bw by (n+1) gaps instead of
+        # (n-1) — first/last card now leave a half-gap gutter on
+        # each side, eliminating the previous "last card sticks to
+        # right edge" overflow by ~12px on bw=1060, n=5.
+        step_w = (bw - gap * (n + 1)) / n
         for i, step in enumerate(steps):
-            cx = bx + i * (step_w + gap)
+            cx = bx + gap + i * (step_w + gap)
             color = step.get("color", "#1D2CAB")
             title = step.get("title", f"Step {i + 1}")
             items = coerce_str_list(step.get("items", []))
@@ -831,15 +835,19 @@ def render_new_block(spec: dict[str, Any]) -> str:
         # (≥80 char, split-rail). Trigger: 20-79 char single sentence.
         # Background is a soft tint panel so the page reads as a
         # "feature claim" rather than a flat text card.
+        # Phase 9 (2026-09-16): cap 32 → 60 chars SOFT (auto-shrink to
+        # 36px floor instead of raising ValueError), so longer chapter
+        # intros like "为了规范公司采购行为, 降低采购成本..." (70 chars)
+        # still render with full information.
         from .text_width import chars_that_fit
         headline = payload.get("headline", "")
         eyebrow = payload.get("eyebrow", "")
         subline = payload.get("subline", "")
         if not isinstance(headline, str) or not headline:
             raise ValueError("hero_statement requires spec.headline")
-        if len(headline) > 32:
+        if len(headline) > 80:
             raise ValueError(
-                f"hero_statement headline too long (max 32 chars, "
+                f"hero_statement headline too long (max 80 chars, "
                 f"got {len(headline)})"
             )
 
@@ -860,8 +868,8 @@ def render_new_block(spec: dict[str, Any]) -> str:
                 f'font-weight="500" fill="#64748B" letter-spacing="1.2">'
                 f'{escape(eyebrow.upper()[:20])}</text>'
             )
-        # 3. Headline (centered, 68px bold ink, auto-shrink to 14px min
-        #    if headline overflows the panel).
+        # 3. Headline (centered, 68px bold ink, auto-shrink to 36px
+        #    floor if headline overflows the panel).
         font_size = 68.0
         max_chars = chars_that_fit(bw - 64.0, font_size)
         if max_chars <= 0:
@@ -870,7 +878,8 @@ def render_new_block(spec: dict[str, Any]) -> str:
                 f"{font_size} (bw={bw:g})"
             )
         # Auto-shrink if headline is longer than fit-at-default.
-        while len(headline) > max_chars and font_size > 14.0:
+        # Phase 9: floor lowered from 14.0 → 36.0 (don't render illegible).
+        while len(headline) > max_chars and font_size > 36.0:
             font_size -= 2.0
             max_chars = chars_that_fit(bw - 64.0, font_size)
             if max_chars <= 0:
@@ -979,6 +988,230 @@ def render_new_block(spec: dict[str, Any]) -> str:
                 f'<text x="{bx + 24:g}" y="{ev_y + 36:g}" font-size="16" '
                 f'font-weight="500" fill="#1E293B">'
                 f'{escape(evidence[:200])}</text>'
+            )
+        return "\n".join(parts)
+    if layout == "comparison":
+        # ppt-master analog: presentation_core/05_comparison.svg (2026-09-16).
+        # Two side-by-side panels with a central vertical divider for
+        # explicit juxtaposition ("公开招标 vs 邀请招标" / "新制度 vs
+        # 旧制度"). Spec shape:
+        #   spec.left   = {"title": "...", "content": "..."}
+        #   spec.right  = {"title": "...", "content": "..."}
+        #   spec.title  = optional page title at top
+        left = payload.get("left") or {}
+        right = payload.get("right") or {}
+        if not (isinstance(left, dict) and isinstance(right, dict)):
+            raise ValueError(
+                "comparison requires spec.left and spec.right (objects)"
+            )
+        if not (isinstance(left.get("title"), str) and left["title"]
+                and isinstance(right.get("title"), str) and right["title"]):
+            raise ValueError(
+                "comparison requires non-empty spec.left.title and "
+                "spec.right.title"
+            )
+
+        bounds = spec.get("bounds") or payload.get("bounds")
+        bx, by, bw, bh = (float(t) for t in bounds.split())
+        parts: list[str] = []
+
+        # Optional page title (36px bold ink, top).
+        title = payload.get("title", "")
+        title_band = 60.0 if title else 0.0
+        if title:
+            parts.append(
+                f'<text x="{bx:g}" y="{by + 36:g}" font-size="32" '
+                f'font-weight="700" fill="#1E293B">'
+                f'{escape(str(title)[:48])}</text>'
+            )
+
+        # Two equal panels separated by a 24px central gutter.
+        gutter = 24.0
+        panel_w = (bw - gutter) / 2.0
+        panel_y = by + title_band
+        panel_h = bh - title_band
+
+        # Left panel.
+        parts.append(
+            f'<rect x="{bx:g}" y="{panel_y:g}" width="{panel_w:g}" '
+            f'height="{panel_h:g}" rx="12" fill="#F4F6F8" '
+            f'stroke="#D6DCE3" stroke-width="1"/>'
+        )
+        # Right panel.
+        rx_panel_x = bx + panel_w + gutter
+        parts.append(
+            f'<rect x="{rx_panel_x:g}" y="{panel_y:g}" width="{panel_w:g}" '
+            f'height="{panel_h:g}" rx="12" fill="#F4F6F8" '
+            f'stroke="#D6DCE3" stroke-width="1"/>'
+        )
+        # Central vertical divider (4px wide, rx=2, full panel height).
+        divider_x = bx + panel_w + gutter / 2.0 - 2.0
+        parts.append(
+            f'<rect x="{divider_x:g}" y="{panel_y + 32:g}" width="4" '
+            f'height="{panel_h - 64:g}" rx="2" fill="#CBD5E1"/>'
+        )
+
+        # Left title (24px bold ink, top of panel).
+        left_title = str(left["title"])[:24]
+        parts.append(
+            f'<text x="{bx + 24:g}" y="{panel_y + 36:g}" font-size="22" '
+            f'font-weight="700" fill="#1E293B">{escape(left_title)}</text>'
+        )
+        # Right title (same vertical alignment).
+        right_title = str(right["title"])[:24]
+        parts.append(
+            f'<text x="{rx_panel_x + 24:g}" y="{panel_y + 36:g}" '
+            f'font-size="22" font-weight="700" fill="#1E293B">'
+            f'{escape(right_title)}</text>'
+        )
+
+        # Content bodies (18px ink, wrapped by char budget per line).
+        def _wrap_lines(text: str, max_chars_per_line: int) -> list[str]:
+            text = str(text or "")
+            lines: list[str] = []
+            while text and len(lines) < 12:  # cap 12 lines to fit panel
+                if len(text) <= max_chars_per_line:
+                    lines.append(text)
+                    break
+                cut = text.rfind(" ", 0, max_chars_per_line)
+                if cut <= 0:
+                    cut = max_chars_per_line
+                lines.append(text[:cut])
+                text = text[cut:].lstrip()
+            return lines
+
+        body_x_left = bx + 24
+        body_x_right = rx_panel_x + 24
+        body_y_start = panel_y + 80
+        max_chars_per_line = max(8, int((panel_w - 48) / 11.0))
+        line_h = 26.0
+        for side_x, content in (
+            (body_x_left, left.get("content", "")),
+            (body_x_right, right.get("content", "")),
+        ):
+            lines = _wrap_lines(content, max_chars_per_line)
+            for i, ln in enumerate(lines):
+                ly = body_y_start + i * line_h
+                if ly > by + bh - 24:
+                    break
+                parts.append(
+                    f'<text x="{side_x:g}" y="{ly:g}" font-size="18" '
+                    f'fill="#1E293B">{escape(ln)}</text>'
+                )
+        return "\n".join(parts)
+    if layout == "matrix_2x2":
+        # ppt-master analog: report_core/11_matrix_2x2.svg (2026-09-16).
+        # Four quadrants arranged in a 2x2 grid, with optional Y-axis
+        # label on the left and X-axis label on the bottom. Useful for
+        # SWOT / 风险收益 × 高低 / Ansoff 矩阵 analyses. Spec shape:
+        #   spec.x_axis     = optional bottom axis label string
+        #   spec.y_axis     = optional left axis label string
+        #   spec.quadrants  = list of 4 strings (top-left, top-right,
+        #                     bottom-left, bottom-right)
+        #   spec.title      = optional page title at top
+        quadrants = payload.get("quadrants") or []
+        if not (isinstance(quadrants, list) and len(quadrants) == 4):
+            raise ValueError(
+                "matrix_2x2 requires spec.quadrants = list of 4 strings"
+            )
+
+        bounds = spec.get("bounds") or payload.get("bounds")
+        bx, by, bw, bh = (float(t) for t in bounds.split())
+        parts: list[str] = []
+
+        # Optional page title.
+        title = payload.get("title", "")
+        title_band = 60.0 if title else 0.0
+        if title:
+            parts.append(
+                f'<text x="{bx:g}" y="{by + 36:g}" font-size="32" '
+                f'font-weight="700" fill="#1E293B">'
+                f'{escape(str(title)[:48])}</text>'
+            )
+
+        # Reserve left axis-label strip + bottom axis-label strip.
+        axis_left = 100.0 if payload.get("y_axis") else 16.0
+        axis_bottom = 60.0 if payload.get("x_axis") else 16.0
+        inner_x = bx + axis_left
+        inner_y = by + title_band
+        inner_w = bw - axis_left - 16.0
+        inner_h = bh - title_band - axis_bottom
+
+        cell_gap = 8.0
+        cell_w = (inner_w - cell_gap) / 2.0
+        cell_h = (inner_h - cell_gap) / 2.0
+
+        # 4 quadrant panels (top-left, top-right, bottom-left,
+        # bottom-right).
+        positions = [
+            (inner_x, inner_y),                          # TL
+            (inner_x + cell_w + cell_gap, inner_y),      # TR
+            (inner_x, inner_y + cell_h + cell_gap),      # BL
+            (inner_x + cell_w + cell_gap,
+             inner_y + cell_h + cell_gap),               # BR
+        ]
+        for (qx, qy), content in zip(positions, quadrants):
+            parts.append(
+                f'<rect x="{qx:g}" y="{qy:g}" width="{cell_w:g}" '
+                f'height="{cell_h:g}" rx="8" fill="#F8FAFC" '
+                f'stroke="#E2E8F0" stroke-width="1"/>'
+            )
+            # Wrap content into ~6 lines max.
+            max_chars_per_line = max(8, int((cell_w - 32) / 11.0))
+            lines: list[str] = []
+            text = str(content or "")
+            while text and len(lines) < 8:
+                if len(text) <= max_chars_per_line:
+                    lines.append(text)
+                    break
+                cut = text.rfind(" ", 0, max_chars_per_line)
+                if cut <= 0:
+                    cut = max_chars_per_line
+                lines.append(text[:cut])
+                text = text[cut:].lstrip()
+            for i, ln in enumerate(lines):
+                ly = qy + 28 + i * 24
+                if ly > qy + cell_h - 12:
+                    break
+                parts.append(
+                    f'<text x="{qx + 16:g}" y="{ly:g}" font-size="16" '
+                    f'fill="#475569">{escape(ln)}</text>'
+                )
+
+        # Central cross axes (horizontal + vertical lines, drawn on
+        # top of quadrants so they're visible).
+        axis_color = "#CBD5E1"
+        h_mid_y = inner_y + cell_h + cell_gap / 2.0
+        parts.append(
+            f'<line x1="{inner_x:g}" y1="{h_mid_y:g}" '
+            f'x2="{inner_x + inner_w:g}" y2="{h_mid_y:g}" '
+            f'stroke="{axis_color}" stroke-width="2"/>'
+        )
+        v_mid_x = inner_x + cell_w + cell_gap / 2.0
+        parts.append(
+            f'<line x1="{v_mid_x:g}" y1="{inner_y:g}" '
+            f'x2="{v_mid_x:g}" y2="{inner_y + inner_h:g}" '
+            f'stroke="{axis_color}" stroke-width="2"/>'
+        )
+
+        # Y-axis label (rotated, left side).
+        if payload.get("y_axis"):
+            y_label = str(payload["y_axis"])[:16]
+            parts.append(
+                f'<text x="{bx + 16:g}" y="{inner_y + inner_h / 2.0:g}" '
+                f'font-size="14" font-weight="600" fill="#64748B" '
+                f'text-anchor="middle" transform="rotate(-90 '
+                f'{bx + 16:g} {inner_y + inner_h / 2.0:g})">'
+                f'{escape(y_label)}</text>'
+            )
+        # X-axis label (bottom).
+        if payload.get("x_axis"):
+            x_label = str(payload["x_axis"])[:16]
+            parts.append(
+                f'<text x="{inner_x + inner_w / 2.0:g}" '
+                f'y="{by + bh - 24:g}" font-size="14" '
+                f'font-weight="600" fill="#64748B" text-anchor="middle">'
+                f'{escape(x_label)}</text>'
             )
         return "\n".join(parts)
     raise ValueError(f"unsupported new_content_block layout: {layout!r}")

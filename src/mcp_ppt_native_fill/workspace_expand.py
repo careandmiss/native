@@ -310,15 +310,69 @@ def expand_workspace_from_markdown(
                 section_title = (
                     section_obj["title"] if section_obj else title
                 )
-                section_eyebrow = (
-                    section_obj["body"].splitlines()[0].strip()
-                    if section_obj
-                    and section_obj.get("body")
-                    and not section_obj["body"].splitlines()[0].startswith("#")
-                    else ""
+                section_eyebrow = _extract_eyebrow(
+                    section_obj["body"] if section_obj else ""
                 )
 
-                if n_h2 >= 3:
+                # Phase 9 (2026-09-16): explicit comparison / matrix_2x2
+                # triggers BEFORE n_h2 >= 3 check, because both archetypes
+                # render a fixed-shape page regardless of H2 count.
+                section_body_text = (
+                    section_obj["body"] if section_obj else ""
+                )
+                if _looks_like_matrix(section_body_text):
+                    # 4-quadrant rendering: split body into 4 segments
+                    # (paragraph boundaries or H2 boundaries). Boteng
+                    # currently has no 4-quadrant content, so we feed
+                    # placeholder quadrants from the body itself.
+                    q_lines = [
+                        ln.strip() for ln in section_body_text.splitlines()
+                        if ln.strip() and not ln.strip().startswith("#")
+                    ]
+                    # Pad to 4 quadrants by repeating / blank.
+                    while len(q_lines) < 4:
+                        q_lines.append("")
+                    spec = {
+                        "layout": "matrix_2x2",
+                        "bounds": body_bounds,
+                        "spec": {
+                            "title": section_title[:18],
+                            "y_axis": "Y 轴",
+                            "x_axis": "X 轴",
+                            "quadrants": q_lines[:4],
+                        },
+                    }
+                elif _looks_like_comparison(section_body_text):
+                    # Side-by-side comparison: split body around
+                    # "对比" / "vs" marker into left/right halves.
+                    split_idx = None
+                    for marker in ("对比", "vs", "VS", " v.s. ",
+                                   "V.S.", "反之", "与此不同"):
+                        i = section_body_text.find(marker)
+                        if i > 0:
+                            split_idx = i
+                            break
+                    if split_idx is None:
+                        split_idx = len(section_body_text) // 2
+                    left_text = section_body_text[:split_idx].strip()
+                    right_text = section_body_text[
+                        split_idx:].strip()
+                    spec = {
+                        "layout": "comparison",
+                        "bounds": body_bounds,
+                        "spec": {
+                            "title": section_title[:18],
+                            "left": {
+                                "title": section_title[:12],
+                                "content": left_text[:600],
+                            },
+                            "right": {
+                                "title": "对比",
+                                "content": right_text[:600],
+                            },
+                        },
+                    }
+                elif n_h2 >= 3:
                     # Procedural-steps archetype (ppt-master process_timeline).
                     # Synthesize 4 macro phases from the H2 sub-card titles
                     # via keyword-based归类 (申请 / 审批 / 采购 / 验收).
@@ -773,6 +827,64 @@ def toc_slide_number(toc_svg_filename: str) -> int:
 # dispatch in expand_workspace_from_markdown. Kept module-private
 # (underscore-prefixed) so external callers don't depend on them; the
 # dispatch in the per-section loop above is the only consumer.
+
+
+def _extract_eyebrow(body: str) -> str:
+    """Pick a short eyebrow label from a section body.
+
+    Phase 9 (2026-09-16) rewrite: skip markdown heading markers (# / >
+    / - / * / list numbering) so we don't accidentally promote a
+    numbered list bullet ("1. 提高采购效率...") or a citation block to
+    eyebrow position. Returns the first non-marker line, capped to
+    30 chars. Returns "" if the body has no usable line.
+
+    Boteng case (before fix): "为了规范公司采购行为..." 30+ chars
+    paragraph was being injected as 14px eyebrow on top of every
+    hero_statement / kpi_row, dwarfing the actual headline. Now
+    skipped because the line starts with "1." (numbered list).
+    """
+    for raw_line in (body or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith(("#", ">", "-", "*", "·", "•")):
+            continue
+        # Markdown ordered list markers (1. / 2) / etc).
+        if len(line) >= 3 and line[0].isdigit() and line[1] in (".", "、", " "):
+            continue
+        return line[:30]
+    return ""
+
+
+# Contrast markers (Phase 9, 2026-09-16): keywords that explicitly
+# signal "side-by-side comparison" content suitable for the
+# ``comparison`` archetype (ppt-master presentation_core/05_comparison).
+_CONTRAST_MARKERS = (
+    "对比", "对比下", "对比是", "不同于", "不同于", "反之", "反之亦然",
+    "与此不同", "vs", " VS ", " v.s. ", "V.S.",
+    "新制度", "旧制度", "新方法", "旧方法", "新流程", "旧流程",
+)
+
+
+def _looks_like_comparison(body: str) -> bool:
+    """True if the body has explicit contrast markers."""
+    text = body or ""
+    return any(m in text for m in _CONTRAST_MARKERS)
+
+
+# 4-quadrant markers (Phase 9, 2026-09-16): keywords that signal
+# ``matrix_2x2`` archetype (ppt-master report_core/11_matrix_2x2).
+_MATRIX_MARKERS = (
+    "SWOT", "swot", "矩阵", "象限", "四象限", "维度", "高/低",
+    "高 / 低", "收益/风险", "收益 / 风险",
+)
+
+
+def _looks_like_matrix(body: str) -> bool:
+    """True if the body has explicit 4-quadrant markers."""
+    text = body or ""
+    return any(m in text for m in _MATRIX_MARKERS)
+
 
 _PHASE_KEYWORDS = (
     # Phase 8 (2026-09-16): "基本事项" must precede "采购" so

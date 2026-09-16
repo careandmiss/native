@@ -106,6 +106,18 @@ def main() -> int:
             "skip_phase3_5": False,
             "disabled_autofixes": ["render_compat"],
             "clean_workspace": True,
+            # Phase 9 (2026-09-16): constrain the LLM planner so it
+            # actually selects the Phase 7/8 archetypes (hero_statement,
+            # kpi_row, procedural-steps, statement-caption,
+            # three-thesis-cards) instead of falling back to legacy
+            # callout-box / hero-number. Without these hints the LLM
+            # was rendering "1目的" as a synthesized KPI chapter number
+            # and "适用范围" as a quote box — both visually weak.
+            "expand_layout_hints": {
+                "force_archetype": True,
+                "prefer_new": True,
+                "no_fabricate_chapter_numbers": True,
+            },
         },
     }
 

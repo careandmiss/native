@@ -471,6 +471,21 @@ def _execute_native_fill(arguments: dict) -> dict:
     expand_section_title_en_map = options.get(
         "expand_section_title_en_map"
     )
+    # Phase 9 (2026-09-16): propagate caller layout preferences into
+    # the LLM planner. Validated below; must be a dict if provided.
+    expand_layout_hints_raw = options.get("expand_layout_hints")
+    expand_layout_hints: dict[str, Any] | None = None
+    if expand_layout_hints_raw is not None:
+        if not isinstance(expand_layout_hints_raw, dict):
+            return {
+                "ok": False,
+                "stage": "init",
+                "error": (
+                    f"expand_layout_hints must be a dict, "
+                    f"got {type(expand_layout_hints_raw).__name__}"
+                ),
+            }
+        expand_layout_hints = dict(expand_layout_hints_raw)
     expand_exclude_source_slides = options.get("expand_exclude_source_slides")
 
     # Smart TOC fill (opt-in)
@@ -554,6 +569,9 @@ def _execute_native_fill(arguments: dict) -> dict:
             expand_part_names=expand_part_names,
             expand_divider_subtitle_template=expand_divider_subtitle_template,
             expand_section_title_en_map=expand_section_title_en_map,
+            # Phase 9 (2026-09-16): forward layout hints so the LLM
+            # planner biases toward new archetypes.
+            llm_layout_hints=expand_layout_hints,
             expand_exclude_source_slides=expand_exclude_source_slides,
             expand_toc_from_markdown=expand_toc_from_markdown,
             expand_toc_slot_grid=expand_toc_slot_grid,
