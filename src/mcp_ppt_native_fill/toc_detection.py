@@ -674,7 +674,19 @@ def cards_from_body(body: str) -> list[dict[str, Any]]:
     # heading are H2 sub-sections, owned by the sub-cards block below.
     # They are excluded from the "first card" / "list items" extraction so
     # their content isn't double-counted.
-    paragraphs = [p.strip() for p in body.split("\n\n") if p.strip()]
+    # Phase 7 (2026-09-16): split on blank lines OR a line that
+    # starts with ``## ``. The boteng markdown mixes H2 sub-section
+    # titles with their numbered items in the same paragraph block
+    # (no blank line between ``## （一）xxx`` and ``1. xxx``), so a
+    # pure ``\n\n`` split leaves one giant H2-free paragraph and
+    # the procedural-steps archetype in workspace_expand never sees
+    # the H2 cards. Splitting on ``## `` line boundaries as well
+    # makes each H2 sub-section a discrete paragraph for the
+    # downstream H2-sub-card extraction.
+    paragraphs = [
+        p.strip() for p in re.split(r"\n\n+|(?=^## )", body, flags=re.MULTILINE)
+        if p.strip()
+    ]
     h2_re = re.compile(r"^##\s+(.+)$")
     h2_paragraph_idxs: set[int] = set()
     for i, p in enumerate(paragraphs):
@@ -716,44 +728,65 @@ def cards_from_body(body: str) -> list[dict[str, Any]]:
     # per H2, with the H2 title as the card title and the numbered list
     # items below it as the card items. This fills the body for slides
     # that have NO top-level numbered list but DO have H2 subsections.
+    # Phase 7 (2026-09-16): the boteng markdown sometimes writes the
+    # FIRST numbered item on the SAME line as a spurious ``## **``
+    # prefix (``## **  **1.xxx``), so the H2 sub-section's items
+    # can span multiple paragraphs (the next paragraph starts with
+    # ``## **`` too, which the original H2 detector mis-reads as a
+    # real H2 boundary). For each H2 paragraph, walk forward through
+    # subsequent paragraphs until we hit another real H2 paragraph,
+    # collecting numbered items from each — with ``## **`` prefix
+    # stripped before matching the numbered-list regex.
     sub_cards: list[dict[str, Any]] = []
-    for i in h2_paragraph_idxs:
-        p = paragraphs[i]
+    for i, p in enumerate(paragraphs):
         lines = p.splitlines()
         if not lines:
             continue
-        h2m = h2_re.match(lines[0].strip())
+        first_line = lines[0].strip()
+        h2m = h2_re.match(first_line)
         if not h2m:
             continue
-        sub_title = h2m.group(1).strip()
-        # Strip bold markers (``**xxx**``) so the card title doesn't show asterisks.
-        sub_title = sub_title.replace("**", "").strip()
+        sub_title = h2m.group(1).strip().replace("**", "").strip()
         items: list[str] = []
-        for line in lines[1:]:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            lm = list_re.match(line)
-            if lm:
-                txt = lm.group(2).strip()
-                # Phase 6.1c (2026-09-16): widened 30→80 chars. 30 chars
-                # chopped long Chinese items mid-sentence ("研发部对价值
-                # 超过2000元以上的配件、设备、仪器等需要由研发…"); 80
-                # keeps a full clause readable in bullet-list /
-                # 3-column-cards. The downstream renderer still enforces
-                # its own bounds-based shrink if the item doesn't fit.
-                items.append(txt[:80] + ("…" if len(txt) > 80 else ""))
+        # Scan this paragraph's lines + subsequent paragraphs until
+        # we hit another paragraph whose first line is a real H2.
+        for j in range(i, len(paragraphs)):
+            if j > i and j in h2_paragraph_idxs:
+                break
+            for line in paragraphs[j].splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") is False and False:
+                    # ``line.startswith('#')`` would skip our own H2
+                    # title line — keep it so we don't strip it. We
+                    # only want to skip lines that are themselves
+                    # H2/H3 headings (handled by the j>i boundary
+                    # check above). Numbered items start with ``N.``
+                    # which doesn't match this; pass through.
+                    pass
+                if line.startswith("##") or line.startswith("# "):
+                    # Strip ``## **`` markdown typo prefix so the
+                    # numbered-item regex can match ``## ** **1.xxx``.
+                    line = re.sub(r"^#+\s*\*+\s*", "", line)
+                lm = list_re.match(line)
+                if lm:
+                    txt = lm.group(2).strip()
+                    items.append(
+                        txt[:80] + ("…" if len(txt) > 80 else "")
+                    )
         if items:
-            # Color cycles with current card count so duplicates don't share color.
             color = colors[(len(cards) + len(sub_cards)) % 3]
             sub_cards.append({
-                "title": sub_title[:12],   # Phase 1.2 widened from earlier truncation
+                "title": sub_title[:12],
                 "color": color,
                 "items": items[:4],
             })
 
-    # Append at most 2 H2 sub-cards (renderer supports 1-4 cards per row).
-    cards.extend(sub_cards[:2])
+    # Append at most 5 H2 sub-cards (procedural-steps archetype
+    # budget). Phase 7 (2026-09-16) raised the cap from 2 → 5 so the
+    # procedural-steps archetype in workspace_expand has ≥3 distinct
+    # H2 cards to dispatch on. n_h2 ≥ 3 triggers procedural-steps;
+    # n_h2 < 3 falls through to the multi-H2 bullet-list path.
+    cards.extend(sub_cards[:5])
 
     # Additional cards: numbered list ``1. xxx`` items.
     # Phase 1.3 (2026-09-16): also scan paragraphs[0] (non-H2 path) so numbered
@@ -794,10 +827,12 @@ def cards_from_body(body: str) -> list[dict[str, Any]]:
                 "items": list_items[half:half + 5],
             })
 
-    # Trim to 4 cards max (Phase 1.2: renderer ``3-column-cards`` supports
-    # 1-4 cards; lifted cap from 3 so H2 sub-cards + numbered list cards
-    # can coexist on the same slide, e.g. ``四、工作程序``).
-    cards = cards[:4]
+    # Phase 7 (2026-09-16): do NOT trim here. The 3-column-cards
+    # renderer's 1-4 card limit is enforced downstream by the A-path
+    # dispatch in workspace_expand (which routes to procedural-steps
+    # when n_h2 >= 3, so trimming would prevent n_h2 from ever
+    # reaching 4). cards_from_body returns all detected cards; the
+    # dispatcher picks the right layout for the markdown shape.
 
     # Phase 6.1b (2026-09-16): markdown pipe-table detection. Body that
     # is primarily a table (e.g. 附件's 修订记录) should render as

@@ -251,15 +251,95 @@ def expand_workspace_from_markdown(
                         "color": "#1D2CAB",
                         "items": ["(待补充)"],
                     }]
+
+                # Phase 7 (2026-09-16): ppt-master archetype-based
+                # dispatch. Layout selection driven by content SHAPE
+                # (count of H2 sub-cards, paragraph length, item
+                # count), not by character-count switches. Each branch
+                # picks a ppt-master presentation_core archetype that
+                # fits the content. Priority order:
+                #   1. revision-table sentinel (Phase 6.4, unchanged)
+                #   2. n_h2 >= 3 → procedural-steps (with synthesized
+                #      4 macro phases via _synthesize_procedural_phases)
+                #   3. single long paragraph (≥80 chars) → statement-caption
+                #   4. single short paragraph → simple-text
+                #   5. 1 card ≥2 items → bullet-list
+                #   6. 2 H2 → three-thesis-cards (synthesize 3rd card)
+                #   7. ≥2 cards → 3-column-cards (legacy fallback)
                 n_items_total = sum(len(c.get("items", [])) for c in cards)
-                if len(cards) == 1 and n_items_total == 1:
+                n_h2 = sum(
+                    1 for c in cards
+                    if c.get("title") not in ("要点", "子项", "补充")
+                )
+                # `section` is needed for the eyebrow / title fields of
+                # the new archetypes. Bind it from the per-section index.
+                section_idx = i - 1  # `i` is 1-based in this loop
+                section_obj = (
+                    sections[section_idx] if section_idx < len(sections)
+                    else None
+                )
+                section_title = (
+                    section_obj["title"] if section_obj else title
+                )
+                section_eyebrow = (
+                    section_obj["body"].splitlines()[0].strip()
+                    if section_obj
+                    and section_obj.get("body")
+                    and not section_obj["body"].splitlines()[0].startswith("#")
+                    else ""
+                )
+
+                if n_h2 >= 3:
+                    # Procedural-steps archetype (ppt-master process_timeline).
+                    # Synthesize 4 macro phases from the H2 sub-card titles
+                    # via keyword-based归类 (申请 / 审批 / 采购 / 验收).
+                    steps, takeaways = _synthesize_procedural_phases(
+                        cards, section_title,
+                    )
+                    if steps and takeaways:
+                        spec = {
+                            "layout": "procedural-steps",
+                            "bounds": body_bounds,
+                            "spec": {
+                                "eyebrow": section_title[:20],
+                                "steps": steps,
+                                "takeaways": takeaways,
+                            },
+                        }
+                    else:
+                        # Synthesis failed — fall through to the
+                        # Phase 6.4 multi-H2 bullet-list path below.
+                        spec = _multi_h2_bullet_list_spec(
+                            cards, body_bounds,
+                        )
+                elif (len(cards) == 1
+                      and n_items_total == 1
+                      and len(cards[0].get("items", [""])[0]) >= 80):
+                    # statement-caption archetype (ppt-master content_caption).
+                    # Triggered by a single long-paragraph H1 with no
+                    # numbered list — gives the page an editorial "title
+                    # on the rail, body on the panel" feel instead of
+                    # simple-text's flat single card.
                     long_text = cards[0]["items"][0]
+                    spec = {
+                        "layout": "statement-caption",
+                        "bounds": body_bounds,
+                        "spec": {
+                            "title": section_title[:18],
+                            "eyebrow": section_eyebrow[:24]
+                            if section_eyebrow else "要点",
+                            "body": long_text,
+                        },
+                    }
+                elif len(cards) == 1 and n_items_total == 1:
+                    # Short single-paragraph → simple-text (Phase 3.4).
                     spec = {
                         "layout": "simple-text",
                         "bounds": body_bounds,
-                        "spec": {"text": long_text},
+                        "spec": {"text": cards[0]["items"][0]},
                     }
                 elif len(cards) == 1 and n_items_total >= 2:
+                    # Single H1 with multiple items → bullet-list (Phase 3.4).
                     spec = {
                         "layout": "bullet-list",
                         "bounds": body_bounds,
@@ -268,6 +348,15 @@ def expand_workspace_from_markdown(
                             "color": cards[0].get("color", "#1D2CAB"),
                         },
                     }
+                elif (n_h2 == 2
+                      and all("（" in c.get("title", "")
+                              and "）" in c.get("title", "")
+                              for c in cards
+                              if c.get("title") not in ("要点",))):
+                    # 2-H2 → three-thesis-cards (synthesize the 3rd
+                    # card from leftover items so the page reads as
+                    # 3 parallel theses, not as a 2-card fragment).
+                    spec = _three_thesis_spec(cards, body_bounds)
                 elif (len(cards) >= 3
                       and all(c.get("title") != "要点" for c in cards[1:])
                       # Multi-H2 bullet-list dispatch: ONLY when the
@@ -281,27 +370,7 @@ def expand_workspace_from_markdown(
                       and any("（" in c.get("title", "")
                               and "）" in c.get("title", "")
                               for c in cards[1:])):
-                    # Phase 6.4 multi-H2 → bullet-list: flatten the H2
-                    # sub-cards into one numbered list with the H2 title
-                    # as a prefix on each item, so the reader can tell
-                    # which sub-section each clause belongs to. Cap at
-                    # 10 items per the bullet-list renderer budget.
-                    flat_items: list[str] = []
-                    for c in cards[1:]:
-                        ctitle = c.get("title", "").strip()
-                        for it in c.get("items", []):
-                            if ctitle:
-                                flat_items.append(f"{ctitle}: {it[:80]}")
-                            else:
-                                flat_items.append(it[:80])
-                    spec = {
-                        "layout": "bullet-list",
-                        "bounds": body_bounds,
-                        "spec": {
-                            "items": flat_items[:10],
-                            "color": cards[1].get("color", "#1D2CAB"),
-                        },
-                    }
+                    spec = _multi_h2_bullet_list_spec(cards, body_bounds)
                 else:
                     # Multi-card fallback — keep the legacy 40-char
                     # truncation per item so cards stay readable in
@@ -626,3 +695,142 @@ def toc_slide_number(toc_svg_filename: str) -> int:
     """Extract 1-based slide number from ``slide_NN.svg`` filename."""
     m = re.search(r"slide_(\d+)\.svg$", toc_svg_filename)
     return int(m.group(1)) if m else 0
+
+
+# Phase 7 (2026-09-16): helper functions for the new archetype
+# dispatch in expand_workspace_from_markdown. Kept module-private
+# (underscore-prefixed) so external callers don't depend on them; the
+# dispatch in the per-section loop above is the only consumer.
+
+_PHASE_KEYWORDS = (
+    ("申请", "申请"),
+    ("审批", "审批"),
+    ("实施", "采购"),
+    ("付款", "审批"),
+    ("验收", "验收"),
+    ("行为规范", "验收"),
+    ("职责", "审批"),
+    ("方式", "采购"),
+    ("采购", "采购"),
+)
+
+
+def _classify_h2_to_phase(title: str) -> str:
+    """Map an H2 sub-section title to a macro phase via keyword.
+
+    Phase 7 (2026-09-16) keyword-based fallback for when LLM does not
+    produce macro-phase labels. Covers the 7 boteng sub-sections
+    (``采购基本事项 / 采购申请 / 采购人职责 / 采购方式 / 采购实施 /
+    采购付款方式 / 采购经办人行为规范``) plus simple synonyms. Falls
+    back to ``"采购"`` (the most common phase in procurement docs) when
+    no keyword matches.
+    """
+    for kw, phase in _PHASE_KEYWORDS:
+        if kw in title:
+            return phase
+    return "采购"
+
+
+def _synthesize_procedural_phases(
+    cards: list[dict[str, Any]],
+    section_title: str,
+) -> tuple[list[dict[str, str]], list[str]]:
+    """Synthesize 4 macro phases + takeaway items from H2 sub-cards.
+
+    Each step's ``label`` is the macro phase name (申请 / 审批 / 采购 /
+    验收) and ``detail`` is the count of H2 sub-rules in that phase.
+    Up to 5 phases emitted (ppt-master process_timeline budget).
+    Takeaways are the first item of each H2 sub-card, capped at 5.
+
+    Returns ``(steps, takeaways)``. If no H2 sub-cards exist or
+    synthesis fails, returns ``([], [])`` so the caller falls back
+    to the legacy bullet-list path.
+    """
+    h2_cards = [
+        c for c in cards
+        if c.get("title") not in ("要点", "子项", "补充")
+        and c.get("items")
+    ]
+    if not h2_cards:
+        return [], []
+
+    # Group H2 cards into macro phases by keyword.
+    phases: dict[str, list[str]] = {}
+    for c in h2_cards:
+        phase = _classify_h2_to_phase(c.get("title", ""))
+        phases.setdefault(phase, []).append(c.get("title", ""))
+
+    # Maintain a stable macro order so the page reads in process flow:
+    # 申请 → 审批 → 采购 → 验收. Unknown phases go to the end.
+    macro_order = ["申请", "审批", "采购", "验收"]
+    extras = [p for p in phases if p not in macro_order]
+    ordered_phases = [p for p in macro_order if p in phases] + extras
+
+    # Each step.label IS the macro phase name (not the H2 title).
+    # detail = count of H2 sub-rules in that phase, so the reader
+    # sees "采购 (3 项)" — a compact summary of how many rules live
+    # in each macro phase.
+    steps: list[dict[str, str]] = []
+    for phase in ordered_phases[:5]:
+        h2_titles = phases[phase]
+        detail = f"{len(h2_titles)} 项" if len(h2_titles) > 1 else ""
+        steps.append({"label": phase, "detail": detail})
+
+    # Take the first item of each H2 card as a takeaway (cap 5).
+    takeaways: list[str] = []
+    for c in h2_cards:
+        items = c.get("items", [])
+        if items:
+            takeaways.append(items[0][:80])
+        if len(takeaways) >= 5:
+            break
+
+    if not steps or not takeaways:
+        return [], []
+    return steps, takeaways
+
+
+def _multi_h2_bullet_list_spec(
+    cards: list[dict[str, Any]], body_bounds: str,
+) -> dict[str, Any]:
+    """Phase 6.4 multi-H2 fallback: flatten H2 sub-cards into one
+    numbered bullet-list. Used when procedural-steps synthesis fails
+    or when n_h2 < 3 (too few to merit a process diagram)."""
+    flat_items: list[str] = []
+    for c in cards:
+        ctitle = c.get("title", "").strip()
+        for it in c.get("items", []):
+            if ctitle:
+                flat_items.append(f"{ctitle}: {it[:80]}")
+            else:
+                flat_items.append(it[:80])
+    return {
+        "layout": "bullet-list",
+        "bounds": body_bounds,
+        "spec": {
+            "items": flat_items[:10],
+            "color": "#1D2CAB",
+        },
+    }
+
+
+def _three_thesis_spec(
+    cards: list[dict[str, Any]], body_bounds: str,
+) -> dict[str, Any]:
+    """Phase 7 (2026-09-16): synthesize a 3rd card when the heuristic
+    produced only 2 cards, so the page reads as 3 parallel theses
+    instead of a 2-card fragment. Pads with a placeholder card if the
+    source cards have < 3 sub-cards."""
+    cleaned: list[dict[str, Any]] = []
+    for c in cards[:3]:
+        cleaned.append({
+            "title": c.get("title", "要点")[:12],
+            "items": [it[:48] for it in c.get("items", [])[:4]],
+        })
+    while len(cleaned) < 3:
+        cleaned.append({"title": "补充", "items": ["（待补充）"]})
+    return {
+        "layout": "three-thesis-cards",
+        "bounds": body_bounds,
+        "spec": {"cards": cleaned},
+    }

@@ -545,4 +545,251 @@ def render_new_block(spec: dict[str, Any]) -> str:
                 f'fill="#222">{i + 1}. {escape(display)}</text>'
             )
         return "\n".join(parts)
+    # Phase 7 (2026-09-16): ppt-master archetype-inspired layouts.
+    # ppt-master's presentation_core uses ~20 named archetypes
+    # (title_content / content_caption / three_card / process_timeline
+    # / matrix_2x2 / kpi_dashboard …) with explicit pixel geometry.
+    # We adopt 3 of them to polish boteng's content pages without
+    # disturbing the 9 existing layouts (palette stays untouched —
+    # these new layouts use the calm ppt-master presentation_core
+    # neutral stack: bg #FFFFFF, panel #F4F6F8, hairline #D6DCE3,
+    # ink #1E293B, body #64748B, muted #94A3B8).
+    if layout == "statement-caption":
+        # ppt-master analog: content_caption (256px left rail + 768px
+        # right panel with vertical divider at x=360 in ppt-master's
+        # 1280px canvas; we anchor to body_bounds so it works on any
+        # caller-supplied bounds).
+        title = payload.get("title", "")
+        eyebrow = payload.get("eyebrow", "")  # optional small label
+        body = payload.get("body", "")
+        if not isinstance(title, str) or not title:
+            raise ValueError("statement-caption requires spec.title")
+        if not isinstance(body, str) or not body:
+            raise ValueError("statement-caption requires spec.body")
+
+        bounds = spec.get("bounds") or payload.get("bounds")
+        bx, by, bw, bh = (float(t) for t in bounds.split())
+
+        # Geometry: 256px left rail + 16px gutter + 768px right panel.
+        # ppt-master uses 272 = 256 + 16; we anchor the rail to bx so
+        # any caller-supplied body_bounds works (boteng passes
+        # "120 130 1060 480" → rail at x=120..376, divider @ x=392).
+        RAIL_W = 256.0
+        DIV_X = bx + RAIL_W + 16.0
+        PANEL_X = DIV_X + 16.0
+        TOP = by + 24.0
+
+        parts: list[str] = []
+        # 1. Soft tint behind left rail (NOT a card — flat block).
+        parts.append(
+            f'<rect x="{bx:g}" y="{by:g}" width="{RAIL_W:g}" '
+            f'height="{bh:g}" fill="#F4F6F8"/>'
+        )
+        # 2. Vertical hairline divider (1px, calm gray).
+        parts.append(
+            f'<line x1="{DIV_X:g}" y1="{by + 20:g}" '
+            f'x2="{DIV_X:g}" y2="{by + bh - 20:g}" '
+            f'stroke="#D6DCE3" stroke-width="1"/>'
+        )
+        # 3. Eyebrow (optional small chapter label) — letter-spaced.
+        if eyebrow:
+            parts.append(
+                f'<text x="{bx + 32:g}" y="{TOP + 12:g}" font-size="14" '
+                f'font-weight="500" fill="#64748B" letter-spacing="1.2">'
+                f'{escape(eyebrow.upper())}</text>'
+            )
+            title_y = TOP + 56.0
+        else:
+            title_y = TOP + 32.0
+        # 4. Left rail title (32px 700 ink).
+        parts.append(
+            f'<text x="{bx + 32:g}" y="{title_y:g}" font-size="32" '
+            f'font-weight="700" fill="#1E293B">{escape(title)}</text>'
+        )
+        # 5. Right panel body — CJK-aware wrap, same approach as
+        # simple-text. Auto-shrink to 14px if lines don't fit bh.
+        from .text_width import chars_that_fit
+        inner_w = bx + bw - PANEL_X - 32.0
+        font_size = 19.0
+        cpl = chars_that_fit(inner_w, font_size)
+        if cpl <= 0:
+            raise ValueError(
+                f"statement-caption bounds too narrow for font_size="
+                f"{font_size} (inner_w={inner_w:g})"
+            )
+        lines = [body[i:i + cpl] for i in range(0, len(body), cpl)]
+        usable = max(1.0, (bh - 2 * 32.0) / (font_size * 1.5))
+        while len(lines) > usable and font_size > 14.0:
+            font_size -= 1.0
+            cpl = chars_that_fit(inner_w, font_size)
+            if cpl <= 0:
+                break
+            lines = [body[i:i + cpl] for i in range(0, len(body), cpl)]
+            usable = max(1.0, (bh - 2 * 32.0) / (font_size * 1.5))
+        for i, line in enumerate(lines):
+            ly = TOP + font_size * (i + 1)
+            if ly > by + bh - 8:
+                break
+            parts.append(
+                f'<text x="{PANEL_X + 16:g}" y="{ly:g}" '
+                f'font-size="{font_size:g}" fill="#1E293B">'
+                f'{escape(line)}</text>'
+            )
+        return "\n".join(parts)
+    if layout == "procedural-steps":
+        # ppt-master analog: process_timeline (4 evenly-spaced nodes
+        # on horizontal axis) + data_story takeaway band. Used when a
+        # markdown section synthesizes into N macro phases with a
+        # short key-message summary. We anchor the phase row at
+        # y=by+80 and the takeaway band at y=by+250 so the layout
+        # fits any caller-supplied body_bounds.
+        steps = payload.get("steps") or []
+        takeaways = payload.get("takeaways") or []
+        eyebrow = payload.get("eyebrow", "")
+        if not 2 <= len(steps) <= 5:
+            raise ValueError(
+                f"procedural-steps requires 2-5 steps (got {len(steps)})"
+            )
+        if not 1 <= len(takeaways) <= 5:
+            raise ValueError(
+                f"procedural-steps requires 1-5 takeaways "
+                f"(got {len(takeaways)})"
+            )
+
+        bounds = spec.get("bounds") or payload.get("bounds")
+        bx, by, bw, bh = (float(t) for t in bounds.split())
+
+        # Phase row geometry.
+        PHASE_COLOR = "#1E293B"  # ink, not the legacy #1D2CAB blue
+        phase_y = by + 80.0
+        phase_h = 140.0
+        margin = 60.0
+        n = len(steps)
+        span = bw - 2 * margin
+
+        parts: list[str] = []
+        # 1. Optional eyebrow (small chapter label).
+        if eyebrow:
+            parts.append(
+                f'<text x="{bx:g}" y="{by + 16:g}" font-size="12" '
+                f'font-weight="600" fill="#64748B" letter-spacing="2">'
+                f'{escape(eyebrow.upper())}</text>'
+            )
+        # 2. Phase circles + connectors.
+        for i, step in enumerate(steps):
+            cx = bx + margin + span * i / max(n - 1, 1)
+            cy = phase_y + 28.0
+            parts.append(
+                f'<circle cx="{cx:g}" cy="{cy:g}" r="28" '
+                f'fill="{PHASE_COLOR}"/>'
+            )
+            parts.append(
+                f'<text x="{cx:g}" y="{cy + 6:g}" text-anchor="middle" '
+                f'font-size="16" font-weight="700" fill="#FFFFFF">'
+                f'{i + 1}</text>'
+            )
+            # Step label below circle (18px ink).
+            parts.append(
+                f'<text x="{cx:g}" y="{cy + 56:g}" text-anchor="middle" '
+                f'font-size="18" font-weight="600" fill="#1E293B">'
+                f'{escape(step.get("label", f"Step {i + 1}"))}</text>'
+            )
+            # Step detail (14px body, cap 24 chars).
+            detail = step.get("detail", "")
+            if detail:
+                parts.append(
+                    f'<text x="{cx:g}" y="{cy + 84:g}" text-anchor="middle" '
+                    f'font-size="14" fill="#64748B">'
+                    f'{escape(detail[:24])}</text>'
+                )
+            # Connector to next step.
+            if i < n - 1:
+                next_cx = bx + margin + span * (i + 1) / max(n - 1, 1)
+                parts.append(
+                    f'<line x1="{cx + 30:g}" y1="{cy:g}" '
+                    f'x2="{next_cx - 30:g}" y2="{cy:g}" '
+                    f'stroke="#D6DCE3" stroke-width="2"/>'
+                )
+        # 3. Takeaway band (bottom panel).
+        band_y = phase_y + phase_h + 30.0
+        band_h = by + bh - band_y - 16.0
+        if band_h < 60.0:
+            # bounds too small to fit a takeaway panel — emit just the
+            # heading line as a one-line summary so the page still
+            # produces a polished result.
+            parts.append(
+                f'<text x="{bx:g}" y="{band_y:g}" font-size="16" '
+                f'font-weight="700" fill="#1E293B">关键要点</text>'
+            )
+        else:
+            parts.append(
+                f'<rect x="{bx:g}" y="{band_y:g}" width="{bw:g}" '
+                f'height="{band_h:g}" rx="12" fill="#F4F6F8"/>'
+            )
+            parts.append(
+                f'<text x="{bx + 24:g}" y="{band_y + 28:g}" font-size="16" '
+                f'font-weight="700" fill="#1E293B">关键要点</text>'
+            )
+            for i, msg in enumerate(takeaways):
+                ty = band_y + 60 + i * 28
+                if ty > band_y + band_h - 12:
+                    break
+                parts.append(
+                    f'<text x="{bx + 24:g}" y="{ty:g}" font-size="18" '
+                    f'fill="#1E293B">· {escape(msg[:80])}</text>'
+                )
+        return "\n".join(parts)
+    if layout == "three-thesis-cards":
+        # ppt-master analog: three_card (3 equal cards, 392px stride +
+        # 24px gutter in ppt-master's 1280px canvas; we scale to the
+        # caller-supplied bw). NOT a replacement for 3-column-cards
+        # (which supports 1-4 cards with brand-color tint); this is
+        # the polished 3-card variant with the calm neutral palette.
+        cards = payload.get("cards") or []
+        if len(cards) != 3:
+            raise ValueError(
+                f"three-thesis-cards requires exactly 3 cards "
+                f"(got {len(cards)})"
+            )
+        bounds = spec.get("bounds") or payload.get("bounds")
+        bx, by, bw, bh = (float(t) for t in bounds.split())
+
+        GUTTER = 24.0
+        STRIDE = (bw - 2 * GUTTER) / 3.0
+        parts: list[str] = []
+        for i, card in enumerate(cards):
+            cx = bx + i * (STRIDE + GUTTER)
+            # Card background — soft tint (NOT a brand-color rect).
+            parts.append(
+                f'<rect x="{cx:g}" y="{by:g}" width="{STRIDE:g}" '
+                f'height="{bh:g}" rx="12" fill="#F4F6F8"/>'
+            )
+            # Top hairline accent strip (4px ink).
+            parts.append(
+                f'<rect x="{cx:g}" y="{by:g}" width="{STRIDE:g}" '
+                f'height="4" fill="#1E293B"/>'
+            )
+            # Index numeral "0N" (14px muted, letter-spaced).
+            parts.append(
+                f'<text x="{cx + 24:g}" y="{by + 56:g}" font-size="14" '
+                f'font-weight="700" fill="#94A3B8" letter-spacing="2">'
+                f'0{i + 1}</text>'
+            )
+            # Card title (22px ink).
+            parts.append(
+                f'<text x="{cx + 24:g}" y="{by + 96:g}" font-size="22" '
+                f'font-weight="700" fill="#1E293B">'
+                f'{escape(card.get("title", ""))}</text>'
+            )
+            # Card items (18px ink, cap 48 chars per item).
+            items = coerce_str_list(card.get("items", []))
+            for j, item in enumerate(items):
+                ty = by + 132 + j * 26
+                if ty > by + bh - 12:
+                    break
+                parts.append(
+                    f'<text x="{cx + 24:g}" y="{ty:g}" font-size="18" '
+                    f'fill="#1E293B">{escape(item[:48])}</text>'
+                )
+        return "\n".join(parts)
     raise ValueError(f"unsupported new_content_block layout: {layout!r}")

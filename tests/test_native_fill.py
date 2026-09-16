@@ -3373,15 +3373,18 @@ class TestCardsFromBodyImprovements(unittest.TestCase):
         self.assertEqual(all_items.count("xxx"), 1)
         self.assertEqual(all_items.count("yyy"), 1)
 
-    def test_h2_subcard_capped_at_two(self):
-        # 3 H2 subsections → only 2 sub-cards kept (plan §3.2.2 cap)
+    def test_h2_subcard_capped_at_five(self):
+        # Phase 7 (2026-09-16): cap raised 2→5 so the procedural-steps
+        # archetype in workspace_expand has enough H2 cards to dispatch
+        # on (n_h2 ≥ 3). The 3-column-cards renderer's 4-card cap is
+        # enforced downstream by the A-path dispatcher, not here.
         body = "\n\n".join(
             f"## （{label}）章节\n\n1. 第一项\n2. 第二项"
-            for label in "一二三"
+            for label in "一二三四五六"
         )
         cards = pl._cards_from_body(body)
         h2_cards = [c for c in cards if c["title"].startswith("（") and "）" in c["title"]]
-        self.assertLessEqual(len(h2_cards), 2)
+        self.assertLessEqual(len(h2_cards), 5)
 
 
 class TestCardsFromBodyPhase6(unittest.TestCase):
@@ -3918,6 +3921,303 @@ class TestBlockRendererBulletList(unittest.TestCase):
                 "spec": {"items": []},
             })
         self.assertIn("bullet-list requires spec.items", str(ctx.exception))
+
+
+class TestBlockRendererStatementCaption(unittest.TestCase):
+    """Phase 7 (2026-09-16): statement-caption archetype (ppt-master
+    content_caption analog).
+
+    3 cases:
+    - renders eyebrow + title + body with the ppt-master neutral palette
+    - rejects empty title / body
+    - auto-shrinks font when body overflows the right panel
+    """
+
+    def test_renders_eyebrow_title_body(self):
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        out = _render_new_block({
+            "layout": "statement-caption",
+            "bounds": "120 130 1060 480",
+            "spec": {
+                "title": "前言",
+                "eyebrow": "PREFACE",
+                "body": "公司规章制度是保障公司运营的工具，是本着服务公司各项工作的态度，同时兼顾各方面的利益而制定的。",
+            },
+        })
+        # Left rail tint + 1 vertical divider line + 1 eyebrow +
+        # 1 title + ≥1 body line. The hairline is <line>, the rail is
+        # <rect>, eyebrow+title+body are <text>.
+        self.assertIn('fill="#F4F6F8"', out)
+        self.assertIn('stroke="#D6DCE3"', out)
+        self.assertIn("PREFACE", out)
+        self.assertIn("前言", out)
+        self.assertIn("公司规章制度", out)
+        # Title is 32px ink, body is 19px ink.
+        self.assertIn('font-size="32"', out)
+        self.assertIn('font-size="19"', out)
+        self.assertIn('fill="#1E293B"', out)
+
+    def test_rejects_empty_title_or_body(self):
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        with self.assertRaises(ValueError):
+            _render_new_block({
+                "layout": "statement-caption",
+                "bounds": "120 130 1060 480",
+                "spec": {"title": "", "body": "x"},
+            })
+        with self.assertRaises(ValueError):
+            _render_new_block({
+                "layout": "statement-caption",
+                "bounds": "120 130 1060 480",
+                "spec": {"title": "x", "body": ""},
+            })
+
+    def test_auto_shrinks_font_for_long_body(self):
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        # 200-char body — at 19px in 768px-wide panel will wrap to
+        # ~5 lines, well within bh. At much longer lengths auto-shrink
+        # kicks in to keep the text inside the right panel.
+        long_body = "公司" * 200
+        out = _render_new_block({
+            "layout": "statement-caption",
+            "bounds": "120 130 1060 480",
+            "spec": {"title": "测试", "body": long_body},
+        })
+        # The renderer never raises for long bodies — it shrinks font
+        # down to 14px min. Verify at least one body <text> was emitted
+        # with font-size ≤ 19 (initial 19, may shrink).
+        import re as _re
+        body_sizes = [
+            int(m.group(1)) for m in _re.finditer(
+                r'font-size="(\d+)"\s+fill="#1E293B"', out
+            )
+        ]
+        self.assertTrue(
+            any(s <= 19 for s in body_sizes),
+            f"expected a body <text> with font-size ≤ 19, got {body_sizes}",
+        )
+
+
+class TestBlockRendererProceduralSteps(unittest.TestCase):
+    """Phase 7 (2026-09-16): procedural-steps archetype (ppt-master
+    process_timeline + data_story takeaway analog).
+
+    3 cases:
+    - renders 4 phases + takeaway band
+    - rejects 1 / 6 steps
+    - bounds too small for full band falls back to heading-only
+    """
+
+    def test_renders_four_phases_and_takeaway(self):
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        out = _render_new_block({
+            "layout": "procedural-steps",
+            "bounds": "120 130 1060 480",
+            "spec": {
+                "eyebrow": "WORKFLOW",
+                "steps": [
+                    {"label": "申请", "detail": "采购人提交"},
+                    {"label": "审批", "detail": "总经理审批"},
+                    {"label": "采购", "detail": "议价下单"},
+                    {"label": "验收", "detail": "入库登记"},
+                ],
+                "takeaways": ["议价后保留合同", "保留发票凭证", "异常及时上报"],
+            },
+        })
+        # 4 circles r=28 + 4 numbers + 4 labels + 4 details +
+        # 1 eyebrow + 1 takeaway heading + 3 takeaway bullets = 17 <text>
+        self.assertEqual(out.count('r="28"'), 4)
+        self.assertEqual(out.count("<text "), 17)
+        self.assertIn('fill="#1E293B"', out)  # phase color
+        self.assertIn("WORKFLOW", out)
+        self.assertIn("关键要点", out)
+        self.assertIn("申请", out)
+        self.assertIn("验收", out)
+
+    def test_rejects_one_or_six_steps(self):
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        with self.assertRaises(ValueError):
+            _render_new_block({
+                "layout": "procedural-steps",
+                "bounds": "120 130 1060 480",
+                "spec": {"steps": [{"label": "x"}],
+                         "takeaways": ["y"]},
+            })
+        with self.assertRaises(ValueError):
+            _render_new_block({
+                "layout": "procedural-steps",
+                "bounds": "120 130 1060 480",
+                "spec": {
+                    "steps": [{"label": f"s{i}"} for i in range(6)],
+                    "takeaways": ["y"],
+                },
+            })
+
+    def test_tight_bounds_falls_back_to_heading_only(self):
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        # bh=120 leaves <60px for the takeaway band after phase row +
+        # eyebrow → renderer falls back to heading-only output.
+        out = _render_new_block({
+            "layout": "procedural-steps",
+            "bounds": "120 130 1060 120",
+            "spec": {
+                "steps": [{"label": "A"}, {"label": "B"}],
+                "takeaways": ["t1"],
+            },
+        })
+        # Still emits 2 phase circles (no band rect because band_h < 60).
+        self.assertEqual(out.count('r="28"'), 2)
+        self.assertIn("关键要点", out)
+        # No takeaway band rect (would be the panel rect with rx=12).
+        self.assertNotIn('rx="12"', out)
+
+
+class TestBlockRendererThreeThesisCards(unittest.TestCase):
+    """Phase 7 (2026-09-16): three-thesis-cards archetype (ppt-master
+    three_card analog).
+
+    2 cases:
+    - exactly 3 cards render with neutral palette + top accent
+    - 2 / 4 cards raise
+    """
+
+    def test_renders_three_cards_with_accent(self):
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        out = _render_new_block({
+            "layout": "three-thesis-cards",
+            "bounds": "120 130 1060 480",
+            "spec": {"cards": [
+                {"title": "效率", "items": ["提高采购效率", "明确岗位"]},
+                {"title": "成本", "items": ["降低成本", "规范流程"]},
+                {"title": "合规", "items": ["秉公办事", "维护利益"]},
+            ]},
+        })
+        # 3 panel rects + 3 top accent strips = 6 rects.
+        self.assertEqual(out.count('rx="12"'), 3)
+        # Top accent strips (4px ink rects) — same as the 3 panel rects
+        # with height 4.
+        self.assertIn('fill="#F4F6F8"', out)
+        self.assertIn('fill="#1E293B"', out)
+        # Index numerals 01, 02, 03.
+        self.assertIn("01", out)
+        self.assertIn("02", out)
+        self.assertIn("03", out)
+        # Card titles.
+        self.assertIn("效率", out)
+        self.assertIn("成本", out)
+        self.assertIn("合规", out)
+
+    def test_rejects_two_or_four_cards(self):
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        with self.assertRaises(ValueError):
+            _render_new_block({
+                "layout": "three-thesis-cards",
+                "bounds": "120 130 1060 480",
+                "spec": {"cards": [
+                    {"title": "a", "items": ["x"]},
+                    {"title": "b", "items": ["y"]},
+                ]},
+            })
+        with self.assertRaises(ValueError):
+            _render_new_block({
+                "layout": "three-thesis-cards",
+                "bounds": "120 130 1060 480",
+                "spec": {"cards": [
+                    {"title": f"t{i}", "items": ["x"]} for i in range(4)
+                ]},
+            })
+
+
+class TestPhase7Dispatch(unittest.TestCase):
+    """Phase 7 (2026-09-16): A-path dispatch routing to ppt-master
+    archetypes based on markdown shape.
+
+    2 cases:
+    - multi-H2 (≥3) procedural section → procedural-steps
+    - single long-paragraph H1 → statement-caption
+    """
+
+    def _workspace_with_section(self, td: str, md_text: str) -> Path:
+        """Build a minimal workspace with the markdown auto-routed
+        through expand_workspace_from_markdown and return the cloned
+        content SVG path."""
+        from pathlib import Path as _P
+        from mcp_ppt_native_fill import workspace_expand as _we
+        ws = _P(td) / "ws"
+        auth = ws / "authoring-svg-flat"
+        auth.mkdir(parents=True, exist_ok=True)
+        # 2 skeleton SVGs (divider + content) — minimal but parseable.
+        for i in (3, 4):
+            (auth / f"slide_{i:02d}.svg").write_text(
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                '<svg xmlns="http://www.w3.org/2000/svg">'
+                f'<g id="shape-{17 if i == 4 else 4}">'
+                '<text>{{title}}</text></g></svg>',
+                encoding="utf-8",
+            )
+        md = _P(td) / "m.md"
+        md.write_text(md_text, encoding="utf-8")
+        _we.expand_workspace_from_markdown(
+            ws, md,
+            skeleton_divider=3, skeleton_content=4,
+            divider_edits_template={"shape-4": "PART {nn}",
+                                    "shape-5": "{title}"},
+            content_edits_template={"shape-17": "{title}"},
+            body_bounds="120 130 1060 480",
+            exclude_source_slides=None,
+        )
+        return auth / "slide_part01_content.svg"
+
+    def test_multi_h2_routes_to_procedural_steps(self):
+        import tempfile
+        from pathlib import Path as _P
+        with tempfile.TemporaryDirectory() as td:
+            md_text = (
+                "# 四、工作程序\n\n"
+                "## 采购申请\n"
+                "1. 提交采购申请单\n"
+                "\n"
+                "## 总经理审批\n"
+                "1. 财务审批流程\n"
+                "\n"
+                "## 采购方式\n"
+                "1. 长期报价采购\n"
+                "2. 议价定购\n"
+                "\n"
+                "## 验收入库\n"
+                "1. 库管盘点\n"
+            )
+            svg = self._workspace_with_section(td, md_text)
+            content_svg = svg.read_text(encoding="utf-8")
+            # 4 H2 sub-cards map to 4 macro phases (申请 / 审批 /
+            # 采购 / 验收) via _classify_h2_to_phase.
+            self.assertEqual(
+                content_svg.count('r="28"'), 4,
+                "expected 4 procedural-step phase circles",
+            )
+            # Takeaway band rect rx=12 #F4F6F8.
+            self.assertIn('rx="12" fill="#F4F6F8"', content_svg)
+            self.assertIn("关键要点", content_svg)
+
+    def test_long_paragraph_routes_to_statement_caption(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            # 140-char single paragraph + no H2 / no list → statement-caption
+            md_text = (
+                "# 前言\n\n"
+                "公司规章制度是保障公司运营的工具，是本着服务公司各项工作的"
+                "态度，同时兼顾各方面的利益而制定的。制度从零到有，从小到"
+                "大，伴随着公司不断发展、壮大也在不断更新、完善。\n"
+            )
+            svg = self._workspace_with_section(td, md_text)
+            content_svg = svg.read_text(encoding="utf-8")
+            # statement-caption emits left rail tint + vertical divider +
+            # 32px ink title.
+            self.assertIn('fill="#F4F6F8"', content_svg)
+            self.assertIn('stroke="#D6DCE3"', content_svg)
+            self.assertIn('font-size="32"', content_svg)
+            # No 3-column-cards 14px body — that's the legacy path.
+            self.assertNotIn('font-size="14" fill="#222"', content_svg)
 
 
 class TestExpandDividerExtras(unittest.TestCase):

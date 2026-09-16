@@ -742,6 +742,25 @@ def phase3_author(
                     "phase3: remove_existing group failed svg=%s shape=%s: %s",
                     svg_name, shape_id, exc,
                 )
+            # Phase 7.5 (2026-09-16): anti-double-stack guard for
+            # LLM-side content-body writes. The caller A-path uses
+            # ``body_cards`` and the LLM uses ``content-body`` —
+            # different group_ids, so the same-id guard above doesn't
+            # fire. But the caller body_cards group is still in the
+            # SVG (legacy direct-write from expand), so we'd render
+            # both blocks stacked. Drop the caller's body_cards when
+            # an LLM content-body override is being written.
+            if shape_id == "content-body":
+                try:
+                    _remove_existing_new_content_group(
+                        svg_path, "body_cards"
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "phase3: remove caller body_cards failed "
+                        "svg=%s: %s",
+                        svg_name, exc,
+                    )
             try:
                 svg_edits.write_new_content_block(
                     svg_path,
