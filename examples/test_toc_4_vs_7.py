@@ -110,6 +110,9 @@ def _run_pipeline(
             "expand_content_edits_template": CONTENT_EDITS,
             "expand_body_bounds": BODY_BOUNDS,
             "expand_ending_svg": "slide_05.svg",
+            # Bug fix (2026-09-16): drop slide_03 + slide_04 from the
+            # final deck — see examples/smart_toc_fill.py for context.
+            "expand_exclude_source_slides": [3, 4],
             "fix_nested_picture": True,
             "skip_phase3_5": False,
             "disabled_autofixes": ["render_compat"],

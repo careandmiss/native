@@ -107,6 +107,13 @@ def run(template: Path, md_path: Path, workspace: Path, output: Path) -> int:
             "expand_content_edits_template": CONTENT_EDITS,
             "expand_body_bounds": BODY_BOUNDS,
             "expand_ending_svg": "slide_05.svg",
+            # Bug fix (2026-09-16): drop the raw divider/content skeletons
+            # (slide_03.svg, slide_04.svg) from the final deck — they're
+            # design samples consumed by cloning, not real slides.
+            # Without this, slide 3 / 4 in the generated .pptx show the
+            # unedited template ("PART 01 / 添加大标题" + "单击添加大标题"
+            # placeholders) which is visible to the viewer.
+            "expand_exclude_source_slides": [3, 4],
             # Boteng compatibility workarounds
             "fix_nested_picture": True,
             "skip_phase3_5": False,

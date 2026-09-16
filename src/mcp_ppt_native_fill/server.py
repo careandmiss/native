@@ -322,10 +322,12 @@ TOOL_NATIVE_FILL: dict[str, Any] = {
                             "drop from page_plan.json's original roster. "
                             "Use when a skeleton slide is also a "
                             "design sample that cloning consumed — "
-                            "e.g. boteng callers pass [skeleton_divider] "
-                            "to drop slide_03 so the original 'PART 01 "
-                            "/ <template title>' doesn't appear in the "
-                            "deck alongside cloned per-section dividers."
+                            "e.g. boteng callers pass "
+                            "[skeleton_divider, skeleton_content] "
+                            "to drop slide_03 + slide_04 so neither "
+                            "raw template appears in the deck "
+                            "alongside cloned per-section dividers "
+                            "and content slides."
                         ),
                     },
                     "clean_workspace": {
