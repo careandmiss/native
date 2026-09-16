@@ -468,6 +468,9 @@ def _execute_native_fill(arguments: dict) -> dict:
     expand_divider_subtitle_template = options.get(
         "expand_divider_subtitle_template"
     )
+    expand_section_title_en_map = options.get(
+        "expand_section_title_en_map"
+    )
     expand_exclude_source_slides = options.get("expand_exclude_source_slides")
 
     # Smart TOC fill (opt-in)
@@ -550,6 +553,7 @@ def _execute_native_fill(arguments: dict) -> dict:
             expand_ending_svg=expand_ending_svg,
             expand_part_names=expand_part_names,
             expand_divider_subtitle_template=expand_divider_subtitle_template,
+            expand_section_title_en_map=expand_section_title_en_map,
             expand_exclude_source_slides=expand_exclude_source_slides,
             expand_toc_from_markdown=expand_toc_from_markdown,
             expand_toc_slot_grid=expand_toc_slot_grid,

@@ -36,6 +36,21 @@ TOC_TOP = {"rows": 3, "cols": 2}
 
 # Boteng divider/content skeleton (matched to existing examples)
 DIVIDER_EDITS = {"shape-4": "PART {nn}", "shape-5": "{title}"}
+# Phase 8 (2026-09-16): translate H1 titles to English subtitles for
+# the boteng divider template's shape-70 element (font / size / color
+# / position preserved by the template). test_toc_4_vs_7 uses generic
+# "第N章" titles that don't map to boteng section names — keys here
+# mirror the boteng scenarios for cross-script regression.
+SECTION_TITLE_EN = {
+    "第一章 项目概述": "Chapter 1 Project Overview",
+    "第二章 实施步骤": "Chapter 2 Implementation",
+    "第三章 团队分工": "Chapter 3 Team Roles",
+    "第四章 风险控制": "Chapter 4 Risk Control",
+    "第五章 验收标准": "Chapter 5 Acceptance",
+    "第六章 培训计划": "Chapter 6 Training Plan",
+    "第七章 运维保障": "Chapter 7 Operations",
+}
+DIVIDER_SUBTITLE = {"shape-70": "{title_en}"}
 CONTENT_EDITS = {"shape-17": "{title}"}
 BODY_BOUNDS = "120 130 1060 480"
 
@@ -107,6 +122,8 @@ def _run_pipeline(
             "expand_skeleton_divider": 3,
             "expand_skeleton_content": 4,
             "expand_divider_edits_template": DIVIDER_EDITS,
+            "expand_divider_subtitle_template": DIVIDER_SUBTITLE,
+            "expand_section_title_en_map": SECTION_TITLE_EN,
             "expand_content_edits_template": CONTENT_EDITS,
             "expand_body_bounds": BODY_BOUNDS,
             "expand_ending_svg": "slide_05.svg",

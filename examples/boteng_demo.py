@@ -25,6 +25,19 @@ DEFAULT_WORKSPACE = HERE.parent / "projects" / "boteng_采购制度_v2_workspace
 
 TOC_TOP = {"rows": 3, "cols": 2}
 DIVIDER_EDITS = {"shape-4": "PART {nn}", "shape-5": "{title}"}
+# Phase 8 (2026-09-16): translate each H1's Chinese title into the
+# English subtitle that lives on shape-70 of the boteng divider
+# template. We KEEP the template's original <g id="shape-70"> frame
+# (font / size / color / position) — only the <text> body changes.
+SECTION_TITLE_EN = {
+    "前言": "Preface",
+    "一、目的": "Purpose",
+    "二、适用范围": "Application Scope",
+    "三、基本原则": "Basic Principles",
+    "四、工作程序": "Working Procedure",
+    "附件：": "Appendix",
+}
+DIVIDER_SUBTITLE = {"shape-70": "{title_en}"}
 CONTENT_EDITS = {"shape-17": "{title}"}
 BODY_BOUNDS = "120 130 1060 480"
 
@@ -83,6 +96,8 @@ def main() -> int:
             "expand_skeleton_divider": 3,
             "expand_skeleton_content": 4,
             "expand_divider_edits_template": DIVIDER_EDITS,
+            "expand_divider_subtitle_template": DIVIDER_SUBTITLE,
+            "expand_section_title_en_map": SECTION_TITLE_EN,
             "expand_content_edits_template": CONTENT_EDITS,
             "expand_body_bounds": BODY_BOUNDS,
             "expand_ending_svg": "slide_05.svg",

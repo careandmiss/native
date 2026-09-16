@@ -52,6 +52,7 @@ def expand_workspace_from_markdown(
     ending_svg: str | None = None,
     part_names: list[str] | None = None,
     divider_subtitle_template: dict[str, str] | None = None,
+    section_title_en_map: dict[str, str] | None = None,
     exclude_source_slides: list[int] | None = None,
 ) -> dict[str, Any]:
     """Clone skeleton slides for each markdown H1 section.
@@ -96,15 +97,25 @@ def expand_workspace_from_markdown(
     divider_subtitle_template:
         Optional second-pass text edits applied to each cloned divider
         AFTER ``divider_edits_template``. Same shape-id → text-format
-        format (``{nn}`` / ``{n}`` / ``{title}`` placeholders). Use
-        this for shapes the main title template doesn't cover — e.g.
-        boteng's English subtitle shape::
+        format (``{nn}`` / ``{n}`` / ``{title}`` / ``{title_en}``
+        placeholders). Use this for shapes the main title template
+        doesn't cover — e.g. boteng's English subtitle shape::
 
             divider_subtitle_template={"shape-70": "{title_en}"}
 
         Caller is responsible for picking the right shape ids and
         supplying the value data; this function makes no assumption
         about which shape ids exist on the template.
+    section_title_en_map:
+        Optional ``{section_title: english_title}`` lookup used to
+        resolve the ``{title_en}`` placeholder in
+        ``divider_subtitle_template``. Phase 8 (2026-09-16):
+        lets callers (e.g. boteng_demo) translate each H1's Chinese
+        title into the English subtitle that lives on shape-70 of the
+        divider template, without breaking the template's original
+        visual structure (font / size / color / position). When a
+        section title is not in the map, ``{title_en}`` expands to
+        the empty string (graceful degradation, never raises).
     exclude_source_slides:
         Optional list of 1-based slide numbers to drop from the
         original roster in ``page_plan.json``. The skeleton slides
@@ -152,9 +163,14 @@ def expand_workspace_from_markdown(
     new_blocks: dict[str, dict[str, Any]] = {}
 
     def _format(template_dict: dict[str, str], *, nn: str, n: int,
-                title: str) -> dict[str, str]:
+                title: str, title_en: str = "") -> dict[str, str]:
+        # Phase 8 (2026-09-16): ``title_en`` placeholder for divider
+        # subtitle shapes (e.g. boteng shape-70). When the template
+        # contains ``{title_en}`` and the caller supplied a section
+        # title map, the lookup result is substituted; otherwise it
+        # expands to empty string.
         return {
-            k: v.format(nn=nn, n=n, title=title)
+            k: v.format(nn=nn, n=n, title=title, title_en=title_en)
             for k, v in template_dict.items()
         }
 
@@ -166,13 +182,22 @@ def expand_workspace_from_markdown(
         div_skeleton = auth / f"slide_{skeleton_divider:02d}.svg"
         if div_skeleton.is_file():
             shutil.copy2(div_skeleton, auth / div_svg_name)
+            # Phase 8 (2026-09-16): look up the English subtitle text
+            # for this section's H1 title. ``section_title_en_map`` is
+            # caller-supplied; missing keys resolve to "" (graceful
+            # degradation — never raises).
+            title_en = ""
+            if section_title_en_map:
+                title_en = section_title_en_map.get(title, "")
             div_edits = _format(divider_edits_template,
-                                nn=nn, n=i, title=title)
+                                nn=nn, n=i, title=title,
+                                title_en=title_en)
             svg_edits.apply_text_edits(auth / div_svg_name, div_edits)
             # Optional subtitle second-pass (e.g. english subtitle shape).
             if divider_subtitle_template:
                 sub_edits = _format(divider_subtitle_template,
-                                    nn=nn, n=i, title=title)
+                                    nn=nn, n=i, title=title,
+                                    title_en=title_en)
                 svg_edits.apply_text_edits(auth / div_svg_name, sub_edits)
             cloned.append(div_svg_name)
         else:
@@ -262,10 +287,14 @@ def expand_workspace_from_markdown(
                 #   2. n_h2 >= 3 → procedural-steps (with synthesized
                 #      4 macro phases via _synthesize_procedural_phases)
                 #   3. single long paragraph (≥80 chars) → statement-caption
-                #   4. single short paragraph → simple-text
-                #   5. 1 card ≥2 items → bullet-list
-                #   6. 2 H2 → three-thesis-cards (synthesize 3rd card)
-                #   7. ≥2 cards → 3-column-cards (legacy fallback)
+                #   4. single medium paragraph (20-79 chars) → hero_statement
+                #      [Phase 8 NEW]
+                #   5. single short paragraph (<20 chars) → simple-text
+                #   6. 1 card, 2-5 items each ≤12 chars → kpi_row
+                #      [Phase 8 NEW]
+                #   7. 1 card ≥2 items → bullet-list
+                #   8. 2 H2 → three-thesis-cards (synthesize 3rd card)
+                #   9. ≥2 cards → 3-column-cards (legacy fallback)
                 n_items_total = sum(len(c.get("items", [])) for c in cards)
                 n_h2 = sum(
                     1 for c in cards
@@ -332,22 +361,65 @@ def expand_workspace_from_markdown(
                         },
                     }
                 elif len(cards) == 1 and n_items_total == 1:
-                    # Short single-paragraph → simple-text (Phase 3.4).
-                    spec = {
-                        "layout": "simple-text",
-                        "bounds": body_bounds,
-                        "spec": {"text": cards[0]["items"][0]},
-                    }
+                    # Medium / short single-paragraph. Phase 8 (2026-09-16):
+                    # a 20-79 char single sentence now routes to
+                    # hero_statement (centered 68px display type) instead
+                    # of falling through to simple-text. < 20 chars still
+                    # gets simple-text (no visual centrepiece needed).
+                    single_item = cards[0]["items"][0]
+                    if 20 <= len(single_item) <= 79:
+                        spec = {
+                            "layout": "hero_statement",
+                            "bounds": body_bounds,
+                            "spec": {
+                                "eyebrow": section_eyebrow[:20]
+                                if section_eyebrow else section_title[:20],
+                                "headline": single_item[:32],
+                                "subline": "",
+                            },
+                        }
+                    else:
+                        spec = {
+                            "layout": "simple-text",
+                            "bounds": body_bounds,
+                            "spec": {"text": single_item},
+                        }
                 elif len(cards) == 1 and n_items_total >= 2:
-                    # Single H1 with multiple items → bullet-list (Phase 3.4).
-                    spec = {
-                        "layout": "bullet-list",
-                        "bounds": body_bounds,
-                        "spec": {
-                            "items": cards[0].get("items", []),
-                            "color": cards[0].get("color", "#1D2CAB"),
-                        },
-                    }
+                    # Single H1 with multiple items. Phase 8 (2026-09-16):
+                    # 2-5 keyword-style items (each ≤12 chars) route to
+                    # kpi_row (N tiles + evidence panel); otherwise fall
+                    # through to bullet-list (existing Phase 3.4 path).
+                    items = cards[0].get("items", [])
+                    if 2 <= len(items) <= 5 and all(
+                        isinstance(it, str) and len(it) <= 12
+                        for it in items
+                    ):
+                        spec = {
+                            "layout": "kpi_row",
+                            "bounds": body_bounds,
+                            "spec": {
+                                "eyebrow": section_eyebrow[:20]
+                                if section_eyebrow else section_title[:20],
+                                "tiles": [
+                                    {
+                                        "keyword": it[:12],
+                                        "descriptor": it[:12],
+                                        "value": "",
+                                    }
+                                    for it in items[:5]
+                                ],
+                                "evidence": section_eyebrow,
+                            },
+                        }
+                    else:
+                        spec = {
+                            "layout": "bullet-list",
+                            "bounds": body_bounds,
+                            "spec": {
+                                "items": items,
+                                "color": cards[0].get("color", "#1D2CAB"),
+                            },
+                        }
                 elif (n_h2 == 2
                       and all("（" in c.get("title", "")
                               and "）" in c.get("title", "")
@@ -703,6 +775,11 @@ def toc_slide_number(toc_svg_filename: str) -> int:
 # dispatch in the per-section loop above is the only consumer.
 
 _PHASE_KEYWORDS = (
+    # Phase 8 (2026-09-16): "基本事项" must precede "采购" so
+    # "采购基本事项" matches the more specific keyword and routes
+    # to the 申请 macro phase (rather than collapsing every H2
+    # into 采购 and tripping the synthesis-empty fallback).
+    ("基本事项", "申请"),
     ("申请", "申请"),
     ("审批", "审批"),
     ("实施", "采购"),

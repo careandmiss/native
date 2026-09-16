@@ -1379,6 +1379,7 @@ def run_with_mapping(
     expand_ending_svg: str | None = None,
     expand_part_names: list[str] | None = None,
     expand_divider_subtitle_template: dict[str, str] | None = None,
+    expand_section_title_en_map: dict[str, str] | None = None,
     expand_exclude_source_slides: list[int] | None = None,
     # Workaround toggles (opt-in)
     fix_nested_picture: bool = False,
@@ -1558,6 +1559,7 @@ def run_with_mapping(
             ending_svg=expand_ending_svg,
             part_names=expand_part_names,
             divider_subtitle_template=expand_divider_subtitle_template,
+            section_title_en_map=expand_section_title_en_map,
             exclude_source_slides=expand_exclude_source_slides,
         )
 
