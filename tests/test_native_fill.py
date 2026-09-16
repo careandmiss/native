@@ -3384,6 +3384,93 @@ class TestCardsFromBodyImprovements(unittest.TestCase):
         self.assertLessEqual(len(h2_cards), 2)
 
 
+class TestCardsFromBodyPhase6(unittest.TestCase):
+    """Phase 6 (2026-09-16): content-page layout fixes.
+
+    5 cases covering:
+    - single-numbered-paragraph dedup (1a)
+    - revision-table detection + non-table regression (1b)
+    - 80-char item truncation (1c)
+    - _parse_markdown_table robustness for ragged rows / unknown headers
+    """
+
+    def test_single_numbered_paragraph_no_duplicate_card(self):
+        # Phase 6.1a: a body whose ONLY paragraph is ``1. xxx`` should
+        # produce a single "要点" card. The previous bug emitted a
+        # redundant "子项" card containing the same text.
+        body = "1.为了提高公司采购效率、明确岗位职责、有效降低采购成本"
+        cards = pl._cards_from_body(body)
+        self.assertEqual(len(cards), 1, f"expected 1 card, got {len(cards)}")
+        self.assertEqual(cards[0]["title"], "要点")
+        # The numbered prefix ``1.`` must have been stripped from the
+        # rendered item (it lives in the prefix, not the item).
+        self.assertNotIn("1.", cards[0]["items"][0])
+
+    def test_long_items_truncated_at_80(self):
+        # Phase 6.1c: items longer than 80 chars get a "…" suffix at
+        # position 80, items <=80 chars stay intact.
+        long_item = (
+            "研发部对价值超过2000元以上的配件、设备、仪器等需要由研发"
+            "部申请人氚云提交采购申请并附采购附件，审批后交由采购负责"
+            "人进行采购议价后，把最终报价发送总经理，同意后采购人进行"
+            "采购实施"
+        )
+        self.assertGreater(len(long_item), 80,
+                           "long_item fixture must exceed 80 chars")
+        body = f"## （一）\n1. {long_item}\n2. 短项"
+        cards = pl._cards_from_body(body)
+        h2_card = next(c for c in cards if "（一）" in c["title"])
+        long_in_card = next(it for it in h2_card["items"] if len(it) > 80)
+        self.assertTrue(long_in_card.endswith("…"))
+        self.assertEqual(len(long_in_card), 81)  # 80 chars + "…"
+        # Short item untouched.
+        self.assertIn("短项", h2_card["items"])
+
+    def test_revision_table_detected(self):
+        # Phase 6.1b: a body that IS a pipe-table returns the sentinel
+        # card so workspace_expand routes to revision-table layout.
+        body = (
+            "| 日期 | 状态 | 内容 | 修改人 |\n"
+            "| --- | --- | --- | --- |\n"
+            "| 2023-01-01 | 新建 | 初始版本 | 张三 |\n"
+            "| 2023-02-01 | 修订 | 完善流程 | 李四 |\n"
+        )
+        cards = pl._cards_from_body(body)
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["title"], "__revision_table__")
+        self.assertEqual(len(cards[0]["items"]), 2)
+        first = cards[0]["items"][0]
+        self.assertEqual(first["date"], "2023-01-01")
+        self.assertEqual(first["status"], "新建")
+        self.assertEqual(first["content"], "初始版本")
+        self.assertEqual(first["author"], "张三")
+
+    def test_no_table_returns_normal_cards(self):
+        # Regression for 6.1b: a body with at most 1 pipe-line or no
+        # separator row must NOT be misread as a table.
+        body = "公司规章制度是保障公司运营的工具。"
+        cards = pl._cards_from_body(body)
+        self.assertNotEqual(cards[0]["title"], "__revision_table__")
+        # Single-paragraph body → exactly one "要点" card.
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["title"], "要点")
+
+    def test_parse_markdown_table_handles_ragged_rows(self):
+        # Robustness: 5-column header + 4-column data row must not crash
+        # and must not blow up the renderer downstream. _parse_markdown_table
+        # pads/truncates to match the header width.
+        body = (
+            "| 日期 | 状态 | 内容 | 修改人 | 审核人 |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "| 2023-01-01 | 新建 | 初始版本 | 张三 |\n"
+        )
+        rows = pl._parse_markdown_table(body)
+        self.assertEqual(len(rows), 1)
+        # Header is 5 columns → row dict has 5 keys (positional col5 for
+        # 审核人 since it isn't in the standard mapping).
+        self.assertEqual(len(rows[0]), 5)
+
+
 class TestSplitMarkdownSectionsMeta(unittest.TestCase):
     """Phase 2 (2026-09-16): ``split_markdown_sections`` extracts meta.
 

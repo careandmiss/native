@@ -247,6 +247,7 @@ from .toc_detection import (  # noqa: F401  (re-export for back-compat)
     cards_for_section as _cards_for_section,
     cards_from_body as _cards_from_body,
     detect_toc_slot_shape_ids as _detect_toc_slot_shape_ids,
+    _parse_markdown_table as _parse_markdown_table,
     fill_missing_content_blocks as _fill_missing_content_blocks,
     filter_toc_manual_mapping as _filter_toc_manual_mapping,
     find_toc_svg as _find_toc_svg,
@@ -280,6 +281,61 @@ from .workspace_expand import (  # noqa: F401  (re-export for back-compat)
     toc_deletion_marker_path as _toc_deletion_marker_path,
     toc_slide_number as _toc_slide_number,
 )
+
+
+def _merge_new_blocks(
+    caller_blocks: dict[str, dict[str, Any]],
+    planner_blocks: dict[str, dict[str, Any]] | None,
+) -> dict[str, dict[str, Any]]:
+    """Merge caller-supplied ``new_blocks`` (from
+    :func:`workspace_expand.expand_workspace_from_markdown`) and the
+    planner/LLM-supplied ``new_blocks`` (from the Phase B planner).
+
+    Phase 6.2b/6.4 (2026-09-16) unification: both sides use the same
+    SVG-write path (:func:`svg_edits.write_new_content_block` inside
+    :func:`realize_plan`). When caller and planner emit the SAME
+    ``group_id`` (key under per-svg dict) for the same svg, planner
+    wins — so the LLM can override caller A-path auto-fill instead of
+    stacking a second card. Different ``group_id`` → both kept.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    for svg_name, blocks in (caller_blocks or {}).items():
+        merged[svg_name] = dict(blocks)
+    for svg_name, blocks in (planner_blocks or {}).items():
+        per_svg = merged.setdefault(svg_name, {})
+        # Planner wins on per-group_id collision.
+        per_svg.update(blocks)
+    return merged
+
+
+def _remove_existing_new_content_group(svg_path: Path, group_id: str) -> None:
+    """Remove any existing top-level ``<g id="<group_id>">`` from an SVG.
+
+    Phase 6.2b (2026-09-16): ``write_new_content_block`` appends rather
+    than replaces — when the caller path already wrote a
+    ``body_cards`` group, a later LLM re-write would produce a
+    duplicate ``<g id="body_cards">`` and svg_to_pptx rejects the
+    duplicate. Drop the existing same-id group before writing.
+    Idempotent: no-op when no matching group exists.
+
+    Uses regex on the raw text (no ElementTree) so it doesn't depend
+    on svg_edits' private namespace helpers. The pattern is
+    deliberately conservative: it only matches a ``<g>`` whose first
+    attribute is ``id="<group_id>"`` so it never trims unrelated
+    nested groups.
+    """
+    import re as _re
+    raw = svg_path.read_text(encoding="utf-8")
+    pattern = _re.compile(
+        r'<g\s+id="' + _re.escape(group_id) + r'"[^>]*>.*?</g>',
+        _re.DOTALL,
+    )
+    new_raw, n = pattern.subn("", raw, count=1)
+    if n == 0:
+        return
+    tmp = svg_path.with_suffix(svg_path.suffix + ".tmp")
+    tmp.write_text(new_raw, encoding="utf-8")
+    tmp.replace(svg_path)
 
 
 def _seed_original_roster(
@@ -672,6 +728,20 @@ def phase3_author(
                     f"missing bounds; skipping (would WARN at quality gate)"
                 )
                 continue
+            # Phase 6.2b (2026-09-16): idempotency guard. When the
+            # caller path (expand_workspace_from_markdown) wrote a
+            # ``body_cards`` group earlier, our re-write would append
+            # a duplicate ``<g id="body_cards">`` and svg_to_pptx
+            # rejects with "duplicate top-level group id(s)".
+            # Drop the existing same-id group before writing so the
+            # LLM's later override cleanly replaces the caller slot.
+            try:
+                _remove_existing_new_content_group(svg_path, shape_id)
+            except Exception as exc:
+                log.warning(
+                    "phase3: remove_existing group failed svg=%s shape=%s: %s",
+                    svg_name, shape_id, exc,
+                )
             try:
                 svg_edits.write_new_content_block(
                     svg_path,
@@ -1540,7 +1610,15 @@ def run_with_mapping(
         output_pptx=output_pptx,
         page_plan=effective_page_plan,
         content_mapping=content_mapping,
-        new_content_blocks=new_content_blocks,
+        # Phase 6.2b/6.4 (2026-09-16): merge caller-supplied
+        # ``new_blocks`` (from expand_workspace_from_markdown's auto
+        # routing) into the new_content_blocks the LLM also writes
+        # into. Same ``body_cards`` group_id means the LLM can
+        # override the caller slot instead of stacking a second card.
+        new_content_blocks=_merge_new_blocks(
+            expansions.get("new_blocks", {}),
+            new_content_blocks,
+        ),
         content_markdown=content_markdown,
         skill_dir=skill_dir,
         auto_fix=auto_fix,

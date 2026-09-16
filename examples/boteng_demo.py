@@ -20,8 +20,8 @@ if str(SRC) not in sys.path:
 
 DEFAULT_TEMPLATE = Path(r"D:\Code\tst\native_fill\柏腾ppt模版.pptx")
 DEFAULT_MD = Path(r"D:\Code\tst\native_fill\3山西柏腾科技有限公司采购制度.md")
-DEFAULT_OUTPUT = HERE.parent / "projects" / "boteng_采购制度_out.pptx"
-DEFAULT_WORKSPACE = HERE.parent / "projects" / "boteng_采购制度_workspace"
+DEFAULT_OUTPUT = HERE.parent / "projects" / "boteng_采购制度_v2_out.pptx"
+DEFAULT_WORKSPACE = HERE.parent / "projects" / "boteng_采购制度_v2_workspace"
 
 TOC_TOP = {"rows": 3, "cols": 2}
 DIVIDER_EDITS = {"shape-4": "PART {nn}", "shape-5": "{title}"}

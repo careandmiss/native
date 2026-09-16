@@ -684,6 +684,22 @@ def cards_from_body(body: str) -> list[dict[str, Any]]:
     non_h2_paragraphs = [
         p for i, p in enumerate(paragraphs) if i not in h2_paragraph_idxs
     ]
+    list_re = re.compile(r"^([\d]+)[、.]\s*(.+)$")
+    # Phase 6.1a (2026-09-16): detect the single-line-numbered-paragraph
+    # pattern. When the WHOLE body is one paragraph whose first line is
+    # ``1. xxx`` (e.g. ``一、目的``'s ``1.为了提高公司采购效率...``),
+    # the paragraph IS the only numbered item. Putting it into "要点"
+    # already covers everything — emitting "子项" via the list-items
+    # fallback below would duplicate the same content on the same slide
+    # (visible on boteng slide 6/8 before Phase 6). Flag the pattern
+    # so the list-items loop skips that line.
+    first_is_single_numbered = False
+    if non_h2_paragraphs:
+        first_lines = non_h2_paragraphs[0].splitlines()
+        first_is_single_numbered = (
+            len(first_lines) == 1
+            and list_re.match(first_lines[0].strip()) is not None
+        )
     if non_h2_paragraphs:
         first = non_h2_paragraphs[0]
         # Strip leading "# " / leading numbered list prefix.
@@ -700,7 +716,6 @@ def cards_from_body(body: str) -> list[dict[str, Any]]:
     # per H2, with the H2 title as the card title and the numbered list
     # items below it as the card items. This fills the body for slides
     # that have NO top-level numbered list but DO have H2 subsections.
-    list_re = re.compile(r"^([\d]+)[、.]\s*(.+)$")
     sub_cards: list[dict[str, Any]] = []
     for i in h2_paragraph_idxs:
         p = paragraphs[i]
@@ -721,7 +736,13 @@ def cards_from_body(body: str) -> list[dict[str, Any]]:
             lm = list_re.match(line)
             if lm:
                 txt = lm.group(2).strip()
-                items.append(txt[:30] + ("…" if len(txt) > 30 else ""))
+                # Phase 6.1c (2026-09-16): widened 30→80 chars. 30 chars
+                # chopped long Chinese items mid-sentence ("研发部对价值
+                # 超过2000元以上的配件、设备、仪器等需要由研发…"); 80
+                # keeps a full clause readable in bullet-list /
+                # 3-column-cards. The downstream renderer still enforces
+                # its own bounds-based shrink if the item doesn't fit.
+                items.append(txt[:80] + ("…" if len(txt) > 80 else ""))
         if items:
             # Color cycles with current card count so duplicates don't share color.
             color = colors[(len(cards) + len(sub_cards)) % 3]
@@ -738,36 +759,133 @@ def cards_from_body(body: str) -> list[dict[str, Any]]:
     # Phase 1.3 (2026-09-16): also scan paragraphs[0] (non-H2 path) so numbered
     # items embedded in the first paragraph are captured. H2 paragraphs
     # are already excluded (Phase 1.2 owns their items).
+    # Phase 6.1a (2026-09-16): skip the first paragraph's first line when
+    # it IS a single ``1. xxx`` numbered item — that line is already
+    # absorbed into the "要点" card above, so re-emitting it as "子项"
+    # duplicates content.
     list_items: list[str] = []
-    for p in non_h2_paragraphs:
-        for line in p.splitlines():
+    for pi, p in enumerate(non_h2_paragraphs):
+        lines = p.splitlines()
+        for li, line in enumerate(lines):
             line = line.strip()
             if line.startswith("#"):
                 continue
+            if pi == 0 and li == 0 and first_is_single_numbered:
+                continue  # Phase 6.1a: already in 要点 card
             lm = list_re.match(line)
             if lm:
-                list_items.append(lm.group(2).strip())
+                # Phase 6.1c (2026-09-16): widen per-item cap 30→80 so
+                # long Chinese clauses don't get chopped mid-sentence.
+                txt = lm.group(2).strip()
+                list_items.append(txt[:80] + ("…" if len(txt) > 80 else ""))
     if list_items:
-        # Group into 2 cards (cap at 4 items per card).
+        # Group into 2 cards (cap at 5 items per card so the right column
+        # doesn't immediately exhaust the budget).
         half = max(1, (len(list_items) + 1) // 2)
         cards.append({
             "title": "子项",
             "color": colors[1],
-            "items": [it[:30] + ("…" if len(it) > 30 else "")
-                      for it in list_items[:half]],
+            "items": list_items[:half],
         })
         if len(list_items) > half:
             cards.append({
                 "title": "补充",
                 "color": colors[2],
-                "items": [it[:30] + ("…" if len(it) > 30 else "")
-                          for it in list_items[half:half + 4]],
+                "items": list_items[half:half + 5],
             })
 
     # Trim to 4 cards max (Phase 1.2: renderer ``3-column-cards`` supports
     # 1-4 cards; lifted cap from 3 so H2 sub-cards + numbered list cards
     # can coexist on the same slide, e.g. ``四、工作程序``).
-    return cards[:4]
+    cards = cards[:4]
+
+    # Phase 6.1b (2026-09-16): markdown pipe-table detection. Body that
+    # is primarily a table (e.g. 附件's 修订记录) should render as
+    # ``revision-table`` not as a 3-column-cards paragraph of raw pipes.
+    # Return a sentinel card so :func:`workspace_expand.expand_workspace_from_markdown`
+    # picks ``revision-table`` and writes the rows verbatim.
+    table_rows = _parse_markdown_table(body)
+    if table_rows:
+        return [{
+            "title": "__revision_table__",
+            "color": "#1D2CAB",
+            "items": table_rows,
+        }]
+    return cards
+
+
+# Phase 6.1b (2026-09-16): parse a markdown pipe-table into the
+# ``revision-table`` row shape (``{date, status, content, author}``).
+# Returns an empty list if the body has no recognizable table, so
+# callers can fall through to the regular card heuristic.
+_TABLE_HEADER_RE = re.compile(r"^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$")
+_TABLE_CELL_RE = re.compile(r"\s*\|\s*")
+
+
+def _parse_markdown_table(body: str) -> list[dict[str, str]]:
+    """Convert a markdown pipe-table block into ``revision-table`` rows.
+
+    Recognizes the conventional layout::
+
+        | 日期 | 状态 | 内容 | 修改人 |
+        | --- | --- | --- | --- |
+        | 2023-01-01 | 新建 | 初始版本 | 张三 |
+
+    Returns a list of dicts keyed ``date / status / content / author``
+    in the order they appear in the header row, or an empty list when
+    the body has fewer than two non-separator pipe lines or fewer
+    than three columns (deliberately conservative so random ``|``
+    characters in prose don't get misread as a table).
+
+    Header-cell → row-key mapping uses a small lookup so callers can
+    use either the standard revision-record headers (``日期 / 状态 /
+    内容 / 修改人``) or other 4-column headers (``Name / Status /
+    Description / Owner``); any unknown header falls back to a
+    positional slot (``col1 / col2 / col3 / col4``).
+    """
+    if not body:
+        return []
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    pipe_lines = [ln for ln in lines if ln.lstrip().startswith("|")]
+    if len(pipe_lines) < 3:  # header + separator + at least 1 row
+        return []
+    if not _TABLE_HEADER_RE.match(pipe_lines[1].strip()):
+        return []
+    header_cells = [
+        c.strip() for c in _TABLE_CELL_RE.split(pipe_lines[0].strip().strip("|"))
+    ]
+    if len(header_cells) < 3:
+        return []
+    # Map header text → row key. Standard revision-record vocabulary
+    # lands in the documented 4 slots; anything else falls through to
+    # positional colN slots so 3/5/6-column tables still render.
+    header_map = {
+        "日期": "date", "时间": "date", "date": "date",
+        "状态": "status", "status": "status",
+        "内容": "content", "描述": "content", "content": "content",
+        "修改人": "author", "作者": "author", "author": "author",
+        "审核人": "reviewer", "批准人": "approver",
+    }
+    row_keys: list[str] = []
+    for i, h in enumerate(header_cells):
+        if h in header_map:
+            row_keys.append(header_map[h])
+        else:
+            row_keys.append(f"col{i + 1}")
+    # Ensure "status" / "date" keys exist (revision-table defaults).
+    if "status" not in row_keys:
+        row_keys[1] = "status"
+    if "date" not in row_keys:
+        row_keys[0] = "date"
+
+    rows: list[dict[str, str]] = []
+    for raw in pipe_lines[2:]:
+        cells = [c.strip() for c in _TABLE_CELL_RE.split(raw.strip().strip("|"))]
+        if len(cells) != len(row_keys):
+            # ragged row — pad / truncate so the renderer doesn't crash
+            cells = (cells + [""] * len(row_keys))[: len(row_keys)]
+        rows.append(dict(zip(row_keys, cells)))
+    return rows
 
 
 def fill_missing_content_blocks(

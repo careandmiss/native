@@ -535,10 +535,11 @@ def render_new_block(spec: dict[str, Any]) -> str:
             # skip items that would fall past the bounds bottom.
             if ty > by + bh - 8:
                 break
-            # 40-char truncation per item (matches
-            # workspace_expand.py:233 behavior so 3-column-cards and
-            # bullet-list look consistent on the same content).
-            display = item[:40] + ("…" if len(item) > 40 else "")
+            # Phase 6.6 (2026-09-16): widened 40→80 chars. The renderer's
+            # own bounds-check (line 537 ``ty > by + bh - 8``) still
+            # drops items that fall past the bottom of the body rect,
+            # so we don't risk overflow from the longer truncation.
+            display = item[:80] + ("…" if len(item) > 80 else "")
             parts.append(
                 f'<text x="{bx + 24:g}" y="{ty:g}" font-size="16" '
                 f'fill="#222">{i + 1}. {escape(display)}</text>'

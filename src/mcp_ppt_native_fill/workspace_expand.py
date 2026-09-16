@@ -59,10 +59,11 @@ def expand_workspace_from_markdown(
     For every H1 in ``md_path`` we clone ``slide_<skeleton_divider>.svg``
     into ``slide_partNN_div.svg`` and ``slide_<skeleton_content>.svg``
     into ``slide_partNN_content.svg``, then apply template-supplied text
-    edits and embed an auto-generated new_block of cards pulled from
-    the section body. Finally we re-seal ``page_plan.json`` with the
-    original roster prepended and (optionally) ``ending_svg`` moved
-    to the last position.
+    edits and accumulate a new-block spec (one per content slide) under
+    the ``new_blocks`` return key. The caller (:func:`pipeline.run_with_mapping`)
+    feeds those specs into ``realize_plan`` via ``new_content_blocks``
+    so the LLM and caller paths share one SVG-write pipeline and the
+    same ``group_id`` collision semantics.
 
     Parameters
     ----------
@@ -116,7 +117,18 @@ def expand_workspace_from_markdown(
 
     Returns
     -------
-    ``{"cloned_svgs": [..], "page_plan_path": Path, "n_parts": int}``.
+    ``{"cloned_svgs": [..], "page_plan_path": Path, "n_parts": int,
+    "new_blocks": {svg_name: {"body_cards": spec}}}``.
+
+    The ``new_blocks`` dict is the Phase 6.2b/6.4 (2026-09-16) addition:
+    previously this function wrote its auto-generated cards block
+    directly into the cloned SVG via ``write_new_content_block``. That
+    caused double-layer stack when the LLM also injected a
+    ``content-body`` block (different ``group_id``) into the same SVG.
+    By returning the spec and letting ``realize_plan`` route everything
+    through one ``write_new_content_block`` call site, the LLM can
+    override the same ``body_cards`` key (no double-layer) or add
+    separate blocks for orthogonal content (no collision).
 
     Fully generic: this function makes no assumption about template
     shape ids, body bounds, section names, or layout choice. The boteng
@@ -133,6 +145,11 @@ def expand_workspace_from_markdown(
 
     auth = workspace / "authoring-svg-flat"
     cloned: list[str] = []
+    # Phase 6.2b/6.4 (2026-09-16): accumulate caller-side new_blocks here
+    # instead of writing directly to SVG. ``realize_plan`` consumes this
+    # dict via the same ``new_content_blocks`` channel the LLM uses,
+    # which gives the LLM one chance to override the same ``group_id``.
+    new_blocks: dict[str, dict[str, Any]] = {}
 
     def _format(template_dict: dict[str, str], *, nn: str, n: int,
                 title: str) -> dict[str, str]:
@@ -211,7 +228,24 @@ def expand_workspace_from_markdown(
                 # 3-column-cards with ~40-char chunks is removed: callers
                 # who actually want 3-column-cards now have ≥2 cards, and
                 # the long-text case is handed off to simple-text.
-                if not cards:
+                #
+                # Phase 6.4 (2026-09-16): two new dispatch branches.
+                # - revision-table sentinel card → revision-table layout
+                #   so markdown pipe-tables don't render as raw pipes.
+                # - ≥3 cards where the trailing cards are H2 sub-cards
+                #   with items → bullet-list with "<H2 title>: <item>"
+                #   per line, so multi-H2 sections don't end up with 30+
+                #   cards chopped at 80 chars each (visible on a complex
+                #   H2-heavy slide before Phase 6).
+                if (cards
+                        and len(cards) == 1
+                        and cards[0].get("title") == "__revision_table__"):
+                    spec = {
+                        "layout": "revision-table",
+                        "bounds": body_bounds,
+                        "spec": {"rows": cards[0]["items"]},
+                    }
+                elif not cards:
                     cards = [{
                         "title": "要点",
                         "color": "#1D2CAB",
@@ -234,6 +268,40 @@ def expand_workspace_from_markdown(
                             "color": cards[0].get("color", "#1D2CAB"),
                         },
                     }
+                elif (len(cards) >= 3
+                      and all(c.get("title") != "要点" for c in cards[1:])
+                      # Multi-H2 bullet-list dispatch: ONLY when the
+                      # non-要点 cards are actual H2 sub-section cards
+                      # (their titles contain ``（xx）`` style headers
+                      # or come from the cards_from_body H2 path). The
+                      # numbered-list fallback produces cards named
+                      # ``子项`` / ``补充`` — those should keep the
+                      # legacy 3-column-cards behaviour so existing
+                      # callers don't see a sudden layout swap.
+                      and any("（" in c.get("title", "")
+                              and "）" in c.get("title", "")
+                              for c in cards[1:])):
+                    # Phase 6.4 multi-H2 → bullet-list: flatten the H2
+                    # sub-cards into one numbered list with the H2 title
+                    # as a prefix on each item, so the reader can tell
+                    # which sub-section each clause belongs to. Cap at
+                    # 10 items per the bullet-list renderer budget.
+                    flat_items: list[str] = []
+                    for c in cards[1:]:
+                        ctitle = c.get("title", "").strip()
+                        for it in c.get("items", []):
+                            if ctitle:
+                                flat_items.append(f"{ctitle}: {it[:80]}")
+                            else:
+                                flat_items.append(it[:80])
+                    spec = {
+                        "layout": "bullet-list",
+                        "bounds": body_bounds,
+                        "spec": {
+                            "items": flat_items[:10],
+                            "color": cards[1].get("color", "#1D2CAB"),
+                        },
+                    }
                 else:
                     # Multi-card fallback — keep the legacy 40-char
                     # truncation per item so cards stay readable in
@@ -248,6 +316,22 @@ def expand_workspace_from_markdown(
                         "spec": {"cards": cards},
                         "bounds": body_bounds,
                     }
+            # Phase 6.2b (2026-09-16): accumulate spec in new_blocks
+            # so realize_plan can route it through the unified
+            # write_new_content_block path alongside any LLM blocks.
+            # Matching ``group_id="body_cards"`` lets the LLM override
+            # the same slot instead of double-stacking. We also keep
+            # the legacy direct-SVG write so callers / tests that read
+            # the SVG file immediately after expand still see the
+            # rendered body — realize_plan's re-write is idempotent on
+            # ``body_cards`` group_id.
+            new_blocks[cont_svg_name] = {
+                "body_cards": {
+                    "bounds": body_bounds,
+                    "layout": spec["layout"],
+                    **({"spec": spec["spec"]} if "spec" in spec else {}),
+                }
+            }
             inner = render_new_block(spec)
             svg_edits.write_new_content_block(
                 auth / cont_svg_name,
@@ -294,6 +378,7 @@ def expand_workspace_from_markdown(
         "cloned_svgs": cloned,
         "page_plan_path": plan_path,
         "n_parts": n_parts,
+        "new_blocks": new_blocks,
     }
 
 
