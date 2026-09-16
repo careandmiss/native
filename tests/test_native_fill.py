@@ -4583,5 +4583,186 @@ class TestDetectTocSlotShapeIds(unittest.TestCase):
                 )
 
 
+class TestBackfillCoverTitle(unittest.TestCase):
+    """Phase C — deterministic cover title safety net.
+
+    Triggered when the LLM planner leaves the cover slide empty. The
+    pipeline calls :func:`backfill_cover_title` after merging
+    caller-supplied and LLM-supplied content mappings.
+    """
+
+    def _workspace(self, td: Path):
+        flat = td / "authoring-svg-flat"
+        flat.mkdir(parents=True)
+        (flat / "authoring_summary.json").write_text(
+            json.dumps({"schema": "x", "documents": []}),
+            encoding="utf-8",
+        )
+        # Cover with two text shapes; shape-24 is wider so it wins on
+        # max_chars heuristic (placeholder "old title long string"
+        # ~26 chars * 1.2 = 31) vs shape-23 ("old title" * 1.2 = 12).
+        (flat / "slide_01.svg").write_text(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">'
+            '<g id="shape-23"><text x="10" y="20">old title</text></g>'
+            '<g id="shape-24"><text x="10" y="40">old title long string</text></g>'
+            '</svg>',
+            encoding="utf-8",
+        )
+        # A non-cover slide to confirm the backfill only touches slide_01.
+        (flat / "slide_02.svg").write_text(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">'
+            '<g id="shape-2"><text x="10" y="20">toc slot</text></g>'
+            '</svg>',
+            encoding="utf-8",
+        )
+        # 5 text elements on slide_03 → heuristics may classify it as
+        # toc; ensure the cover classification is stable.
+        slot_texts = "".join(
+            f'<g id="shape-{i + 100}"><text x="10" y="{20 + i * 10}">'
+            f"slot {i}</text></g>"
+            for i in range(5)
+        )
+        (flat / "slide_03.svg").write_text(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">'
+            f"{slot_texts}"
+            '</svg>',
+            encoding="utf-8",
+        )
+        md = td / "content.md"
+        md.write_text("# 公司采购制度\n\nbody\n", encoding="utf-8")
+        return td, md
+
+    def test_fills_when_cover_unfilled(self):
+        from mcp_ppt_native_fill import llm_planner
+
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            ws, md = self._workspace(td)
+            merged: dict[str, dict[str, str]] = {}
+            report = llm_planner.backfill_cover_title(
+                merged_mapping=merged,
+                workspace=ws,
+                md_text=md.read_text(encoding="utf-8"),
+                md_path=md,
+            )
+            self.assertTrue(report["filled"], msg=str(report))
+            self.assertEqual(report["cover_svg"], "slide_01.svg")
+            self.assertEqual(report["title"], "公司采购制度")
+            self.assertIn("slide_01.svg", merged)
+            # Touched exactly one shape (the max_chars winner).
+            self.assertEqual(len(merged["slide_01.svg"]), 1)
+            self.assertEqual(
+                merged["slide_01.svg"][report["shape_id"]],
+                "公司采购制度",
+            )
+
+    def test_skips_when_cover_already_has_edit(self):
+        from mcp_ppt_native_fill import llm_planner
+
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            ws, md = self._workspace(td)
+            merged = {
+                "slide_01.svg": {"shape-23": "user supplied cover title"},
+            }
+            report = llm_planner.backfill_cover_title(
+                merged_mapping=merged,
+                workspace=ws,
+                md_text=md.read_text(encoding="utf-8"),
+                md_path=md,
+            )
+            self.assertFalse(report["filled"])
+            self.assertEqual(report["reason"], "cover_already_filled")
+            # Caller value untouched.
+            self.assertEqual(
+                merged["slide_01.svg"]["shape-23"],
+                "user supplied cover title",
+            )
+            # shape-24 was NOT added (we don't second-guess callers).
+            self.assertNotIn("shape-24", merged["slide_01.svg"])
+
+    def test_falls_back_to_filename_when_no_h1(self):
+        from mcp_ppt_native_fill import llm_planner
+
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            ws, _ = self._workspace(td)
+            md = td / "山西柏腾科技采购制度.md"  # no H1 in body
+            md.write_text("no heading here, just prose\n", encoding="utf-8")
+            merged: dict[str, dict[str, str]] = {}
+            report = llm_planner.backfill_cover_title(
+                merged_mapping=merged,
+                workspace=ws,
+                md_text=md.read_text(encoding="utf-8"),
+                md_path=md,
+            )
+            self.assertTrue(report["filled"], msg=str(report))
+            self.assertEqual(report["title"], "山西柏腾科技采购制度")
+
+    def test_truncates_to_max_chars(self):
+        from mcp_ppt_native_fill import llm_planner
+
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            ws, _ = self._workspace(td)
+            # Force a tight frame geometry so max_chars is small.
+            # data-pptx-frame="x y w h" makes _scan_text_shapes apply
+            # the geometry-based cap instead of placeholder-length.
+            # 200px wide / 47pt font ≈ 4 chars (CJK 1.0× * 0.85 safety).
+            flat = ws / "authoring-svg-flat"
+            (flat / "slide_01.svg").write_text(
+                '<?xml version="1.0" encoding="utf-8"?>'
+                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">'
+                '<g id="shape-77" data-pptx-frame="100 100 200 80">'
+                '<text x="10" y="20" font-size="47">placeholder</text>'
+                '</g>'
+                '</svg>',
+                encoding="utf-8",
+            )
+            md = td / "content.md"
+            md.write_text(
+                "# 山西柏腾科技有限公司采购管理制度\n\nbody\n",
+                encoding="utf-8",
+            )
+            merged: dict[str, dict[str, str]] = {}
+            report = llm_planner.backfill_cover_title(
+                merged_mapping=merged,
+                workspace=ws,
+                md_text=md.read_text(encoding="utf-8"),
+                md_path=md,
+            )
+            self.assertTrue(report["filled"], msg=str(report))
+            # The geometry cap ≤ placeholder cap, so we honor the smaller.
+            self.assertLessEqual(len(report["title"]), report["max_chars"])
+            # 15-char title into ~4-char slot ⇒ truncation was needed.
+            self.assertTrue(report["truncated"])
+
+    def test_no_cover_slide_returns_clean_report(self):
+        from mcp_ppt_native_fill import llm_planner
+
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            flat = td / "authoring-svg-flat"
+            flat.mkdir(parents=True)
+            (flat / "authoring_summary.json").write_text(
+                json.dumps({"schema": "x", "documents": []}),
+                encoding="utf-8",
+            )
+            # Empty flat → no slides → skeleton detection returns {}.
+            ws = td
+            merged: dict[str, dict[str, str]] = {}
+            report = llm_planner.backfill_cover_title(
+                merged_mapping=merged,
+                workspace=ws,
+                md_text="# Title",
+            )
+            self.assertFalse(report["filled"])
+            self.assertEqual(report["reason"], "no_cover_slide")
+            self.assertEqual(merged, {})
+
+
 if __name__ == "__main__":
     unittest.main()

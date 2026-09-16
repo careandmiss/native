@@ -194,6 +194,38 @@ def llm_plan(
             f"new block(s) from {content_markdown.name}"
         )
 
+    # Cover title backfill (Phase C, 2026-09-16). Deterministic
+    # safety net: when neither the caller nor the LLM wrote to the
+    # cover slide (probabilistic), we fill it from the markdown's H1
+    # / filename. Runs unconditionally so empty-mapping fallbacks also
+    # get the cover title. Only writes when the cover slide has zero
+    # shape edits; if either side already filled it, we leave it alone.
+    try:
+        backfill = llm_planner.backfill_cover_title(
+            merged_mapping=merged,
+            workspace=workspace,
+            md_text=content_markdown.read_text(encoding="utf-8"),
+            md_path=content_markdown,
+        )
+        if backfill.get("filled"):
+            state.warnings.append(
+                f"llm_plan: cover title backfill wrote "
+                f"{backfill['cover_svg']}:{backfill['shape_id']}="
+                f"{backfill['title']!r} "
+                f"(max_chars={backfill['max_chars']}, "
+                f"truncated={backfill['truncated']})"
+            )
+        elif backfill.get("reason") not in (
+            None, "cover_already_filled", "no_cover_slide",
+        ):
+            log.info(
+                "llm_plan: cover title backfill skipped: %s",
+                backfill["reason"],
+            )
+    except Exception as exc:
+        # Backfill is best-effort; never fail the pipeline on this.
+        log.warning("llm_plan: cover title backfill raised: %s", exc)
+
     state.context["content_mapping"] = merged
     state.context["planner_result"] = planner_result
     state.stage = "imported"
@@ -1256,6 +1288,7 @@ def run_with_mapping(
     fix_nested_picture: bool = False,
     skip_phase3_5: bool = False,
     disabled_autofixes: tuple[str, ...] = (),
+    enable_llm_planner: bool = False,
     # Smart TOC fill (opt-in; auto-detects TOC slide from 目录/CONTENTS)
     expand_toc_from_markdown: bool = False,
     expand_toc_slot_grid: dict[str, Any] | None = None,
@@ -1509,6 +1542,7 @@ def run_with_mapping(
         skip_phase3_5=skip_phase3_5,
         disabled_autofixes=disabled_autofixes,
         quality_strict=quality_strict,
+        enable_llm_planner=enable_llm_planner,
     )
     # Augment result with the pre-delegation work that the caller
     # asked about (edit_summary, strip_report, expansions, toc_summary).

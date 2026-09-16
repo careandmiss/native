@@ -974,3 +974,140 @@ def _normalize_new_blocks(raw: Any) -> list[dict[str, Any]]:
             "spec": spec,
         })
     return cleaned
+
+
+# ---------------------------------------------------------------------------
+# Cover title backfill (Phase C, 2026-09-16).
+#
+# The LLM planner is probabilistic. When the cover slide
+# (``skeleton_kind["..._cover"]``) has no entry in the merged
+# ``content_mapping``, the deck ships with the template's placeholder
+# text on slide 1 — a clearly broken result. The cover title slot is
+# deterministic enough to fill without the LLM: every cover has a
+# single large title shape (max ``max_chars``), and the doc title comes
+# from the markdown H1 / filename. This helper fills that gap.
+#
+# Idempotent and additive: it only writes when the cover slide has
+# ZERO shape edits in ``merged_mapping``. Caller-supplied edits and
+# any LLM edits are preserved.
+# ---------------------------------------------------------------------------
+
+
+def _doc_title_from_markdown(md_text: str, md_path: Path | None) -> str:
+    """Best-effort doc title for the cover slide.
+
+    Order:
+      1. First H1 in the markdown (``# 标题``).
+      2. Filename stem with separators (``_`` / ``-``) replaced by space.
+      3. Empty string (caller should skip the backfill).
+    """
+    head_re = re.compile(r"^#\s+(.+)$", re.MULTILINE)
+    m = head_re.search(md_text)
+    if m:
+        title = m.group(1).strip()
+        # strip inline markdown emphasis (same as toc_detection.split_markdown_sections)
+        title = re.sub(r"\*\*(.+?)\*\*", r"\1", title)
+        title = re.sub(r"\*(.+?)\*", r"\1", title)
+        title = re.sub(r"`(.+?)`", r"\1", title)
+        if title:
+            return title
+    if md_path is not None:
+        stem = md_path.stem
+        stem = re.sub(r"[_\-]+", " ", stem).strip()
+        if stem:
+            return stem
+    return ""
+
+
+def _cover_svg_name(skeleton_kind: dict[str, str]) -> str | None:
+    """Return the SVG filename marked as ``"cover"`` by skeleton detection.
+
+    Returns ``None`` when no cover is classified (the template doesn't
+    have a cover slide, or skeleton detection failed).
+    """
+    for name, role in skeleton_kind.items():
+        if role == "cover":
+            return name
+    return None
+
+
+def _pick_cover_title_shape(
+    cover_shapes: dict[str, dict[str, Any]],
+) -> tuple[str, int] | None:
+    """Choose the cover slide's primary title shape (max ``max_chars``).
+
+    Returns ``(shape_id, max_chars)`` or ``None`` if no shapes exist.
+    Tie-break: larger frame area wins (rough — uses
+    ``max_chars`` * 100 as a proxy since we don't expose frame w/h here).
+    """
+    if not cover_shapes:
+        return None
+    best_id = max(
+        cover_shapes,
+        key=lambda sid: cover_shapes[sid].get("max_chars", 0),
+    )
+    best = cover_shapes[best_id]
+    return best_id, int(best.get("max_chars", 0))
+
+
+def backfill_cover_title(
+    *,
+    merged_mapping: dict[str, dict[str, str]],
+    workspace: Path,
+    md_text: str,
+    md_path: Path | None = None,
+) -> dict[str, Any]:
+    """Deterministically fill the cover slide title if it's empty.
+
+    Only triggers when:
+      * the workspace has a cover slide per skeleton detection, AND
+      * the cover slide has **no** shape edits in ``merged_mapping``
+        (LLM already wrote to it ⇒ we leave it alone; caller wins
+        already), AND
+      * we can derive a non-empty doc title from the markdown.
+
+    Returns a small report dict so callers can log / surface it::
+
+        {"filled": bool, "cover_svg": str|None, "shape_id": str|None,
+         "title": str|None, "max_chars": int|None, "truncated": bool,
+         "reason": str|None}
+    """
+    empty = {
+        "filled": False, "cover_svg": None, "shape_id": None,
+        "title": None, "max_chars": None, "truncated": False,
+        "reason": None,
+    }
+    skeleton_index = _detect_skeleton_kind(workspace)
+    skeleton_kind = (skeleton_index or {}).get("skeleton_kind") or {}
+    cover_svg = _cover_svg_name(skeleton_kind)
+    if not cover_svg:
+        return {**empty, "reason": "no_cover_slide"}
+    # LLM / caller already wrote to this slide → leave it alone.
+    if merged_mapping.get(cover_svg):
+        return {**empty, "reason": "cover_already_filled"}
+
+    title = _doc_title_from_markdown(md_text, md_path)
+    if not title:
+        return {**empty, "reason": "no_doc_title"}
+
+    shape_index = _scan_text_shapes(workspace)
+    cover_shapes = shape_index.get(cover_svg) or {}
+    picked = _pick_cover_title_shape(cover_shapes)
+    if picked is None:
+        return {**empty, "reason": "cover_no_text_shapes"}
+    shape_id, max_chars = picked
+
+    # Honor the same truncation ceiling the LLM planner enforces:
+    # ``max_chars - 2`` is the safe target (see SYSTEM_PROMPT Rules).
+    safe = max_chars - 2 if max_chars > 2 else max_chars
+    truncated = False
+    if len(title) > safe and safe > 0:
+        title = title[:safe]
+        truncated = True
+
+    merged_mapping.setdefault(cover_svg, {})[shape_id] = title
+    return {
+        "filled": True, "cover_svg": cover_svg, "shape_id": shape_id,
+        "title": title, "max_chars": max_chars, "truncated": truncated,
+        "reason": None,
+    }

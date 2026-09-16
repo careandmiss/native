@@ -560,6 +560,7 @@ def _execute_native_fill(arguments: dict) -> dict:
             max_fix_iterations=max_fix_iterations,
             validate_strict=validate_strict,
             clean_workspace=clean_workspace,
+            enable_llm_planner=enable_llm_planner,
         )
         # Surface deprecation notices to the caller.
         if deprecation_warnings:
@@ -568,6 +569,7 @@ def _execute_native_fill(arguments: dict) -> dict:
                 if w not in existing:
                     existing.append(w)
             response["warnings"] = existing
+        log.info("server: delegating to pipeline.run_with_mapping enable_llm_planner=%s", enable_llm_planner)
         return response
 
     response = pipeline.run_native_fill(
@@ -579,13 +581,6 @@ def _execute_native_fill(arguments: dict) -> dict:
         new_content_blocks=arguments.get("new_content_blocks"),
         content_markdown=content_markdown,
         enable_llm_planner=enable_llm_planner,
-        skill_dir=skill_dir,
-        auto_fix=auto_fix,
-        max_fix_iterations=max_fix_iterations,
-        validate_strict=validate_strict,
-        inheritance_mode=inheritance_mode,
-        skip_phase3_5=skip_phase3_5,
-        disabled_autofixes=tuple(disabled_autofixes),
     )
     # Surface deprecation notices to the caller. The "warnings" list is
     # the canonical channel for non-fatal advisories and is preserved
