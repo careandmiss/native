@@ -3533,9 +3533,13 @@ class TestExpandWorkspaceMarkdownMeta(unittest.TestCase):
             self.assertIn(">5</text>", content_svg)
             self.assertIn("总章数", content_svg)
 
-    def test_no_meta_falls_back_to_3_column_cards(self):
-        """Without meta lines, the A path renders 3-column-cards rects —
-        no behavioral regression vs Phase 1."""
+    def test_no_meta_falls_back_to_simple_text_for_long_paragraph(self):
+        """Without meta lines, the A path auto-routes a long single-paragraph
+        section to simple-text (Phase 3.4 routing) instead of the legacy
+        40-char-chunked 3-column-cards. A single ``body text`` paragraph
+        is too short to wrap to multiple lines, so the SVG should still
+        contain the section body but render as simple-text (one padded card,
+        not a 3-column-cards rect + title)."""
         with tempfile.TemporaryDirectory() as td:
             ws = self._make_workspace(td)
             md = Path(td) / "m.md"
@@ -3551,9 +3555,146 @@ class TestExpandWorkspaceMarkdownMeta(unittest.TestCase):
             content_svg = (
                 ws / "authoring-svg-flat" / "slide_part01_content.svg"
             ).read_text(encoding="utf-8")
-            # A path: 3-column-cards produces rect + title text.
+            # A path with single-card+single-item → simple-text.
+            # simple-text renders a 1060×480 padded card with the body
+            # text inside. 3-column-cards would render a small per-card
+            # rect with rx="8" + a "要点" title + a 40-char-truncated
+            # item — that's NOT what we want here.
             self.assertIn('fill="#1D2CAB"', content_svg)
             self.assertIn('rx="8"', content_svg)
+            # The body text must NOT be 40-char-truncated by 3-column-cards.
+            # simple-text passes it through verbatim.
+            self.assertIn("body text", content_svg)
+            # And 3-column-cards would have added a "要点" title —
+            # simple-text has no title element, only the body card.
+            self.assertNotIn("要点", content_svg)
+
+    def test_long_paragraph_routes_to_simple_text(self):
+        """Phase 3.4 (2026-09-16): A-path auto-routing. A single H1 with a
+        single long paragraph (no numbered list, no H2 subsections) is
+        routed to simple-text instead of 3-column-cards. The SVG should
+        contain the full body text (not 40-char-truncated) and should NOT
+        contain the legacy '要点' card title."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_workspace(td)
+            md = Path(td) / "m.md"
+            long_body = (
+                "公司规章制度是保障公司运营的工具，是本着服务公司各项工作"
+                "的态度，同时兼顾各方面的利益而制定的。制度从零到有，"
+                "从小到大，伴随着公司不断发展、壮大也在不断更新、完善。"
+                "本制度涵盖采购申请、审批、执行、验收、付款等全流程要求。"
+            )
+            md.write_text(f"# 前言\n{long_body}\n", encoding="utf-8")
+            pl.expand_workspace_from_markdown(
+                ws, md,
+                skeleton_divider=3, skeleton_content=4,
+                divider_edits_template={"shape-4": "PART {nn}",
+                                        "shape-5": "{title}"},
+                content_edits_template={"shape-17": "{title}"},
+                exclude_source_slides=None,
+            )
+            content_svg = (
+                ws / "authoring-svg-flat" / "slide_part01_content.svg"
+            ).read_text(encoding="utf-8")
+            # Full body preserved — simple-text passes text through,
+            # 3-column-cards would 40-char-truncate.
+            self.assertIn("本制度涵盖采购申请", content_svg)
+            self.assertIn("全流程要求", content_svg)
+            # No '要点' card title (3-column-cards artifact).
+            self.assertNotIn("要点", content_svg)
+            # Multiple <text> nodes because the long body auto-wraps.
+            self.assertGreaterEqual(
+                content_svg.count("<text "), 3,
+                "long paragraph should produce ≥3 <text> nodes via simple-text",
+            )
+
+    def test_multi_items_route_to_bullet_list(self):
+        """Phase 3.4 (2026-09-16): A-path auto-routing. A single H1 with a
+        long paragraph prefix followed by a numbered list (1./2./3./4.)
+        still produces ≥2 cards via ``cards_from_body`` (it splits the
+        list into a "子项" + "补充" pair). The routing falls through to
+        3-column-cards which is the correct layout for a multi-card body
+        — bullet-list only wins when cards_from_body produces a single
+        card with multiple items, which is the pre-Phase-1 behavior."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_workspace(td)
+            md = Path(td) / "m.md"
+            md.write_text(
+                "# 一、目的\n"
+                "为了提高公司采购效率、明确岗位职责、有效降低采购成本。\n"
+                "1. 提高公司采购效率\n"
+                "2. 明确岗位职责\n"
+                "3. 降低采购成本\n"
+                "4. 满足优质资源需求\n",
+                encoding="utf-8",
+            )
+            pl.expand_workspace_from_markdown(
+                ws, md,
+                skeleton_divider=3, skeleton_content=4,
+                divider_edits_template={"shape-4": "PART {nn}",
+                                        "shape-5": "{title}"},
+                content_edits_template={"shape-17": "{title}"},
+                exclude_source_slides=None,
+            )
+            content_svg = (
+                ws / "authoring-svg-flat" / "slide_part01_content.svg"
+            ).read_text(encoding="utf-8")
+            # multi-card → 3-column-cards, multiple card rects, items
+            # truncated per 30-char (cards_from_body) then per 40-char
+            # (workspace_expand) — the structural marker is the
+            # presence of multiple per-card rects + item titles.
+            self.assertNotIn('width="6"', content_svg,
+                             "no bullet-list color bar in multi-card path")
+            self.assertGreaterEqual(
+                content_svg.count("<rect"), 2,
+                "multi-card path should have ≥2 card rects",
+            )
+            # The numbered items surface in the SVG, regardless of card split.
+            self.assertIn("提高公司采购效率", content_svg)
+            self.assertIn("满足优质资源需求", content_svg)
+
+    def test_multi_card_keeps_3_column_cards(self):
+        """Phase 3.4 (2026-09-16): A-path auto-routing. When cards_from_body
+        produces ≥2 cards (e.g. multi-H2 subsections), the legacy
+        3-column-cards path still wins. The 40-char per-item truncation
+        is preserved so multi-card tile-row stays readable."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_workspace(td)
+            md = Path(td) / "m.md"
+            md.write_text(
+                "# 四、工作程序\n"
+                "## （一）采购基本事项\n"
+                "1. 新采购物料需提供至少 3 家供应商报价\n"
+                "2. 物料合作供应商确定后进行采购\n"
+                "\n"
+                "## （二）采购申请\n"
+                "1. 采购之前采购人提交采购申请及订单\n"
+                "2. 紧急采购时申请部门提交采购申请\n",
+                encoding="utf-8",
+            )
+            pl.expand_workspace_from_markdown(
+                ws, md,
+                skeleton_divider=3, skeleton_content=4,
+                divider_edits_template={"shape-4": "PART {nn}",
+                                        "shape-5": "{title}"},
+                content_edits_template={"shape-17": "{title}"},
+                exclude_source_slides=None,
+            )
+            content_svg = (
+                ws / "authoring-svg-flat" / "slide_part01_content.svg"
+            ).read_text(encoding="utf-8")
+            # multi-card → 3-column-cards, multiple per-card rects with
+            # rx="8" + multiple titles. No bullet-list color bar (no
+            # width="6" attribute) and no simple-text wrap (the body is
+            # already split across H2 cards).
+            self.assertNotIn('width="6"', content_svg)
+            self.assertGreaterEqual(
+                content_svg.count("<rect"), 2,
+                "multi-card 3-column-cards should have ≥2 card rects",
+            )
+            # H2 sub-section titles surface as card titles.
+            self.assertIn("（一）", content_svg)
+            self.assertIn("（二）", content_svg)
 
     def test_bullet_list_layout_via_meta(self):
         """Section with ``> **layout**: bullet-list`` + ``> **items**: a、b、c``

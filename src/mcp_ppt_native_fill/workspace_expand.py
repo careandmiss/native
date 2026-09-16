@@ -194,56 +194,60 @@ def expand_workspace_from_markdown(
                     "spec": payload,
                 }
             else:
-                # A path: heuristic 3-column-cards with Phase 1.4 text-split
-                # Phase 1.4 (2026-09-16): single-card text-split fallback.
-                # When ``cards_from_body`` returns only 1 card with 1 long item
-                # (the "empty slide" pattern — a section with just a single
-                # paragraph of 140+ chars, no H2 subsections, no numbered
-                # list), the existing 40-char truncation produces a single
-                # ``<text>`` node and the slide looks visually empty.
-                # Split the long item into ~40-char chunks so 3-column-cards
-                # renders each chunk as a separate ``<text>`` node, lifting
-                # text_nodes from 1 → 5-6. The simple-text layout (planned for
-                # Phase 3) will eventually replace this heuristic.
-                if len(cards) == 1 and len(cards[0].get("items", [])) == 1:
-                    long_text = cards[0]["items"][0]
-                    if len(long_text) > 40:
-                        chunks: list[str] = []
-                        rest = long_text
-                        while len(rest) > 40:
-                            # Prefer sentence/comma boundaries before 40 chars.
-                            cut = max(
-                                rest.rfind("。", 0, 40),
-                                rest.rfind("，", 0, 40),
-                                rest.rfind("；", 0, 40),
-                                rest.rfind("、", 0, 40),
-                            )
-                            if cut <= 0:
-                                cut = 40
-                            else:
-                                cut += 1  # keep delimiter with the chunk
-                            chunks.append(rest[:cut])
-                            rest = rest[cut:]
-                        if rest:
-                            chunks.append(rest)
-                        cards[0]["items"] = chunks
-
-                for c in cards:
-                    c["items"] = [
-                        it[:40] + ("…" if len(it) > 40 else "")
-                        for it in c["items"]
-                    ]
+                # A path: heuristic cards_from_body. Phase 3.4 (2026-09-16):
+                # auto-route the cards shape to a layout that fits, instead
+                # of always forcing 3-column-cards + 40-char item truncation.
+                #
+                # - 1 card, 1 long item (>40 chars) → simple-text
+                #   (single padded card with auto-wrap; the Phase 1.4
+                #   chunking heuristic is no longer needed because
+                #   simple-text handles wrapping by font_size + CJK width.)
+                # - 1 card, ≥2 items → bullet-list
+                #   (left color bar + vertical numbered items; reads as a
+                #   list, not as a 40-char-truncated card.)
+                # - ≥2 cards → 3-column-cards (existing behavior)
+                #
+                # The Phase 1.4 chunking that previously padded
+                # 3-column-cards with ~40-char chunks is removed: callers
+                # who actually want 3-column-cards now have ≥2 cards, and
+                # the long-text case is handed off to simple-text.
                 if not cards:
                     cards = [{
                         "title": "要点",
                         "color": "#1D2CAB",
                         "items": ["(待补充)"],
                     }]
-                spec = {
-                    "layout": layout,
-                    "spec": {"cards": cards},
-                    "bounds": body_bounds,
-                }
+                n_items_total = sum(len(c.get("items", [])) for c in cards)
+                if len(cards) == 1 and n_items_total == 1:
+                    long_text = cards[0]["items"][0]
+                    spec = {
+                        "layout": "simple-text",
+                        "bounds": body_bounds,
+                        "spec": {"text": long_text},
+                    }
+                elif len(cards) == 1 and n_items_total >= 2:
+                    spec = {
+                        "layout": "bullet-list",
+                        "bounds": body_bounds,
+                        "spec": {
+                            "items": cards[0].get("items", []),
+                            "color": cards[0].get("color", "#1D2CAB"),
+                        },
+                    }
+                else:
+                    # Multi-card fallback — keep the legacy 40-char
+                    # truncation per item so cards stay readable in
+                    # tile-row geometry. Tests cover this path.
+                    for c in cards:
+                        c["items"] = [
+                            it[:40] + ("…" if len(it) > 40 else "")
+                            for it in c.get("items", [])
+                        ]
+                    spec = {
+                        "layout": layout,
+                        "spec": {"cards": cards},
+                        "bounds": body_bounds,
+                    }
             inner = render_new_block(spec)
             svg_edits.write_new_content_block(
                 auth / cont_svg_name,
