@@ -3555,6 +3555,135 @@ class TestExpandWorkspaceMarkdownMeta(unittest.TestCase):
             self.assertIn('fill="#1D2CAB"', content_svg)
             self.assertIn('rx="8"', content_svg)
 
+    def test_bullet_list_layout_via_meta(self):
+        """Section with ``> **layout**: bullet-list`` + ``> **items**: a、b、c``
+        renders a color bar + numbered items in the cloned content SVG."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_workspace(td)
+            md = Path(td) / "m.md"
+            md.write_text(
+                "# 一、目的\n"
+                "> **layout**: bullet-list\n"
+                "> **items**: 采购效率、岗位职责、成本控制、流程规范\n"
+                "\n"
+                "body\n",
+                encoding="utf-8",
+            )
+            pl.expand_workspace_from_markdown(
+                ws, md,
+                skeleton_divider=3, skeleton_content=4,
+                divider_edits_template={"shape-4": "PART {nn}",
+                                        "shape-5": "{title}"},
+                content_edits_template={"shape-17": "{title}"},
+                exclude_source_slides=None,
+            )
+            content_svg = (
+                ws / "authoring-svg-flat" / "slide_part01_content.svg"
+            ).read_text(encoding="utf-8")
+            # bullet-list renders a 6px-wide color bar rect plus numbered
+            # text lines. Items string is split by Chinese 、 so 4 items
+            # become 4 numbered entries.
+            self.assertIn('width="6"', content_svg)
+            self.assertIn('1. ', content_svg)
+            self.assertIn('4. ', content_svg)
+            self.assertIn("采购效率", content_svg)
+
+
+class TestBlockRendererSimpleText(unittest.TestCase):
+    """Phase 3 (2026-09-16): simple-text layout.
+
+    2 cases:
+    - short text renders 1 line + 1 padded rect
+    - long text auto-wraps to multiple lines
+    """
+
+    def test_short_text_renders_single_line(self):
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        out = _render_new_block({
+            "layout": "simple-text",
+            "bounds": "120 130 1060 480",
+            "spec": {"text": "短文本"},
+        })
+        # 1 padded card rect + 1 <text> node for the single line.
+        self.assertEqual(out.count("<text "), 1)
+        self.assertEqual(out.count("<rect"), 1)
+        self.assertIn("短文本", out)
+
+    def test_long_text_wraps_to_multiple_lines(self):
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        # 200 CJK chars at 24pt across ~1060px inner width → 6+ lines.
+        long_text = "一二三四五六七八九十" * 20
+        out = _render_new_block({
+            "layout": "simple-text",
+            "bounds": "120 130 1060 480",
+            "spec": {"text": long_text},
+        })
+        self.assertGreaterEqual(
+            out.count("<text "), 3,
+            "long text should auto-wrap to ≥3 <text> nodes",
+        )
+        # The full text content is preserved across the wrapped lines.
+        self.assertIn("一二三", out)
+
+    def test_missing_text_raises(self):
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        with self.assertRaises(ValueError) as ctx:
+            _render_new_block({
+                "layout": "simple-text",
+                "bounds": "120 130 1060 480",
+                "spec": {},
+            })
+        self.assertIn("simple-text requires spec.text", str(ctx.exception))
+
+
+class TestBlockRendererBulletList(unittest.TestCase):
+    """Phase 3 (2026-09-16): bullet-list layout.
+
+    2 cases:
+    - 5 items render with the left color bar
+    - 11 items are capped at 10 (plan §3.1.2 cap)
+    """
+
+    def test_five_items_render_with_color_bar(self):
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        out = _render_new_block({
+            "layout": "bullet-list",
+            "bounds": "120 130 1060 480",
+            "spec": {"items": ["采购效率", "岗位职责", "成本控制",
+                                "流程规范", "风险防范"]},
+        })
+        # 5 numbered items + 1 color bar rect.
+        self.assertEqual(out.count("<text "), 5)
+        self.assertEqual(out.count("<rect"), 1)
+        # Color bar is 6px wide (left edge accent).
+        self.assertIn('width="6"', out)
+        # Each item is numbered.
+        self.assertIn("1. 采购效率", out)
+        self.assertIn("5. 风险防范", out)
+
+    def test_ten_items_capped_above_ten(self):
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        out = _render_new_block({
+            "layout": "bullet-list",
+            "bounds": "120 130 1060 480",
+            "spec": {"items": [f"item{i}" for i in range(11)]},
+        })
+        # 11 items → capped at 10 per plan §3.1.2.
+        self.assertEqual(out.count("<text "), 10)
+        self.assertIn("10. item9", out)
+        # item10 should NOT appear (index 10, would be "11. item10").
+        self.assertNotIn("11. item10", out)
+
+    def test_empty_items_raises(self):
+        from mcp_ppt_native_fill.pipeline import _render_new_block
+        with self.assertRaises(ValueError) as ctx:
+            _render_new_block({
+                "layout": "bullet-list",
+                "bounds": "120 130 1060 480",
+                "spec": {"items": []},
+            })
+        self.assertIn("bullet-list requires spec.items", str(ctx.exception))
+
 
 class TestExpandDividerExtras(unittest.TestCase):
     """Phase D: divider subtitle + exclude-source-slides opt-in params.

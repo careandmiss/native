@@ -23,6 +23,7 @@ Public API:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -433,5 +434,114 @@ def render_new_block(spec: dict[str, Any]) -> str:
                     f'text-anchor="middle" font-size="12" fill="#222">'
                     f'{escape(str(detail))}</text>'
                 )
+        return "\n".join(parts)
+    if layout == "simple-text":
+        # Phase 3 (2026-09-16): single padded card with auto-wrapping
+        # text. Used when the markdown author wants one block of prose
+        # (e.g. a policy statement) without numbered list or hero KPI.
+        # Replacement for the Phase 1.4 heuristic text-split in
+        # workspace_expand.py:189-229 — author explicitly opts in via
+        # ``> **layout**: simple-text`` instead of letting the heuristic
+        # decide.
+        text = payload.get("text", "")
+        if not isinstance(text, str) or not text:
+            raise ValueError("simple-text requires spec.text (non-empty string)")
+        bounds = spec.get("bounds") or payload.get("bounds")
+        bx, by, bw, bh = (float(t) for t in bounds.split())
+        padding = 24.0
+        inner_w = bw - 2 * padding
+        # CJK-aware line fitting: chars_that_fit does a binary search
+        # against both a CJK sample and a Latin sample and returns the
+        # more restrictive cap. This avoids the fixed 1.0em/char
+        # heuristic in plan §3.1.2 which over-estimates for Latin text.
+        from .text_width import chars_that_fit
+        font_size = 24.0
+        chars_per_line = chars_that_fit(inner_w, font_size)
+        if chars_per_line <= 0:
+            raise ValueError(
+                f"simple-text bounds too narrow for font_size={font_size} "
+                f"(inner_w={inner_w:g})"
+            )
+        # Auto-wrap by chars_per_line (CJK-dominant cap is the safer
+        # estimate). For Latin text this leaves whitespace ragged on
+        # the right edge; matching plan §3.1.2 spec — caller's
+        # alternative is bullet-list for itemized content.
+        lines = [text[i:i + chars_per_line]
+                 for i in range(0, len(text), chars_per_line)]
+        # Bug 12-style font shrink: if the line count exceeds what fits
+        # in bh (estimate bh/(font_size*1.4) usable lines), shrink
+        # font_size proportionally down to MIN_READABLE_FONT=14.
+        usable_lines = max(1.0, (bh - 2 * padding) / (font_size * 1.4))
+        while len(lines) > usable_lines and font_size > 14.0:
+            font_size = max(14.0, font_size - 2.0)
+            chars_per_line = chars_that_fit(inner_w, font_size)
+            if chars_per_line <= 0:
+                break
+            lines = [text[i:i + chars_per_line]
+                     for i in range(0, len(text), chars_per_line)]
+            usable_lines = max(1.0, (bh - 2 * padding) / (font_size * 1.4))
+        parts: list[str] = [
+            f'<rect x="{bx:g}" y="{by:g}" width="{bw:g}" height="{bh:g}" '
+            f'rx="8" fill="#1D2CAB" fill-opacity="0.08"/>'
+        ]
+        for i, line in enumerate(lines):
+            ty = by + padding + font_size * (i + 1)
+            if ty > by + bh - 8:
+                break
+            parts.append(
+                f'<text x="{bx + padding:g}" y="{ty:g}" '
+                f'font-size="{font_size:g}" fill="#222">'
+                f'{escape(line)}</text>'
+            )
+        return "\n".join(parts)
+    if layout == "bullet-list":
+        # Phase 3 (2026-09-16): left color bar + vertical numbered list.
+        # Use when the markdown author has 2-10 enumerated items that
+        # need vertical stacking (vs the horizontal flow-steps which
+        # maxes out at 5).
+        items = coerce_str_list(payload.get("items"))
+        if not items:
+            raise ValueError("bullet-list requires spec.items (non-empty list)")
+        # Accept a single string with separator punctuation by splitting
+        # on the same delimiters Phase 2 uses for meta "items" lists
+        # (、，,;；, /). Without this, markdown authors would have to
+        # write JSON-style arrays which doesn't match prose conventions.
+        if len(items) == 1 and isinstance(items[0], str):
+            raw = items[0]
+            if any(sep in raw for sep in ("、", "，", ",", ";", "；", "/", "\n")):
+                items = [
+                    s.strip() for s in re.split(r"[、,,;;/\\n]+", raw)
+                    if s.strip()
+                ]
+        if len(items) > 10:
+            items = items[:10]  # Cap at 10 per plan §3.1.2
+        color = payload.get("color", "#1D2CAB")
+        if not isinstance(color, str) or not color:
+            color = "#1D2CAB"
+        bounds = spec.get("bounds") or payload.get("bounds")
+        bx, by, bw, bh = (float(t) for t in bounds.split())
+        # Adaptive line height: 30px max, scale down for many items so
+        # the whole list fits. 40px top/bottom reserved for the bar +
+        # breathing room.
+        line_h = min(30.0, (bh - 40.0) / max(1, len(items)))
+        parts: list[str] = [
+            # Left color bar (6px wide).
+            f'<rect x="{bx:g}" y="{by:g}" width="6" height="{bh:g}" '
+            f'fill="{escape(color)}"/>'
+        ]
+        for i, item in enumerate(items):
+            ty = by + 30.0 + line_h * i
+            # Overflow guard (same pattern as 3-column-cards line 122):
+            # skip items that would fall past the bounds bottom.
+            if ty > by + bh - 8:
+                break
+            # 40-char truncation per item (matches
+            # workspace_expand.py:233 behavior so 3-column-cards and
+            # bullet-list look consistent on the same content).
+            display = item[:40] + ("…" if len(item) > 40 else "")
+            parts.append(
+                f'<text x="{bx + 24:g}" y="{ty:g}" font-size="16" '
+                f'fill="#222">{i + 1}. {escape(display)}</text>'
+            )
         return "\n".join(parts)
     raise ValueError(f"unsupported new_content_block layout: {layout!r}")
