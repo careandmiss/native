@@ -66,10 +66,14 @@ def escape(text: str) -> str:
 def render_new_block(spec: dict[str, Any]) -> str:
     """Render a ``new_content_block`` spec into raw SVG children.
 
-    Supports four layouts: ``"raw"`` (caller supplied SVG),
+    Supports the layouts: ``"raw"`` (caller supplied SVG),
     ``"3-column-cards"`` (tile row), ``"flow-steps"`` (numbered
-    horizontal flow), and ``"revision-table"`` (header + rows). Anything
-    else raises.
+    horizontal flow), ``"revision-table"`` (header + rows),
+    ``"hero-number"``, ``"callout-box"``, ``"two-column-compare"``,
+    ``"timeline"``, ``"simple-text"``, ``"bullet-list"``,
+    ``"statement-caption"``, ``"procedural-steps"``,
+    ``"three-thesis-cards"``, ``"hero_statement"``, ``"kpi_row"``.
+    Anything else raises.
 
     Layout-specific spec keys are nested under ``spec["spec"]`` when the
     caller uses the planner shape; the helper accepts both forms so
@@ -188,8 +192,22 @@ def render_new_block(spec: dict[str, Any]) -> str:
             raise ValueError("revision-table requires spec.rows")
         bounds = spec.get("bounds") or payload.get("bounds")
         bx, by, bw, bh = (float(t) for t in bounds.split())
-        # Columns: date / status / content / author (4 columns)
-        col_w = bw / 4
+        # Phase 8 (2026-09-16): variable column count. Boteng's 附件
+        # section ships a 6-column revision table (日期 / 状态 /
+        # 修改内容 / 修改人 / 审核人 / 批准人) — we now size columns
+        # by the actual key set in the first non-empty row, falling
+        # back to the historical 4-column defaults if the rows are
+        # all empty or use the legacy keys.
+        keys = ("date", "status", "content", "author")
+        # If a non-empty row exposes extra cols, widen the key list.
+        for r in rows:
+            if isinstance(r, dict):
+                for k in r.keys():
+                    if k not in keys:
+                        keys = keys + (k,)
+                break
+        n_cols = len(keys)
+        col_w = bw / n_cols
         row_h = min(28.0, (bh - 32) / max(len(rows), 1))
         parts: list[str] = []
         # Header background.
@@ -197,18 +215,32 @@ def render_new_block(spec: dict[str, Any]) -> str:
             f'<rect x="{bx:g}" y="{by:g}" width="{bw:g}" height="28" '
             f'fill="#1D2CAB" fill-opacity="0.08"/>'
         )
-        for j, header in enumerate(("日期", "状态", "内容", "修改人")):
+        # Header text: prefer caller-supplied ``header`` map; otherwise
+        # synthesize from the key names (date→日期 etc.).
+        header_map = payload.get("headers") or {
+            "date": "日期",
+            "status": "状态",
+            "content": "内容",
+            "author": "修改人",
+            "reviewer": "审核人",
+            "approver": "批准人",
+            "col3": "内容",
+            "col4": "修改人",
+            "col5": "审核人",
+            "col6": "批准人",
+        }
+        for j, key in enumerate(keys):
             parts.append(
                 f'<text x="{bx + j * col_w + 12:g}" y="{by + 19:g}" '
                 f'font-size="13" font-weight="bold" fill="#1D2CAB">'
-                f'{escape(header)}</text>'
+                f'{escape(header_map.get(key, key))}</text>'
             )
         # Rows.
         for i, row in enumerate(rows):
             ry = by + 32 + i * row_h
             if ry + row_h > by + bh:
                 break  # bounds budget exhausted
-            for j, key in enumerate(("date", "status", "content", "author")):
+            for j, key in enumerate(keys):
                 raw_val = row.get(key, "")
                 # Bug 10 fix: list values now render as multiple <tspan>
                 # lines (one per item) instead of "; "-joined into a
@@ -791,5 +823,162 @@ def render_new_block(spec: dict[str, Any]) -> str:
                     f'<text x="{cx + 24:g}" y="{ty:g}" font-size="18" '
                     f'fill="#1E293B">{escape(item[:48])}</text>'
                 )
+        return "\n".join(parts)
+    if layout == "hero_statement":
+        # ppt-master analog: hero_statement (single dominant claim at
+        # ~80pt, centered). Phase 8 (2026-09-16): bridges the visual
+        # gap between simple-text (≤40 char, flat) and statement-caption
+        # (≥80 char, split-rail). Trigger: 20-79 char single sentence.
+        # Background is a soft tint panel so the page reads as a
+        # "feature claim" rather than a flat text card.
+        from .text_width import chars_that_fit
+        headline = payload.get("headline", "")
+        eyebrow = payload.get("eyebrow", "")
+        subline = payload.get("subline", "")
+        if not isinstance(headline, str) or not headline:
+            raise ValueError("hero_statement requires spec.headline")
+        if len(headline) > 32:
+            raise ValueError(
+                f"hero_statement headline too long (max 32 chars, "
+                f"got {len(headline)})"
+            )
+
+        bounds = spec.get("bounds") or payload.get("bounds")
+        bx, by, bw, bh = (float(t) for t in bounds.split())
+        cx = bx + bw / 2.0
+
+        parts: list[str] = []
+        # 1. Soft tint background panel (full bounds, rx=12).
+        parts.append(
+            f'<rect x="{bx:g}" y="{by:g}" width="{bw:g}" '
+            f'height="{bh:g}" rx="12" fill="#F4F6F8"/>'
+        )
+        # 2. Eyebrow (optional small label, top-left, letter-spaced).
+        if eyebrow:
+            parts.append(
+                f'<text x="{bx + 32:g}" y="{by + 36:g}" font-size="14" '
+                f'font-weight="500" fill="#64748B" letter-spacing="1.2">'
+                f'{escape(eyebrow.upper()[:20])}</text>'
+            )
+        # 3. Headline (centered, 68px bold ink, auto-shrink to 14px min
+        #    if headline overflows the panel).
+        font_size = 68.0
+        max_chars = chars_that_fit(bw - 64.0, font_size)
+        if max_chars <= 0:
+            raise ValueError(
+                f"hero_statement bounds too narrow for font_size="
+                f"{font_size} (bw={bw:g})"
+            )
+        # Auto-shrink if headline is longer than fit-at-default.
+        while len(headline) > max_chars and font_size > 14.0:
+            font_size -= 2.0
+            max_chars = chars_that_fit(bw - 64.0, font_size)
+            if max_chars <= 0:
+                break
+        # Wrap into at most 2 lines using CJK char count.
+        if len(headline) > max_chars and max_chars > 0:
+            mid = len(headline) // 2
+            line1 = headline[:mid]
+            line2 = headline[mid:]
+            lines = [line1, line2]
+        else:
+            lines = [headline]
+        headline_y = by + bh * 0.45
+        for i, line in enumerate(lines):
+            ly = headline_y + i * (font_size + 8)
+            if ly > by + bh - 32:
+                break
+            parts.append(
+                f'<text x="{cx:g}" y="{ly:g}" text-anchor="middle" '
+                f'font-size="{font_size:g}" font-weight="700" '
+                f'fill="#1E293B">{escape(line)}</text>'
+            )
+        # 4. Subline (optional, centered, 18px body).
+        if subline:
+            sub_y = headline_y + len(lines) * (font_size + 8) + 28.0
+            if sub_y <= by + bh - 16:
+                parts.append(
+                    f'<text x="{cx:g}" y="{sub_y:g}" text-anchor="middle" '
+                    f'font-size="18" fill="#64748B">{escape(subline)}</text>'
+                )
+        return "\n".join(parts)
+    if layout == "kpi_row":
+        # ppt-master analog: kpi_row (report_core) / kpi_dashboard
+        # (presentation_core). Phase 8 (2026-09-16): N=2-5 evenly-spaced
+        # keyword tiles with an evidence panel below. Trigger: short
+        # keyword-style items (each ≤12 chars) where the page reads as
+        # a list of "本页要点" rather than a paragraph.
+        tiles = payload.get("tiles") or []
+        if not 2 <= len(tiles) <= 5:
+            raise ValueError(
+                f"kpi_row requires 2-5 tiles (got {len(tiles)})"
+            )
+        eyebrow = payload.get("eyebrow", "")
+        evidence = payload.get("evidence", "")
+
+        bounds = spec.get("bounds") or payload.get("bounds")
+        bx, by, bw, bh = (float(t) for t in bounds.split())
+
+        GAP = 20.0
+        TILE_H = 200.0
+        n = len(tiles)
+        tile_w = (bw - GAP * (n - 1)) / n
+        tile_y = by + (40.0 if eyebrow else 0.0)
+
+        parts: list[str] = []
+        # Eyebrow (top-left, letter-spaced).
+        if eyebrow:
+            parts.append(
+                f'<text x="{bx:g}" y="{by + 24:g}" font-size="14" '
+                f'font-weight="500" fill="#64748B" letter-spacing="1.2">'
+                f'{escape(eyebrow.upper()[:20])}</text>'
+            )
+
+        # Tiles row.
+        for i, tile in enumerate(tiles):
+            tx = bx + i * (tile_w + GAP)
+            parts.append(
+                f'<rect x="{tx:g}" y="{tile_y:g}" width="{tile_w:g}" '
+                f'height="{TILE_H:g}" rx="8" fill="#FFFFFF" '
+                f'stroke="#D6DCE3" stroke-width="1"/>'
+            )
+            # Keyword (40px ink, top-left of tile).
+            keyword = tile.get("keyword", "")
+            if keyword:
+                parts.append(
+                    f'<text x="{tx + 24:g}" y="{tile_y + 60:g}" '
+                    f'font-size="40" font-weight="700" fill="#1E293B">'
+                    f'{escape(str(keyword)[:12])}</text>'
+                )
+            # Descriptor (14px body, below keyword).
+            descriptor = tile.get("descriptor", "")
+            if descriptor:
+                parts.append(
+                    f'<text x="{tx + 24:g}" y="{tile_y + 92:g}" '
+                    f'font-size="14" fill="#64748B">'
+                    f'{escape(str(descriptor)[:48])}</text>'
+                )
+            # Value (18px muted, bottom of tile).
+            value = tile.get("value", "")
+            if value:
+                parts.append(
+                    f'<text x="{tx + 24:g}" y="{tile_y + TILE_H - 24:g}" '
+                    f'font-size="18" font-weight="500" fill="#64748B">'
+                    f'{escape(str(value)[:24])}</text>'
+                )
+
+        # Evidence panel (below tiles, full width, tinted).
+        ev_y = tile_y + TILE_H + 24.0
+        ev_h = by + bh - ev_y - 8.0
+        if evidence and ev_h >= 60.0:
+            parts.append(
+                f'<rect x="{bx:g}" y="{ev_y:g}" width="{bw:g}" '
+                f'height="{ev_h:g}" rx="12" fill="#F4F6F8"/>'
+            )
+            parts.append(
+                f'<text x="{bx + 24:g}" y="{ev_y + 36:g}" font-size="16" '
+                f'font-weight="500" fill="#1E293B">'
+                f'{escape(evidence[:200])}</text>'
+            )
         return "\n".join(parts)
     raise ValueError(f"unsupported new_content_block layout: {layout!r}")

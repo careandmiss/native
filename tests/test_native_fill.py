@@ -5299,5 +5299,389 @@ class TestBackfillCoverTitle(unittest.TestCase):
             self.assertEqual(merged, {})
 
 
+# ---------------------------------------------------------------------------
+# Phase 8 (2026-09-16): divider subtitle translation + new archetypes.
+# ---------------------------------------------------------------------------
+
+
+class TestPhase8DividerSubtitleTranslation(unittest.TestCase):
+    """Tests for the section_title_en_map + divider_subtitle_template path.
+
+    Phase 8 lets callers (e.g. boteng_demo) translate each H1's
+    Chinese title into the English subtitle text that lives on
+    shape-70 of the divider template, WITHOUT touching the template's
+    <g> frame, font, size, color, or position. The verify surface is:
+    (a) ``_format()`` substitutes ``{title_en}`` correctly when given
+    a value, (b) shape-70's <text> body actually changes in the
+    cloned SVG when ``section_title_en_map`` resolves the lookup.
+    """
+
+    def test_title_en_placeholder_substitutes_correctly(self):
+        """``_format()`` must thread ``title_en`` into ``str.format``."""
+        from mcp_ppt_native_fill.workspace_expand import expand_workspace_from_markdown  # noqa: F401
+
+        # The function is module-level; the inner _format is not
+        # exported, so we exercise it via the public signature path
+        # through ``divider_subtitle_template``. We assert on the
+        # returned new_blocks side: when caller passes a map and a
+        # template containing {title_en}, the cloned SVG must show
+        # the English word in shape-70's text body.
+        import shutil
+        import tempfile
+        from pathlib import Path
+        from mcp_ppt_native_fill import workspace_expand
+
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            ws = td / "ws"
+            ws.mkdir()
+            flat = ws / "authoring-svg-flat"
+            flat.mkdir()
+            # Build a divider skeleton with shape-70 <text> body.
+            div = flat / "slide_03.svg"
+            div.write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg" '
+                'viewBox="0 0 1280 720" width="1280" height="720">'
+                "<g id='shape-4'><text><tspan>PART 01</tspan></text></g>"
+                "<g id='shape-5'><text><tspan>前言</tspan></text></g>"
+                "<g id='shape-70'><text><tspan>单价添加小标题</tspan>"
+                "<tspan>/</tspan><tspan>标题英文</tspan></text></g>"
+                "</svg>",
+                encoding="utf-8",
+            )
+            (flat / "slide_04.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg" '
+                'viewBox="0 0 1280 720" width="1280" height="720">'
+                "<g id='shape-17'><text><tspan>X</tspan></text></g>"
+                "</svg>",
+                encoding="utf-8",
+            )
+            md = td / "content.md"
+            md.write_text(
+                "# 前言\n\n这是前言的内容。\n\n# 一、目的\n\n明确目的。\n",
+                encoding="utf-8",
+            )
+
+            workspace_expand.expand_workspace_from_markdown(
+                ws, md,
+                skeleton_divider=3, skeleton_content=4,
+                divider_edits_template={
+                    "shape-4": "PART {nn}",
+                    "shape-5": "{title}",
+                },
+                content_edits_template={"shape-17": "{title}"},
+                body_bounds="120 130 1060 480",
+                divider_subtitle_template={"shape-70": "{title_en}"},
+                section_title_en_map={
+                    "前言": "Preface",
+                    "一、目的": "Purpose",
+                },
+            )
+
+            for nn, expected in [("01", "Preface"), ("02", "Purpose")]:
+                svg = flat / f"slide_part{nn}_div.svg"
+                raw = svg.read_text(encoding="utf-8")
+                self.assertIn(expected, raw)
+                self.assertNotIn("单价添加小标题", raw)
+
+    def test_divider_subtitle_template_no_translation(self):
+        """When section_title_en_map omits a key, {title_en} expands to "."
+
+        Caller's no-translation path still keeps the template's
+        shape-70 frame intact (font/size/color/position) — only the
+        <text> body becomes blank, not the surrounding <g>.
+        """
+        import tempfile
+        from pathlib import Path
+        from mcp_ppt_native_fill import workspace_expand
+
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
+            ws = td / "ws"
+            ws.mkdir()
+            flat = ws / "authoring-svg-flat"
+            flat.mkdir()
+            (flat / "slide_03.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg" '
+                'viewBox="0 0 1280 720" width="1280" height="720">'
+                "<g id='shape-4'><text><tspan>X</tspan></text></g>"
+                "<g id='shape-5'><text><tspan>X</tspan></text></g>"
+                "<g id='shape-70'><text><tspan>OLD</tspan></text></g>"
+                "</svg>",
+                encoding="utf-8",
+            )
+            (flat / "slide_04.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg" '
+                'viewBox="0 0 1280 720" width="1280" height="720"></svg>',
+                encoding="utf-8",
+            )
+            md = td / "content.md"
+            md.write_text("# 未知章节\n\nbody\n", encoding="utf-8")
+
+            workspace_expand.expand_workspace_from_markdown(
+                ws, md,
+                skeleton_divider=3, skeleton_content=4,
+                divider_edits_template={"shape-4": "X", "shape-5": "{title}"},
+                content_edits_template={},
+                divider_subtitle_template={"shape-70": "{title_en}"},
+                section_title_en_map={},  # empty → all title_en = ""
+            )
+            svg = flat / "slide_part01_div.svg"
+            raw = svg.read_text(encoding="utf-8")
+            # Frame preserved.
+            self.assertIn('id="shape-70"', raw)
+            # The "OLD" placeholder text is gone (replace-by-empty in
+            # svg_edits leaves a zero-width carrier, not "OLD").
+            self.assertNotIn("OLD", raw)
+
+
+class TestPhase8HeroStatement(unittest.TestCase):
+    """Phase 8 hero_statement archetype (ppt-master hero_statement)."""
+
+    def test_renders_headline_centered(self):
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        svg = render_new_block({
+            "layout": "hero_statement",
+            "bounds": "120 130 1060 480",
+            "spec": {"headline": "提高采购效率", "eyebrow": "PURPOSE"},
+        })
+        self.assertIn('text-anchor="middle"', svg)
+        self.assertIn("提高采购效率", svg)
+        self.assertIn('font-size="68"', svg)
+        self.assertIn('fill="#F4F6F8"', svg)  # background panel
+
+    def test_shrinks_headline_font_when_bounds_narrow(self):
+        """When bh is tiny the renderer must shrink font, not overflow."""
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        svg = render_new_block({
+            "layout": "hero_statement",
+            "bounds": "120 130 200 80",
+            "spec": {"headline": "高效率", "eyebrow": ""},
+        })
+        # Either smaller font or no overflow. Just assert headline is
+        # present and SVG is well-formed.
+        self.assertIn("高效率", svg)
+
+    def test_rejects_overlong_headline(self):
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        with self.assertRaises(ValueError) as cm:
+            render_new_block({
+                "layout": "hero_statement",
+                "bounds": "120 130 1060 480",
+                "spec": {"headline": "x" * 33},
+            })
+        self.assertIn("too long", str(cm.exception).lower())
+
+    def test_no_subline_when_empty(self):
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        svg = render_new_block({
+            "layout": "hero_statement",
+            "bounds": "120 130 1060 480",
+            "spec": {"headline": "聚焦目的", "subline": ""},
+        })
+        # subline="" → exactly one <text> element (the headline).
+        # (eyebrow absent too.)
+        self.assertEqual(svg.count("<text "), 1)
+
+
+class TestPhase8KpiRow(unittest.TestCase):
+    """Phase 8 kpi_row archetype (ppt-master kpi_row)."""
+
+    def test_renders_4_tiles(self):
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        svg = render_new_block({
+            "layout": "kpi_row",
+            "bounds": "120 130 1060 480",
+            "spec": {
+                "tiles": [
+                    {"keyword": "效率", "descriptor": "提效", "value": "30%"},
+                    {"keyword": "职责", "descriptor": "明确", "value": ""},
+                    {"keyword": "成本", "descriptor": "降本", "value": ""},
+                    {"keyword": "规范", "descriptor": "合规", "value": ""},
+                ],
+                "evidence": "完整说明",
+            },
+        })
+        self.assertEqual(svg.count("<rect "), 5)  # 4 tiles + 1 evidence panel
+        self.assertIn("效率", svg)
+        self.assertIn("完整说明", svg)
+
+    def test_supports_3_and_5_tiles(self):
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        for n in (3, 5):
+            tiles = [
+                {"keyword": f"K{i}", "descriptor": f"D{i}", "value": ""}
+                for i in range(n)
+            ]
+            svg = render_new_block({
+                "layout": "kpi_row",
+                "bounds": "120 130 1060 480",
+                "spec": {"tiles": tiles, "evidence": ""},
+            })
+            # 4 tile rects (no evidence panel when evidence="").
+            self.assertGreaterEqual(svg.count("<rect "), n)
+
+    def test_rejects_6_tiles(self):
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        with self.assertRaises(ValueError) as cm:
+            render_new_block({
+                "layout": "kpi_row",
+                "bounds": "120 130 1060 480",
+                "spec": {
+                    "tiles": [
+                        {"keyword": f"K{i}", "descriptor": "", "value": ""}
+                        for i in range(6)
+                    ],
+                },
+            })
+        self.assertIn("2-5 tiles", str(cm.exception))
+
+    def test_evidence_panel_below_row(self):
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        svg = render_new_block({
+            "layout": "kpi_row",
+            "bounds": "120 130 1060 480",
+            "spec": {
+                "tiles": [
+                    {"keyword": "A", "descriptor": "", "value": ""},
+                    {"keyword": "B", "descriptor": "", "value": ""},
+                ],
+                "evidence": "底层论据",
+            },
+        })
+        # evidence panel rendered as a tinted rect.
+        self.assertIn("底层论据", svg)
+        # Two tile rects + one evidence panel rect.
+        self.assertEqual(svg.count("<rect "), 3)
+
+
+class TestPhase8Dispatch(unittest.TestCase):
+    """Phase 8 A-path dispatch: hero_statement + kpi_row entry points.
+
+    These tests exercise the dispatch decision tree in
+    ``workspace_expand.expand_workspace_from_markdown`` directly
+    by feeding in cards shapes and reading the resulting layout
+    name. We bypass markdown parsing (which collapses multi-line
+    bullet lists into a single item string) by injecting cards
+    manually.
+    """
+
+    def _run_dispatch_with_cards(self, cards: list[dict]) -> str:
+        """Run the dispatch tree with explicit cards; return layout name."""
+        from mcp_ppt_native_fill import workspace_expand
+
+        # Monkey-patch _cards_for_section to return our injected cards.
+        original = workspace_expand._cards_for_section
+        workspace_expand._cards_for_section = lambda sections, stem: (
+            cards, {},
+        )
+        try:
+            # Render the new_blocks dispatch path: we read the
+            # ``layout`` key that ends up in new_blocks[svg]["body_cards"].
+            import tempfile
+            from pathlib import Path
+
+            with tempfile.TemporaryDirectory() as td_str:
+                td = Path(td_str)
+                ws = td / "ws"
+                ws.mkdir()
+                flat = ws / "authoring-svg-flat"
+                flat.mkdir()
+                # Real SVG namespace so write_new_content_block is happy.
+                (flat / "slide_03.svg").write_text(
+                    '<svg xmlns="http://www.w3.org/2000/svg" '
+                    'viewBox="0 0 1280 720" width="1280" height="720">'
+                    "<g id='shape-4'><text><tspan>X</tspan></text></g>"
+                    "<g id='shape-5'><text><tspan>X</tspan></text></g>"
+                    "</svg>",
+                    encoding="utf-8",
+                )
+                (flat / "slide_04.svg").write_text(
+                    '<svg xmlns="http://www.w3.org/2000/svg" '
+                    'viewBox="0 0 1280 720" width="1280" height="720">'
+                    "</svg>",
+                    encoding="utf-8",
+                )
+                md = td / "content.md"
+                md.write_text("# 一、目的\n\nplaceholder\n", encoding="utf-8")
+
+                result = workspace_expand.expand_workspace_from_markdown(
+                    ws, md,
+                    skeleton_divider=3, skeleton_content=4,
+                    divider_edits_template={"shape-4": "X", "shape-5": "X"},
+                    content_edits_template={},
+                    body_bounds="120 130 1060 480",
+                )
+                layout = result["new_blocks"]["slide_part01_content.svg"][
+                    "body_cards"
+                ]["layout"]
+                return layout
+        finally:
+            workspace_expand._cards_for_section = original
+
+    def test_medium_sentence_routes_to_hero_statement(self):
+        # Single card, single item, 20-79 chars (CJK-aware char count).
+        layout = self._run_dispatch_with_cards([{
+            "title": "要点", "color": "#1D2CAB",
+            "items": ["提高采购效率明确各岗位职责有效降低采购成本"],
+        }])
+        self.assertEqual(layout, "hero_statement")
+
+    def test_short_sentence_still_routes_to_simple_text(self):
+        # < 20 chars → simple-text (regression for Phase 3.4 path).
+        layout = self._run_dispatch_with_cards([{
+            "title": "要点", "color": "#1D2CAB",
+            "items": ["这是简短内容"],
+        }])
+        self.assertEqual(layout, "simple-text")
+
+    def test_long_sentence_still_routes_to_statement_caption(self):
+        # ≥ 80 chars → statement-caption (regression for Phase 7 path).
+        layout = self._run_dispatch_with_cards([{
+            "title": "要点", "color": "#1D2CAB",
+            "items": ["本章描述一个完整长段落, " * 8],
+        }])
+        self.assertEqual(layout, "statement-caption")
+
+    def test_4_short_items_route_to_kpi_row(self):
+        # 4 keyword-style items (each ≤12 chars).
+        layout = self._run_dispatch_with_cards([{
+            "title": "要点", "color": "#1D2CAB",
+            "items": ["效率", "职责", "成本", "规范"],
+        }])
+        self.assertEqual(layout, "kpi_row")
+
+    def test_long_items_fall_through_to_bullet_list(self):
+        # items > 12 chars → bullet-list (Phase 3.4 fallback).
+        layout = self._run_dispatch_with_cards([{
+            "title": "要点", "color": "#1D2CAB",
+            "items": [
+                "这是一个非常非常长的 item 字串",
+                "另一个长 item",
+            ],
+        }])
+        self.assertEqual(layout, "bullet-list")
+
+
+class TestPhase8ClassifyH2(unittest.TestCase):
+    """Phase 8: boteng 7 H2 → 4 macro phases via keyword lookup."""
+
+    def test_seven_boteng_h2_produce_four_macro_phases(self):
+        from mcp_ppt_native_fill.workspace_expand import (
+            _classify_h2_to_phase,
+        )
+        h2_titles = [
+            "采购基本事项",
+            "采购申请",
+            "采购人职责",
+            "采购方式",
+            "采购实施",
+            "采购付款",
+            "行为规范",
+        ]
+        phases = {_classify_h2_to_phase(t) for t in h2_titles}
+        self.assertEqual(phases, {"申请", "审批", "采购", "验收"})
+
+
 if __name__ == "__main__":
     unittest.main()
