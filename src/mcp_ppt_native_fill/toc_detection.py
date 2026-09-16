@@ -590,31 +590,95 @@ def cards_for_section(
 def cards_from_body(body: str) -> list[dict[str, Any]]:
     """Convert a markdown body into 2-3 cards: one ``要点`` card from
     the first paragraph, then split any ``1. xxx / 2. yyy`` numbered
-    list into additional cards. Truncate each item to a sane length."""
+    list into additional cards. Truncate each item to a sane length.
+
+    Phase 1.1 (2026-09-16): widened the first-card truncation from 60 to
+    200 characters so single-paragraph chapters (e.g. ``前言`` ~140 chars)
+    keep their full context in the rendered SVG. The downstream
+    ``3-column-cards`` layout was already truncating again to 40 chars per
+    item inside ``workspace_expand.py`` (see ``cards_for_section`` loop
+    there), so widening this limit does not break visual balance.
+    """
     if not body:
         return []
     cards: list[dict[str, Any]] = []
     colors = ["#1D2CAB", "#EE822F", "#75BD42"]
 
-    # First card: first paragraph (≥ 1 line, ≤ 60 chars).
+    # First card: first paragraph (≥ 1 line, ≤ 200 chars after Phase 1.1).
+    # Phase 1.2/1.3 (2026-09-16): paragraphs whose first line is an ``##``
+    # heading are H2 sub-sections, owned by the sub-cards block below.
+    # They are excluded from the "first card" / "list items" extraction so
+    # their content isn't double-counted.
     paragraphs = [p.strip() for p in body.split("\n\n") if p.strip()]
-    if paragraphs:
-        first = paragraphs[0]
+    h2_re = re.compile(r"^##\s+(.+)$")
+    h2_paragraph_idxs: set[int] = set()
+    for i, p in enumerate(paragraphs):
+        first_line = p.splitlines()[0].strip() if p.splitlines() else ""
+        if h2_re.match(first_line):
+            h2_paragraph_idxs.add(i)
+    non_h2_paragraphs = [
+        p for i, p in enumerate(paragraphs) if i not in h2_paragraph_idxs
+    ]
+    if non_h2_paragraphs:
+        first = non_h2_paragraphs[0]
         # Strip leading "# " / leading numbered list prefix.
         first = re.sub(r"^#\s+", "", first)
         first = re.sub(r"^[\d一二三四五六七八九十]+[、.]\s*", "", first)
         cards.append({
             "title": "要点",
             "color": colors[0],
-            "items": [first[:60] + ("…" if len(first) > 60 else "")],
+            "items": [first[:200] + ("…" if len(first) > 200 else "")],
         })
 
-    # Additional cards: numbered list ``1. xxx`` items.
+    # Phase 1.2 (2026-09-16): H2 sub-section identification. Slides whose
+    # body contains ``## （一）xxx`` style subsections get one extra card
+    # per H2, with the H2 title as the card title and the numbered list
+    # items below it as the card items. This fills the body for slides
+    # that have NO top-level numbered list but DO have H2 subsections.
     list_re = re.compile(r"^([\d]+)[、.]\s*(.+)$")
+    sub_cards: list[dict[str, Any]] = []
+    for i in h2_paragraph_idxs:
+        p = paragraphs[i]
+        lines = p.splitlines()
+        if not lines:
+            continue
+        h2m = h2_re.match(lines[0].strip())
+        if not h2m:
+            continue
+        sub_title = h2m.group(1).strip()
+        # Strip bold markers (``**xxx**``) so the card title doesn't show asterisks.
+        sub_title = sub_title.replace("**", "").strip()
+        items: list[str] = []
+        for line in lines[1:]:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            lm = list_re.match(line)
+            if lm:
+                txt = lm.group(2).strip()
+                items.append(txt[:30] + ("…" if len(txt) > 30 else ""))
+        if items:
+            # Color cycles with current card count so duplicates don't share color.
+            color = colors[(len(cards) + len(sub_cards)) % 3]
+            sub_cards.append({
+                "title": sub_title[:12],   # Phase 1.2 widened from earlier truncation
+                "color": color,
+                "items": items[:4],
+            })
+
+    # Append at most 2 H2 sub-cards (renderer supports 1-4 cards per row).
+    cards.extend(sub_cards[:2])
+
+    # Additional cards: numbered list ``1. xxx`` items.
+    # Phase 1.3 (2026-09-16): also scan paragraphs[0] (non-H2 path) so numbered
+    # items embedded in the first paragraph are captured. H2 paragraphs
+    # are already excluded (Phase 1.2 owns their items).
     list_items: list[str] = []
-    for p in paragraphs[1:]:
+    for p in non_h2_paragraphs:
         for line in p.splitlines():
             line = line.strip()
+            if line.startswith("#"):
+                continue
             lm = list_re.match(line)
             if lm:
                 list_items.append(lm.group(2).strip())
@@ -635,8 +699,10 @@ def cards_from_body(body: str) -> list[dict[str, Any]]:
                           for it in list_items[half:half + 4]],
             })
 
-    # Trim to 3 cards max (renderer supports 1-4, but 3 keeps visual balance).
-    return cards[:3]
+    # Trim to 4 cards max (Phase 1.2: renderer ``3-column-cards`` supports
+    # 1-4 cards; lifted cap from 3 so H2 sub-cards + numbered list cards
+    # can coexist on the same slide, e.g. ``四、工作程序``).
+    return cards[:4]
 
 
 def fill_missing_content_blocks(

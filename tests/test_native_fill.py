@@ -3314,6 +3314,69 @@ class TestSplitMarkdownSections(unittest.TestCase):
         self.assertEqual(sections[1]["title"], "二、适用范围")
 
 
+class TestCardsFromBodyImprovements(unittest.TestCase):
+    """Phase 1 (2026-09-16): cards_from_body improvements for empty-slide fill.
+
+    4 cases covering:
+    - 200-char truncation widening (was 60)
+    - H2 sub-section identification
+    - paragraph internal numbered item recursion (with H2 dedup)
+    - H2 sub-card count cap (≤ 2)
+    """
+
+    def test_first_card_truncates_at_200(self):
+        # ~280-char paragraph (each repeat is 17 Chinese chars) → first
+        # item is first[:200] + "…" = 201 chars total.
+        long_para = "公司规章制度是保障公司运营的工具，" * 17  # 289 chars
+        cards = pl._cards_from_body(long_para)
+        self.assertEqual(len(cards), 1)
+        first_item = cards[0]["items"][0]
+        self.assertTrue(first_item.endswith("…"))
+        self.assertEqual(len(first_item), 201)
+
+    def test_h2_subsection_becomes_sub_card(self):
+        # H2 title + numbered items in the SAME paragraph block (no \n\n
+        # between H2 title and items). Body splits into one paragraph:
+        #   lines = ["## （一）xxx", "1. 研发...", "2. 生产..."]
+        body = (
+            "## （一）采购基本事项\n"
+            "1. 研发部对价值超过2000元以上的配件需由研发\n"
+            "2. 生产部生产所需配件需由生产部申请人\n"
+        )
+        cards = pl._cards_from_body(body)
+        titles = [c["title"] for c in cards]
+        self.assertTrue(
+            any("（一）" in t for t in titles),
+            f"H2 sub-card missing in titles: {titles}",
+        )
+        sub = next(c for c in cards if "（一）" in c["title"])
+        self.assertEqual(len(sub["items"]), 2)
+        self.assertIn("研发", sub["items"][0])
+        self.assertIn("生产", sub["items"][1])
+
+    def test_h2_dedup_from_list_items(self):
+        # Numbered items below H2 should NOT also appear in the
+        # list-items fallback cards (Phase 1.3 dedup).
+        body = (
+            "## （一）采购基本事项\n"
+            "1. xxx\n2. yyy\n"
+        )
+        cards = pl._cards_from_body(body)
+        all_items = [it for c in cards for it in c["items"]]
+        self.assertEqual(all_items.count("xxx"), 1)
+        self.assertEqual(all_items.count("yyy"), 1)
+
+    def test_h2_subcard_capped_at_two(self):
+        # 3 H2 subsections → only 2 sub-cards kept (plan §3.2.2 cap)
+        body = "\n\n".join(
+            f"## （{label}）章节\n\n1. 第一项\n2. 第二项"
+            for label in "一二三"
+        )
+        cards = pl._cards_from_body(body)
+        h2_cards = [c for c in cards if c["title"].startswith("（") and "）" in c["title"]]
+        self.assertLessEqual(len(h2_cards), 2)
+
+
 class TestExpandDividerExtras(unittest.TestCase):
     """Phase D: divider subtitle + exclude-source-slides opt-in params.
 
@@ -3403,6 +3466,42 @@ class TestExpandDividerExtras(unittest.TestCase):
             # Two cloned dividers + two cloned contents still present.
             self.assertEqual(roster.count("slide_part01_div.svg"), 1)
             self.assertEqual(roster.count("slide_part02_div.svg"), 1)
+
+    def test_exclude_source_slides_drops_both_skeletons(self):
+        """Bug fix (2026-09-16): ``exclude_source_slides=[3, 4]`` drops
+        BOTH the divider skeleton (slide_03) AND the content skeleton
+        (slide_04) — required so neither raw template leaks into the
+        final pptx. The docstring at workspace_expand.py:107-115 was
+        previously wrong (only mentioned [skeleton_divider])."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_workspace(td)
+            md = Path(td) / "m.md"
+            md.write_text(
+                "# Section A\nbody\n\n# Section B\nbody\n",
+                encoding="utf-8",
+            )
+            pl.expand_workspace_from_markdown(
+                ws, md,
+                skeleton_divider=3, skeleton_content=4,
+                divider_edits_template={"shape-4": "PART {nn}",
+                                        "shape-5": "{title}"},
+                content_edits_template={"shape-17": "{title}"},
+                exclude_source_slides=[3, 4],
+            )
+            plan = json.loads(
+                (ws / "page_plan.json").read_text(encoding="utf-8")
+            )
+            roster = [p["svg"] for p in plan["pages"]]
+            # Both raw skeletons dropped.
+            self.assertNotIn("slide_03.svg", roster)
+            self.assertNotIn("slide_04.svg", roster)
+            # slide_05 (ending) still preserved.
+            self.assertIn("slide_05.svg", roster)
+            # Cloned dividers + contents still present.
+            self.assertEqual(roster.count("slide_part01_div.svg"), 1)
+            self.assertEqual(roster.count("slide_part02_div.svg"), 1)
+            self.assertEqual(roster.count("slide_part01_content.svg"), 1)
+            self.assertEqual(roster.count("slide_part02_content.svg"), 1)
 
     def test_no_subtitle_when_omitted(self):
         """Without divider_subtitle_template, original placeholder text

@@ -106,13 +106,13 @@ def expand_workspace_from_markdown(
         about which shape ids exist on the template.
     exclude_source_slides:
         Optional list of 1-based slide numbers to drop from the
-        original roster in ``page_plan.json``. The skeleton slide used
-        for cloning (``skeleton_divider`` / ``skeleton_content``) is
-        usually a design sample whose on-deck counterpart would
-        duplicate the cloned per-section pages — boteng callers pass
-        ``[skeleton_divider]`` so the divider sample is cloned but
-        not also emitted as a standalone page. Default ``None``
-        preserves every original.
+        original roster in ``page_plan.json``. The skeleton slides
+        used for cloning (``skeleton_divider`` / ``skeleton_content``)
+        are design samples whose on-deck counterparts would duplicate
+        the cloned per-section pages — boteng callers pass
+        ``[skeleton_divider, skeleton_content]`` so both samples are
+        cloned but neither appears as a standalone page in the final
+        deck. Default ``None`` preserves every original.
 
     Returns
     -------
@@ -175,6 +175,40 @@ def expand_workspace_from_markdown(
             # Embed auto-generated cards block
             stem = f"part{nn}"
             cards = _cards_for_section(sections, stem)
+
+            # Phase 1.4 (2026-09-16): single-card text-split fallback.
+            # When ``cards_from_body`` returns only 1 card with 1 long item
+            # (the "empty slide" pattern — a section with just a single
+            # paragraph of 140+ chars, no H2 subsections, no numbered
+            # list), the existing 40-char truncation produces a single
+            # ``<text>`` node and the slide looks visually empty.
+            # Split the long item into ~40-char chunks so 3-column-cards
+            # renders each chunk as a separate ``<text>`` node, lifting
+            # text_nodes from 1 → 5-6. The simple-text layout (planned for
+            # Phase 3) will eventually replace this heuristic.
+            if len(cards) == 1 and len(cards[0].get("items", [])) == 1:
+                long_text = cards[0]["items"][0]
+                if len(long_text) > 40:
+                    chunks: list[str] = []
+                    rest = long_text
+                    while len(rest) > 40:
+                        # Prefer sentence/comma boundaries before 40 chars.
+                        cut = max(
+                            rest.rfind("。", 0, 40),
+                            rest.rfind("，", 0, 40),
+                            rest.rfind("；", 0, 40),
+                            rest.rfind("、", 0, 40),
+                        )
+                        if cut <= 0:
+                            cut = 40
+                        else:
+                            cut += 1  # keep delimiter with the chunk
+                        chunks.append(rest[:cut])
+                        rest = rest[cut:]
+                    if rest:
+                        chunks.append(rest)
+                    cards[0]["items"] = chunks
+
             for c in cards:
                 c["items"] = [
                     it[:40] + ("…" if len(it) > 40 else "")
