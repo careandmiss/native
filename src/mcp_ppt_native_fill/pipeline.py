@@ -154,13 +154,20 @@ def llm_plan(
             workspace=workspace,
         )
     except llm_planner.PlannerError as exc:
-        state.stage = "failed"
-        state.errors.append(f"llm_plan: {exc}")
-        return state
+        # Phase 4 (2026-09-16): planner-side errors are recoverable.
+        # Log as warning, fall through with empty content_mapping, let
+        # the deterministic A-path / E-path dispatch + cover title
+        # backfill produce a usable PPT without LLM assistance.
+        state.warnings.append(f"llm_plan: planner error: {exc}")
+        planner_result = llm_planner.PlannerResult(content_mapping={})
     except Exception as exc:  # network / LLMError etc.
-        state.stage = "failed"
-        state.errors.append(f"llm_plan: {type(exc).__name__}: {exc}")
-        return state
+        # Phase 4 (2026-09-16): transient network / DNS / provider
+        # outages must not abort the whole pipeline. Demote to warning
+        # so callers without network access (offline demos, air-gapped
+        # build envs) still get a deterministic, content-aware PPT
+        # generated from the markdown alone.
+        state.warnings.append(f"llm_plan: {type(exc).__name__}: {exc}")
+        planner_result = llm_planner.PlannerResult(content_mapping={})
 
     # Legacy path: PlannerResult's dict-like shim makes the merge logic
     # work without caring about the new fields.

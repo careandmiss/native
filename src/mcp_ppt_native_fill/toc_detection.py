@@ -632,10 +632,23 @@ def cards_for_section(
     if section is None:
         section = sections[0]
     meta = section.get("meta") or {}
-    cards = cards_from_body(section["body"]) or [
-        {"title": section["title"][:10], "color": "#1D2CAB",
-         "items": [section["body"][:60] + ("…" if len(section["body"]) > 60 else "")]}
-    ]
+    cards = cards_from_body(section["body"])
+    if not cards:
+        # Phase 4 (2026-09-16): empty-body fallback. When a markdown
+        # section has no body (e.g. an H1 that exists purely as a
+        # structural grouping header with subsections underneath),
+        # cards_from_body returns []. Without this fallback the
+        # downstream simple-text layout would receive spec.text=""
+        # and raise — instead, render the section title itself as a
+        # single-item "title placeholder" card so the page still
+        # appears (skipping would silently drop the section from TOC).
+        body = section["body"]
+        placeholder = body if body else f"（{section['title']}）"
+        cards = [{
+            "title": section["title"][:10],
+            "color": "#1D2CAB",
+            "items": [placeholder[:60] + ("…" if len(placeholder) > 60 else "")],
+        }]
     return cards, meta
 
 

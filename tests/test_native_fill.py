@@ -1641,6 +1641,9 @@ class PipelineLLMPhaseTests(unittest.TestCase):
             self.assertIs(state.context["planner_result"], llm_mapping)
 
     def test_phase2b_records_planner_error(self):
+        """Phase 4 (2026-09-16): LLM errors are demoted from fatal to
+        warning so the pipeline can continue without LLM assistance
+        (offline / DNS-blocked / air-gapped environments)."""
         from mcp_ppt_native_fill import pipeline, llm_planner
         from unittest.mock import patch
 
@@ -1656,10 +1659,14 @@ class PipelineLLMPhaseTests(unittest.TestCase):
                 side_effect=llm_planner.PlannerError("network down"),
             ):
                 state = pipeline.llm_plan(state, md, {})
-            self.assertEqual(state.stage, "failed")
-            self.assertIn("network down", state.errors[0])
+            # Demoted from "failed" — pipeline continues with empty mapping.
+            self.assertNotEqual(state.stage, "failed")
+            self.assertTrue(any("network down" in w for w in state.warnings))
 
     def test_phase2b_records_llm_client_error(self):
+        """Phase 4 (2026-09-16): network / HTTP errors fall through as
+        warnings; the rest of the pipeline still runs deterministically
+        from the markdown alone."""
         from mcp_ppt_native_fill import pipeline, llm_client
         from unittest.mock import patch
 
@@ -1675,8 +1682,8 @@ class PipelineLLMPhaseTests(unittest.TestCase):
                 side_effect=llm_client.LLMError("HTTP 401"),
             ):
                 state = pipeline.llm_plan(state, md, {})
-            self.assertEqual(state.stage, "failed")
-            self.assertIn("HTTP 401", state.errors[0])
+            self.assertNotEqual(state.stage, "failed")
+            self.assertTrue(any("HTTP 401" in w for w in state.warnings))
 
     def test_phase2b_handles_empty_llm_response(self):
         from mcp_ppt_native_fill import pipeline
