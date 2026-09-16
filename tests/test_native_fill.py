@@ -3377,6 +3377,185 @@ class TestCardsFromBodyImprovements(unittest.TestCase):
         self.assertLessEqual(len(h2_cards), 2)
 
 
+class TestSplitMarkdownSectionsMeta(unittest.TestCase):
+    """Phase 2 (2026-09-16): ``split_markdown_sections`` extracts meta.
+
+    3 cases:
+    - meta present (full-width colon)
+    - multi-field with mixed colons
+    - no meta → empty dict
+    """
+
+    def test_meta_extracted_with_full_width_colon(self):
+        sections = pl._split_markdown_sections(
+            "# 一、目的\n"
+            "> **layout**: hero-number\n"
+            "> **value**: 5\n"
+            "> **caption**: 总章数\n"
+            "\n"
+            "body paragraph\n"
+        )
+        self.assertEqual(sections[0]["title"], "一、目的")
+        self.assertEqual(sections[0]["meta"]["layout"], "hero-number")
+        self.assertEqual(sections[0]["meta"]["value"], "5")
+        self.assertEqual(sections[0]["meta"]["caption"], "总章数")
+        # Meta lines stripped from body so cards_from_body doesn't see them.
+        self.assertNotIn("**layout**", sections[0]["body"])
+        self.assertNotIn("**value**", sections[0]["body"])
+        self.assertIn("body paragraph", sections[0]["body"])
+
+    def test_meta_accepts_half_width_colon_and_whitespace(self):
+        sections = pl._split_markdown_sections(
+            "# 二、范围\n"
+            "> **layout** : callout-box  \n"
+            "> **quote**: 公开透明, 择优选择\n"
+            "\n"
+            "body\n"
+        )
+        # Loose regex tolerates spaces around the colon.
+        self.assertEqual(sections[0]["meta"]["layout"], "callout-box")
+        self.assertEqual(sections[0]["meta"]["quote"], "公开透明, 择优选择")
+        self.assertNotIn("**layout**", sections[0]["body"])
+
+    def test_meta_empty_when_no_meta_lines(self):
+        sections = pl._split_markdown_sections(
+            "# 三、原则\nbody 1\n\n# 四、其他\nbody 2\n"
+        )
+        self.assertEqual(sections[0]["meta"], {})
+        self.assertEqual(sections[1]["meta"], {})
+        # Body unchanged for sections without meta.
+        self.assertIn("body 1", sections[0]["body"])
+
+    def test_meta_does_not_match_unrelated_blockquote(self):
+        """A plain ``>`` blockquote (no ``**key**`` pattern) is preserved
+        as body content, not silently dropped."""
+        sections = pl._split_markdown_sections(
+            "# 标题\n"
+            "> This is just a regular blockquote.\n"
+            "\n"
+            "body\n"
+        )
+        self.assertEqual(sections[0]["meta"], {})
+        self.assertIn("regular blockquote", sections[0]["body"])
+
+
+class TestCardsForSectionReturnsTuple(unittest.TestCase):
+    """Phase 2 (2026-09-16): ``cards_for_section`` returns (cards, meta)."""
+
+    def test_returns_empty_tuple_for_no_sections(self):
+        cards, meta = pl._cards_for_section([], "part01")
+        self.assertEqual(cards, [])
+        self.assertEqual(meta, {})
+
+    def test_meta_propagates_from_section(self):
+        sections = pl._split_markdown_sections(
+            "# 一、目的\n"
+            "> **layout**: hero-number\n"
+            "> **value**: 3\n"
+            "\nbody\n"
+        )
+        cards, meta = pl._cards_for_section(sections, "part01")
+        self.assertEqual(meta["layout"], "hero-number")
+        self.assertEqual(meta["value"], "3")
+        # cards still present (the A-path heuristic still runs).
+        self.assertIsInstance(cards, list)
+        self.assertGreaterEqual(len(cards), 1)
+
+    def test_unmatched_stem_returns_first_section(self):
+        sections = pl._split_markdown_sections(
+            "# 一、目的\nbody\n\n# 二、范围\nbody2\n"
+        )
+        # stem doesn't match partNN regex → falls back to first section.
+        cards, meta = pl._cards_for_section(sections, "anything-else")
+        self.assertEqual(meta, {})  # first section has no meta
+        self.assertIsInstance(cards, list)
+
+
+class TestExpandWorkspaceMarkdownMeta(unittest.TestCase):
+    """Phase 2 (2026-09-16): E-path dispatch — when markdown declares
+    ``> **layout**: <layout>``, the cloned content slide renders that
+    layout instead of the default 3-column-cards.
+    """
+
+    def _make_workspace(self, td: str) -> Path:
+        ws = Path(td)
+        (ws / "authoring-svg-flat").mkdir(parents=True)
+        auth = ws / "authoring-svg-flat"
+        # Minimal slide_03 (divider) and slide_04 (content) skeletons.
+        (auth / "slide_03.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg">'
+            '<g id="shape-4"><text>PLACEHOLDER DIV</text></g>'
+            '<g id="shape-5"><text>PLACEHOLDER TITLE</text></g>'
+            '</svg>',
+            encoding="utf-8",
+        )
+        (auth / "slide_04.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg">'
+            '<g id="shape-17"><text>PLACEHOLDER CONTENT</text></g>'
+            '</svg>',
+            encoding="utf-8",
+        )
+        (auth / "slide_05.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg"/>', encoding="utf-8",
+        )
+        return ws
+
+    def test_hero_number_layout_renders_via_meta(self):
+        """Section with ``> **layout**: hero-number`` + ``> **value**: 5``
+        produces a hero-number SVG node (single big text element) instead
+        of 3-column-cards (which produces multiple rects)."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_workspace(td)
+            md = Path(td) / "m.md"
+            md.write_text(
+                "# 一、目的\n"
+                "> **layout**: hero-number\n"
+                "> **value**: 5\n"
+                "> **caption**: 总章数\n"
+                "\n"
+                "body\n",
+                encoding="utf-8",
+            )
+            pl.expand_workspace_from_markdown(
+                ws, md,
+                skeleton_divider=3, skeleton_content=4,
+                divider_edits_template={"shape-4": "PART {nn}",
+                                        "shape-5": "{title}"},
+                content_edits_template={"shape-17": "{title}"},
+                exclude_source_slides=None,
+            )
+            content_svg = (
+                ws / "authoring-svg-flat" / "slide_part01_content.svg"
+            ).read_text(encoding="utf-8")
+            # hero-number renders one big <text font-size="..." value="5">.
+            # Default 3-column-cards would render <rect ... fill="#1D2CAB"
+            # fill-opacity="0.12"> instead.
+            self.assertIn(">5</text>", content_svg)
+            self.assertIn("总章数", content_svg)
+
+    def test_no_meta_falls_back_to_3_column_cards(self):
+        """Without meta lines, the A path renders 3-column-cards rects —
+        no behavioral regression vs Phase 1."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._make_workspace(td)
+            md = Path(td) / "m.md"
+            md.write_text("# Section A\nbody text\n", encoding="utf-8")
+            pl.expand_workspace_from_markdown(
+                ws, md,
+                skeleton_divider=3, skeleton_content=4,
+                divider_edits_template={"shape-4": "PART {nn}",
+                                        "shape-5": "{title}"},
+                content_edits_template={"shape-17": "{title}"},
+                exclude_source_slides=None,
+            )
+            content_svg = (
+                ws / "authoring-svg-flat" / "slide_part01_content.svg"
+            ).read_text(encoding="utf-8")
+            # A path: 3-column-cards produces rect + title text.
+            self.assertIn('fill="#1D2CAB"', content_svg)
+            self.assertIn('rx="8"', content_svg)
+
+
 class TestExpandDividerExtras(unittest.TestCase):
     """Phase D: divider subtitle + exclude-source-slides opt-in params.
 

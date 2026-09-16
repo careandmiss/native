@@ -540,31 +540,80 @@ def strip_inline_markdown(text: str) -> str:
     return text
 
 
-def split_markdown_sections(md_text: str) -> list[dict[str, str]]:
+# Phase 2 (2026-09-16): loose meta extraction. Matches blockquote lines
+# like ``> **layout**: hero-number`` or ``> **要点**：采购效率、岗位职责``.
+# Accepts BOTH full-width (：) and half-width (:) colons; tolerates spaces
+# around the colon and at the end of the value. Captures any field name
+# (no whitelist) so the markdown author has freedom. Callers in
+# ``workspace_expand`` only consult a few known keys (``layout``,
+# ``items``, ``caption``, etc.) — unknown keys are kept in ``meta`` for
+# forward compatibility but ignored at render time.
+_META_RE = re.compile(
+    r"^>\s*\*\*([^*]+?)\*\*\s*[：:]\s*(.+?)\s*$",
+    re.MULTILINE,
+)
+
+
+def _extract_section_meta(body: str) -> tuple[dict[str, str], str]:
+    """Pull ``> **key**: value`` lines out of ``body``.
+
+    Returns ``(meta, body_without_meta_lines)``. Order in ``meta`` follows
+    first appearance in ``body`` (dict preserves insertion order in
+    Python 3.7+). Multi-value keys are NOT supported — each meta line
+    yields one entry, last one wins on key collision.
+    """
+    meta: dict[str, str] = {}
+    for m in _META_RE.finditer(body):
+        key = m.group(1).strip()
+        value = m.group(2).strip()
+        # Strip leading "**" wrappers inside value too (defensive).
+        value = value.replace("**", "").strip()
+        if key:
+            meta[key] = value
+    # Strip the meta lines so downstream ``cards_from_body`` doesn't
+    # re-process them as ordinary blockquote text.
+    cleaned = _META_RE.sub("", body)
+    # Collapse any blank lines introduced by the strip so split("\n\n")
+    # in cards_from_body still works as before.
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return meta, cleaned
+
+
+def split_markdown_sections(md_text: str) -> list[dict[str, Any]]:
     """Split a Chinese procurement policy markdown into
-    ``[{title, body}]`` sections keyed on `# 一、` / `# 二、` etc.
+    ``[{title, body, meta}]`` sections keyed on `# 一、` / `# 二、` etc.
 
     H1 inline markdown (``**bold**`` / ``*italic*`` / `` `code` ``)
     is stripped — otherwise those markers leak into the PPT shape
     text and render as literal asterisks.
+
+    Phase 2 (2026-09-16): also extracts ``> **key**: value`` meta lines
+    into the ``meta`` dict. See :func:`_extract_section_meta` for the
+    syntax. Sections without any meta lines get ``meta={}``.
     """
-    sections: list[dict[str, str]] = []
+    sections: list[dict[str, Any]] = []
     head_re = re.compile(r"^#\s+(.+)$", re.MULTILINE)
     matches = list(head_re.finditer(md_text))
     for i, m in enumerate(matches):
         start = m.end()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(md_text)
         body = md_text[start:end].strip()
+        meta, body = _extract_section_meta(body)
         title = strip_inline_markdown(m.group(1).strip())
-        sections.append({"title": title, "body": body})
+        sections.append({"title": title, "body": body, "meta": meta})
     return sections
 
 
 def cards_for_section(
-    sections: list[dict[str, str]],
+    sections: list[dict[str, Any]],
     stem: str,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Pull 2-3 cards from the section matching ``stem`` (e.g. ``part02``).
+
+    Returns ``(cards, meta)`` so callers can decide whether to render the
+    heuristic cards (``A path``) or honor the caller's structured markdown
+    (``E path`` — see ``workspace_expand.py`` for the dispatch logic).
+    ``meta`` is the section's extracted meta dict (``{}`` when none).
 
     Mapping heuristic:
       - stem ``partNN`` → H1 with leading CN numeral ``一/二/三/...`` whose
@@ -573,18 +622,21 @@ def cards_for_section(
     cn_numerals = "一二三四五六七八九十"
     """
     if not sections:
-        return []
+        return [], {}
     m = re.match(r"part(\d+)$", stem)
-    if not m:
-        return cards_from_body(sections[0]["body"]) if sections else []
-    idx = int(m.group(1)) - 1  # part02 → section[1]
-    if idx < 0 or idx >= len(sections):
-        return []
-    section = sections[idx]
-    return cards_from_body(section["body"]) or [
+    section = None
+    if m:
+        idx = int(m.group(1)) - 1  # part02 → section[1]
+        if 0 <= idx < len(sections):
+            section = sections[idx]
+    if section is None:
+        section = sections[0]
+    meta = section.get("meta") or {}
+    cards = cards_from_body(section["body"]) or [
         {"title": section["title"][:10], "color": "#1D2CAB",
          "items": [section["body"][:60] + ("…" if len(section["body"]) > 60 else "")]}
     ]
+    return cards, meta
 
 
 def cards_from_body(body: str) -> list[dict[str, Any]]:
@@ -748,7 +800,7 @@ def fill_missing_content_blocks(
             continue
         stem = svg_name.replace("slide_", "").replace(".svg", "")
         # Try to find a matching section by stem number (e.g. part02 → section 2)
-        cards = cards_for_section(sections, stem)
+        cards, meta = cards_for_section(sections, stem)
         if not cards:
             cards = [{"title": "本节要点", "color": "#1D2CAB",
                       "items": ["(待补充)"]}]

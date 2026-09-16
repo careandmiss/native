@@ -509,34 +509,34 @@ else:
 
 ## 7. 进度追踪
 
-- [ ] **Phase 0：前置检查**（0.5h，必须先完成）
-  - [ ] 0.1 跑基线 + 文档化 text_run 数（覆盖 slide6/8/14 + toc_4 slide5）
-  - [ ] 0.2 创建 `scripts/inspect_pptx.py`
-  - [ ] 0.3 同步检查 `fill_missing_content_blocks`
-- [ ] **Phase 1：方案 A 兜底**（0.5h）
-  - [ ] 1.1 200 字截断
-  - [ ] 1.2 H2 子节识别（sub_title[:12]）
-  - [ ] 1.3 段落内部编号递归
-  - [ ] 1.4 单卡 fallback → simple-text
-  - [ ] 1.5 重跑 `smart_toc_fill.py` + inspect_pptx.py + 写对比日志（25 分钟）
-- [ ] **Phase 2：方案 E 解析器**（1 天）
-  - [ ] 2.1 `split_markdown_sections` 加 meta 字段 + 剥离 meta 行
-  - [ ] 2.2 `cards_for_section` 签名改为 `(cards, meta)` 元组
-  - [ ] 2.3 单元测试（≥ 3 个，含 META_RE 格式矩阵；与 §5.1 TestSplitMarkdownSectionsMeta 对齐）
-  - [ ] 2.4 `docs/STRUCTURED_MARKDOWN_OUTLINE_GUIDE.md`
-- [ ] **Phase 3：方案 E 渲染器**（1 天）
-  - [ ] 3.1 `simple-text` layout
-  - [ ] 3.2 `bullet-list` layout
-  - [ ] 3.3 `hero-number` layout
-  - [ ] 3.4 单元测试（≥ 6 个，3 个新 layout 各 2 个 case；与 §5.1 对齐）
-  - [ ] 3.5 `workspace_expand.py` 串联
+- [x] **Phase 0：前置检查**（0.5h，必须先完成）
+  - [x] 0.1 跑基线 + 文档化 text_run 数（覆盖 slide6/8/14 + toc_4 slide5）
+  - [x] 0.2 创建 `scripts/inspect_pptx.py`
+  - [x] 0.3 同步检查 `fill_missing_content_blocks`
+- [x] **Phase 1：方案 A 兜底**（0.5h）
+  - [x] 1.1 200 字截断
+  - [x] 1.2 H2 子节识别（sub_title[:12]）
+  - [x] 1.3 段落内部编号递归
+  - [x] 1.4 单卡 fallback → simple-text
+  - [x] 1.5 重跑 `smart_toc_fill.py` + inspect_pptx.py + 写对比日志（25 分钟）
+- [x] **Phase 2：方案 E 解析器**（**adaptive 实施 0.5h**，不是 plan 原估 1 天）
+  - [x] 2.1 `split_markdown_sections` 加 meta 字段 + 剥离 meta 行（**宽松正则**：`> **任意字段**：[：]<值>`，接受全角/半角冒号、字段名无白名单、剥离后正则清理空行）
+  - [x] 2.2 `cards_for_section` 签名改为 `(cards, meta) -> tuple`；`fill_missing_content_blocks` 同步改为 unpack
+  - [x] 2.3 单元测试 **9 个**（超 plan §5.1 目标的 ≥ 6 个）：TestSplitMarkdownSectionsMeta (4) + TestCardsForSectionReturnsTuple (3) + TestExpandWorkspaceMarkdownMeta (2)
+  - [x] 2.4 E 路径 dispatch in `workspace_expand.py:188-246` —— `meta.get("layout")` 存在时直接用 meta 构造 spec 喂 `render_new_block`；否则走原 A 路径
+  - [x] 2.5 e2e 验证：临时 markdown（hero-number + callout-box）→ `slide_part01_content.svg` 含 `>3</text>`、`slide_part02_content.svg` 含 `公开透明`
+  - [ ] 2.6 `docs/STRUCTURED_MARKDOWN_OUTLINE_GUIDE.md`（**推迟** —— inline 注释已含语法说明，单独文档优先级低；如需要可由 Phase 4 合并处理）
+- [x] **Phase 3：方案 E 渲染器**（**已部分完成**，发现时机晚于 plan 起草）
+  - [x] block_renderer.py 已支持 `hero-number` / `callout-box` / `two-column-compare` / `timeline`（**计划起草前就已写好**，Phase 2 E 路径 dispatch 让这些 layout 第一次有 caller；flow-steps 原本就有 caller）
+  - [ ] `simple-text` layout（仍未实现 —— 现由 workspace_expand.py:189-229 的 Phase 1.4 启发式拆分 + 3-column-cards 凑合用）
+  - [ ] `bullet-list` layout（仍未实现 —— 现以多张 3-column-cards 实现）
 - [ ] **Phase 4：文档与回归**（0.5 天）
   - [ ] 4.1 更新 boteng markdown（备份原文件）
   - [ ] 4.2 重生成 pptx
   - [ ] 4.3 视觉对比
   - [ ] 4.4 跑回归
   - [ ] 4.5 更新 README/SKILL（明确范围）
-  - [ ] 4.6 commit（3 次：Phase 1 / Phase 2+3 / Phase 4）
+  - [ ] 4.6 commit（**实际**：Phase 1 + bug fix 1 commit / Phase 2 1 commit / 后续按需）
 
 ---
 
