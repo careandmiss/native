@@ -120,9 +120,40 @@ def _esc(text: str) -> str:
     )
 
 
+def chrome_meta_defaults() -> dict:
+    """Boteng template chrome default metadata (single source of truth).
+
+    Phase 13 (2026-09-17): the doc_path / page_num_offset / chapter_label
+    format that ``pipeline._derive_default_chrome_plan`` would otherwise
+    hardcode is now exported here so callers (and tests) can see the
+    defaults without importing pipeline. When a caller passes an explicit
+    ``chrome_meta`` option, those values override the per-slide entries
+    in this dict.
+
+    Returns
+    -------
+    dict
+        ``{
+            "chapter_label_format": "PART {nn:02d} · {en_label}",
+            "doc_path": "采购制度 / 山西柏腾科技有限公司",
+            "page_num_offset": 2,   # cover + TOC count as P01 / P02
+            "font_size": 12,
+            "letter_spacing": 4,
+        }``
+    """
+    return {
+        "chapter_label_format": "PART {nn:02d} · {en_label}",
+        "doc_path": "采购制度 / 山西柏腾科技有限公司",
+        "page_num_offset": 2,
+        "font_size": 12,
+        "letter_spacing": 4,
+    }
+
+
 __all__: Iterable[str] = (
     "render_chrome_topbar",
     "render_chrome_footer",
+    "chrome_meta_defaults",
     "BRAND_BLUE",
     "BRAND_BLUE_LIGHT",
     "GOLD",

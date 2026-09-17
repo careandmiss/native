@@ -231,7 +231,7 @@ Available layouts for `new_blocks`:
 - `raw` (caller supplied SVG; spec.svg = "<svg>...</svg>")
 - Phase 7+:
   - `statement-caption` (long single paragraph; spec.body=..., spec.title?=..., spec.eyebrow?=...)
-  - `procedural-steps` (N=3-5 macro phases; spec.phases=[{label, detail}], spec.takeaway?=...)
+  - `procedural-steps` (N=3-5 macro steps; spec.steps=[{label, detail, bullets?}], spec.takeaway?=...)
   - `three-thesis-cards` (exactly 2 H2-driven cards; spec.cards=[{title, items}])
   - `hero_statement` (single short claim; spec.headline, spec.subline?, spec.eyebrow?)
   - `kpi_row` (N=2-5 tiles; spec.tiles=[{keyword, descriptor, value?}], spec.evidence?)
@@ -412,7 +412,7 @@ def _geometry_based_max_chars(grp: Any, text: Any) -> int | None:
     if len(parts) < 4:
         return None
     try:
-        _, _, w, _ = (float(p) for p in parts[:4])
+        _, _, w, h = (float(p) for p in parts[:4])
     except ValueError:
         return None
     if w <= 0:
@@ -426,6 +426,15 @@ def _geometry_based_max_chars(grp: Any, text: Any) -> int | None:
         return None
     if fs <= 0:
         return None
+    # Rail-label override (2026-09-17): divider rail labels hold
+    # short ALL-CAPS Latin + digits ("PART 03", "01 / 04", etc.).
+    # ``chars_that_fit`` returns ``min(cjk_cap, latin_cap)`` and CJK
+    # dominates the min at this geometry, capping even text the
+    # frame comfortably accommodates. Bypass with a fixed budget of
+    # 10 chars when the shape is clearly a rail label (large font
+    # in a tall frame).
+    if fs >= 40 and h >= 50:
+        return 10
     # font_weight: bold bumps latin 5 %, ignored by CJK (CJK fonts
     # already render bold glyphs the same width).
     weight = text.get("font-weight") or "400"
@@ -852,8 +861,13 @@ def _truncate_to_fit(text: str, max_chars: int) -> str:
     # of codepoints, not bytes, so ``len`` already measures codepoints).
     # Strip any trailing punctuation/space.
     cleaned = truncated.rstrip(" ,.;:!?。；：、""''")
-    # Only append the ellipsis if we actually cut content off.
-    if len(cleaned) < len(text):
+    # Only append the ellipsis when truncation is meaningful (>=1 char
+    # cut). Defensive against budget mis-calibration: a single-char
+    # truncation that drops just the last character should not be
+    # visually mangled to "PART 0…" — either we keep the full string
+    # (the budget was too tight) or we cut enough to warrant a
+    # marker.
+    if len(cleaned) + 1 < len(text):
         cleaned = cleaned + "…"
     return cleaned
 

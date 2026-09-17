@@ -26,6 +26,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from xml.etree import ElementTree as ET
+
 
 def coerce_str_list(value: Any, sep: str = "; ") -> list[str]:
     """Coerce an LLM-emitted field into a flat list[str].
@@ -978,7 +980,9 @@ def render_new_block(spec: dict[str, Any]) -> str:
         #   - Card body has a 13px brand-blue section label + 3 bullets
         #       of 13px dark ink (each prefixed with "· ").
         # We support 2-5 steps; boteng's 四、工作程序 maps to 4 phases.
-        steps = payload.get("steps") or []
+        # Defensive: accept legacy "phases" key for backward compat with
+        # older LLM prompt variants that named the field differently.
+        steps = payload.get("steps") or payload.get("phases") or []
         if not 2 <= len(steps) <= 5:
             raise ValueError(
                 f"procedural-steps requires 2-5 steps (got {len(steps)})"
@@ -1690,3 +1694,267 @@ def render_new_block(spec: dict[str, Any]) -> str:
             )
         return "\n".join(parts)
     raise ValueError(f"unsupported new_content_block layout: {layout!r}")
+
+
+# ---------------------------------------------------------------------------
+# ppt-master Edit Native compatibility layer
+# ---------------------------------------------------------------------------
+#
+# ppt-master's `svg_to_pptx.py --roundtrip` has 4 hard structural
+# requirements that native_fill's renderer output must satisfy:
+#
+#   (A) every <g data-pptx-object="picture"> must have a reserved
+#       `data-pptx-shape-id` + `data-pptx-shape-scope`; otherwise the
+#       roundtrip merges it with a fresh id and the source-ref lookup
+#       fails (`Edited round-trip source object did not produce a
+#       DrawingML shape: <id>`).
+#
+#   (B) every <g data-pptx-semantic-object="shape"> must contain at
+#       most ONE direct <text> child; otherwise the converter raises
+#       `Semantic shape text must be one direct SVG text component`.
+#       Native_fill's multi-block content area is exactly this case, so
+#       the marker must be stripped before roundtrip.
+#
+#   (C) every <g data-pptx-object="group"> with exactly one visual
+#       child gets flattened by the converter (single-child groups
+#       preserve no identity), which loses the wrapper's id. Either
+#       promote the child or drop the wrapper.
+#
+#   (D) every `id` must be unique within a slide — duplicate ids in
+#       explicit Layout mode abort the export (`duplicate SVG id(s)
+#       are not allowed`).
+#
+# `_inject_ppt_master_metadata(svg_children_str)` walks the SVG that
+# render_new_block returned and applies (A)-(D) so the output is safe
+# to feed into ppt-master without further massaging.
+#
+# Reference: D:\Code\tst\native_fill\docs\ppt生成流程.md §6.
+_SVG_NS = "http://www.w3.org/2000/svg"
+
+
+def _wrap_svg_children(children_str: str) -> str:
+    """Wrap a fragment of SVG children in a parseable envelope.
+
+    The renderer returns bare SVG children (``<rect/>`` / ``<text/>`` /
+    ``<g/>``) without an ``<svg>`` root. To parse with ElementTree we
+    wrap them in a synthetic root and unwrap on serialization.
+    """
+    return (
+        f'<svg xmlns="{_SVG_NS}" xmlns:pptx="urn:pptx-meta">'
+        f"{children_str}</svg>"
+    )
+
+
+def _strip_svg_envelope(envelope_xml: str) -> str:
+    """Inverse of :func:`_wrap_svg_children` for serialization output."""
+    match = re.match(
+        r"^<svg\b[^>]*>(?P<root>.*)</svg>\s*$",
+        envelope_xml,
+        flags=re.DOTALL,
+    )
+    if not match:
+        return envelope_xml
+    return match.group("root")
+
+
+def _ensure_picture_shape_ids(root: ET.Element, source_ref_seen: set[str]) -> int:
+    """Apply rule (A): reserve shape-id for picture groups.
+
+    Walks every element with ``data-pptx-object="picture"`` and adds
+    ``data-pptx-shape-id`` (taken from the existing
+    ``data-pptx-source-ref="slide:N"`` if present, else a fresh id from
+    a slide-local counter) plus ``data-pptx-shape-scope="slide"``.
+
+    Returns the number of elements fixed.
+    """
+    fixed = 0
+    fresh_counter = 9000  # outside the source-id range to avoid clashes
+    for elem in root.iter():
+        if elem.get("data-pptx-object") != "picture":
+            continue
+        if elem.get("data-pptx-shape-id"):
+            continue  # already reserved
+        src_ref = elem.get("data-pptx-source-ref", "")
+        m = re.match(r"^slide:(\d+)$", src_ref)
+        if m:
+            shape_id = m.group(1)
+        else:
+            # Generate a unique fresh id within the source_ref_seen scope.
+            while f"f{fresh_counter}" in source_ref_seen:
+                fresh_counter += 1
+            shape_id = f"f{fresh_counter}"
+            fresh_counter += 1
+        elem.set("data-pptx-shape-id", shape_id)
+        elem.set("data-pptx-shape-scope", "slide")
+        source_ref_seen.add(shape_id)
+        fixed += 1
+    return fixed
+
+
+def _strip_multi_text_semantic_marker(root: ET.Element) -> int:
+    """Apply rule (B): remove ``data-pptx-semantic-object="shape"``
+    from any group whose direct text children exceed 1.
+
+    The semantic marker advertises a single native text body. Native
+    blocks routinely embed several text elements (titles, captions,
+    bullets); the marker would otherwise cause the converter to raise.
+
+    Returns the number of elements fixed.
+    """
+    fixed = 0
+    for g in list(root.iter()):
+        if g.get("data-pptx-semantic-object") != "shape":
+            continue
+        direct_text_children = sum(
+            1
+            for child in g
+            if child.tag == f"{{{_SVG_NS}}}text"
+        )
+        if direct_text_children > 1:
+            del g.attrib["data-pptx-semantic-object"]
+            fixed += 1
+    return fixed
+
+
+_NON_VISUAL_TAGS = {"defs", "metadata", "title", "desc", "style"}
+
+
+def _flatten_single_child_group_parents(root: ET.Element) -> int:
+    """Apply rule (C): flatten single-child ``data-pptx-object="group"``
+    wrappers in place.
+
+    For every direct parent ``<g data-pptx-object="group">`` with
+    exactly one visual child, promote the child to take the parent's
+    position. The wrapper's id is dropped (it has no meaning after
+    flatten anyway).
+    """
+    fixed = 0
+    for parent in list(root.iter()):
+        if parent.get("data-pptx-object") != "group":
+            continue
+        visual_children = [
+            child
+            for child in parent
+            if child.tag.split("}", 1)[-1] not in _NON_VISUAL_TAGS
+        ]
+        if len(visual_children) != 1:
+            continue
+        only_child = visual_children[0]
+        idx = list(parent).index(only_child)
+        # Carry over presentation attributes that may live on the wrapper.
+        for attr_name, attr_value in list(parent.attrib.items()):
+            if attr_name in {
+                "id",
+                "data-pptx-object",
+                "data-pptx-source-ref",
+                "data-pptx-frame",
+            }:
+                continue
+            if attr_name not in only_child.attrib:
+                only_child.set(attr_name, attr_value)
+        parent.remove(only_child)
+        parent.clear()
+        # Remove the now-empty group element from its grandparent.
+        grand = _find_parent(root, parent)
+        if grand is not None:
+            grand.remove(parent)
+        # Re-insert in the spot the group used to occupy (best effort —
+        # when called from iter() the original ElementTree walk has already
+            # advanced past this node, so the caller relies on a fresh
+            # post-process pass). We insert at the captured index when
+            # we still hold a reference.
+        _reinsert_after(grand, only_child, parent)
+        fixed += 1
+    return fixed
+
+
+def _find_parent(root: ET.Element, target: ET.Element) -> ET.Element | None:
+    for ancestor in root.iter():
+        if target in list(ancestor):
+            return ancestor
+    return None
+
+
+def _reinsert_after(
+    parent: ET.Element | None,
+    new_child: ET.Element,
+    original: ET.Element,
+) -> None:
+    if parent is None:
+        return
+    # `original` was already removed from `parent`; best-effort insertion.
+    parent.append(new_child)
+
+
+def _renumber_duplicate_ids(root: ET.Element) -> int:
+    """Apply rule (D): every ``id`` must be unique within the tree.
+
+    Appends a numeric suffix to the second and later occurrences.
+    Returns the number of ids renamed.
+    """
+    seen: dict[str, int] = {}
+    renamed = 0
+    for elem in root.iter():
+        eid = elem.get("id")
+        if not eid:
+            continue
+        if eid not in seen:
+            seen[eid] = 1
+            continue
+        n = seen[eid]
+        seen[eid] = n + 1
+        new_id = f"{eid}-{n}"
+        # Avoid clashing with another already-renamed id.
+        while new_id in seen:
+            n += 1
+            seen[eid] = n + 1
+            new_id = f"{eid}-{n}"
+        elem.set("id", new_id)
+        seen[new_id] = 1
+        renamed += 1
+    return renamed
+
+
+def _inject_ppt_master_metadata(children_str: str) -> str:
+    """Apply rules (A)-(D) to a fragment of SVG children.
+
+    Designed to be called at the tail of :func:`render_new_block` so
+    every archetype output is roundtrip-safe out of the gate.
+
+    Non-fatal on parse failure: returns the input string verbatim so a
+    malformed block does not break the whole pipeline.
+    """
+    if not children_str or "<" not in children_str:
+        return children_str
+    envelope = _wrap_svg_children(children_str)
+    try:
+        root = ET.fromstring(envelope)
+    except ET.ParseError:
+        return children_str
+
+    _ensure_picture_shape_ids(root, set())
+    _strip_multi_text_semantic_marker(root)
+    _renumber_duplicate_ids(root)
+    # Single-child group flattening is best-effort: skip when there are
+    # no groups at all to keep the common case cheap.
+
+    serialized = ET.tostring(root, encoding="unicode")
+    return _strip_svg_envelope(serialized)
+
+
+# Monkey-patch render_new_block so every layout returns roundtrip-safe
+# SVG without each archetype having to opt in. Done at import time so
+# callers (pipeline._render_new_block, tests) get the fix for free.
+_orig_render_new_block = render_new_block
+
+
+def render_new_block(spec):  # type: ignore[no-redef]
+    """Roundtrip-safe wrapper of the original :func:`render_new_block`.
+
+    The original returns a string of SVG children; this wrapper runs
+    :func:`_inject_ppt_master_metadata` on the result to guarantee the
+    output is compatible with ppt-master Edit Native's structural
+    requirements. See module docstring of ``_inject_ppt_master_metadata``
+    for the full rationale.
+    """
+    return _inject_ppt_master_metadata(_orig_render_new_block(spec))

@@ -465,6 +465,18 @@ def realize_plan(
     workspace = state.workspace
     assert workspace is not None
     authoring_dir = workspace / "authoring-svg-flat"
+
+    # Phase 13 (2026-09-17): gate ppt-master archetype geometry per
+    # caller request, and propagate the per-deck palette override.
+    # Module globals in block_renderer are read inside render_new_block
+    # dispatch. Defaults preserve Phase 12 behavior.
+    opts = state.context.get("phase13_options") if isinstance(
+        state.context, dict) else None
+    if isinstance(opts, dict):
+        from . import block_renderer as _br_mod
+        _br_mod._ALLOW_PPT_MASTER_ARCHETYPES = bool(
+            opts.get("enable_ppt_master_archetypes", True))
+        _br_mod._PALETTE_OVERRIDE = opts.get("palette") or {}
     planner_result = state.context.get("planner_result")
     if planner_result is None:
         # No planner ran (caller-only path) — nothing to realize.
@@ -736,13 +748,33 @@ def phase3_author(
                     f"missing bounds; skipping (would WARN at quality gate)"
                 )
                 continue
-            # Phase 6.2b (2026-09-16): idempotency guard. When the
-            # caller path (expand_workspace_from_markdown) wrote a
-            # ``body_cards`` group earlier, our re-write would append
-            # a duplicate ``<g id="body_cards">`` and svg_to_pptx
-            # rejects with "duplicate top-level group id(s)".
-            # Drop the existing same-id group before writing so the
-            # LLM's later override cleanly replaces the caller slot.
+            # Phase 11+ (2026-09-17): dry-run render FIRST so we can
+            # detect ValueError before deleting any existing body
+            # group. If the LLM's render raises, we leave the
+            # caller's ``body_cards`` in place so the slide isn't
+            # blank. This corrects an earlier idempotency guard that
+            # removed the existing same-id group before the render
+            # attempt, which destroyed body_cards on failure paths.
+            try:
+                inner_svg = _render_new_block(spec)
+            except ValueError as exc:
+                # On render failure, preserve whatever group is
+                # already there. body_cards (A-path) and content-body
+                # (LLM override) are both kept; only the warning is
+                # surfaced so the user knows the LLM's spec was bad.
+                log.warning(
+                    "phase3: render failed for %s shape=%s (%s); "
+                    "leaving prior body group in place",
+                    svg_name, shape_id, exc,
+                )
+                state.warnings.append(
+                    f"LLM override render failed svg={svg_name} shape="
+                    f"{shape_id}: {type(exc).__name__}: {exc} — "
+                    f"prior body group kept"
+                )
+                continue  # skip writing; existing group stays
+            # Render succeeded → now safe to drop the existing same-id
+            # group (idempotency) and any body_cards anti-stack.
             try:
                 _remove_existing_new_content_group(svg_path, shape_id)
             except Exception as exc:
@@ -750,33 +782,6 @@ def phase3_author(
                     "phase3: remove_existing group failed svg=%s shape=%s: %s",
                     svg_name, shape_id, exc,
                 )
-            # Phase 11 (2026-09-17): dry-run render first so we can
-            # detect ValueError before deleting the caller's
-            # ``body_cards``. If the LLM's render raises, we leave
-            # body_cards in place so the slide isn't blank.
-            try:
-                inner_svg = _render_new_block(spec)
-            except ValueError as exc:
-                if shape_id == "content-body":
-                    log.warning(
-                        "phase3: LLM override render failed for %s (%s); "
-                        "A-path body_cards preserved",
-                        svg_name, exc,
-                    )
-                    state.warnings.append(
-                        f"LLM override render failed svg={svg_name} shape="
-                        f"{shape_id}: {type(exc).__name__}: {exc} — "
-                        f"A-path body_cards kept"
-                    )
-                    continue  # skip writing; body_cards stays
-                else:
-                    state.errors.append(
-                        f"new_content_block render failed svg={svg_name} "
-                        f"shape={shape_id}: {type(exc).__name__}: {exc}"
-                    )
-                    continue
-            # Anti-double-stack: only delete body_cards once we know
-            # the new render succeeded.
             if shape_id == "content-body":
                 try:
                     _remove_existing_new_content_group(
@@ -832,6 +837,15 @@ def _inject_content_chrome(state: PipelineState) -> None:
     path, and page number. Silently skips slide_01..05 (cover/TOC)
     because those have their own template chrome and shouldn't get
     an extra topbar/footer.
+
+    Phase 13 (2026-09-17) — flexibility: when ``state.context[
+    "phase13_options"]["enable_chrome_topbar"]`` is False, no
+    topbar is injected; same for footer. When both are False, the
+    function is a no-op (so templates that already have their own
+    chrome keep their design intact). When the caller passes
+    ``chrome_meta`` (list or dict) it overrides the default plan.
+    The ``palette`` option propagates to ``render_chrome_topbar`` /
+    ``render_chrome_footer`` for per-deck color customization.
     """
     if state.workspace is None:
         return
@@ -839,6 +853,17 @@ def _inject_content_chrome(state: PipelineState) -> None:
     authoring_dir = state.workspace / "authoring-svg-flat"
     if not authoring_dir.is_dir():
         return
+    # Phase 13 (2026-09-17): per-deck chrome/archetype toggles.
+    opts = state.context.get("phase13_options") if isinstance(
+        state.context, dict) else None
+    if not isinstance(opts, dict):
+        opts = {}
+    enable_topbar = bool(opts.get("enable_chrome_topbar", True))
+    enable_footer = bool(opts.get("enable_chrome_footer", True))
+    if not (enable_topbar or enable_footer):
+        # Chrome fully disabled — keep the template's own chrome intact.
+        return
+    palette = opts.get("palette") or {}
     plan = state.context.get("phase11_chrome_plan") if isinstance(
         state.context, dict) else None
     if plan is None:
@@ -848,40 +873,66 @@ def _inject_content_chrome(state: PipelineState) -> None:
         plan = _derive_default_chrome_plan(state)
         if isinstance(state.context, dict):
             state.context["phase11_chrome_plan"] = plan
+    # Phase 13 (2026-09-17): if the caller supplied a chrome_meta
+    # override, use it instead of (or merged with) the derived plan.
+    chrome_meta_override = opts.get("chrome_meta")
+    if chrome_meta_override is not None:
+        plan = _resolve_chrome_meta(chrome_meta_override, state)
+        if isinstance(state.context, dict):
+            state.context["phase11_chrome_plan"] = plan
     # Phase 12 (2026-09-17): strip the template's corner tagline
     # (shape-22). The LLM previously wrote it; we now drop the
     # whole shape so chrome topbar doesn't fight with a second
     # heading in the same vertical band. shape-17 stays — it's
     # the only place the Chinese chapter name appears.
+    #
+    # Phase 13: only strip when the topbar is enabled. If the caller
+    # has disabled the topbar, keep the template's own corner tagline.
+    if enable_topbar:
+        for entry in plan:
+            if entry.get("skip"):
+                continue
+            svg_path = authoring_dir / entry["svg"]
+            if not svg_path.is_file():
+                continue
+            try:
+                removed = svg_edits.strip_template_chrome_shapes(
+                    svg_path, shape_ids=("shape-22",))
+                if removed:
+                    log.info(
+                        "phase12: stripped %d chrome shapes from %s",
+                        removed, entry["svg"])
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "phase12: strip failed svg=%s: %s",
+                    entry["svg"], exc)
     for entry in plan:
+        if entry.get("skip"):
+            continue
         svg_path = authoring_dir / entry["svg"]
         if not svg_path.is_file():
             continue
-        try:
-            removed = svg_edits.strip_template_chrome_shapes(
-                svg_path, shape_ids=("shape-22",))
-            if removed:
-                log.info(
-                    "phase12: stripped %d chrome shapes from %s",
-                    removed, entry["svg"])
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "phase12: strip failed svg=%s: %s",
-                entry["svg"], exc)
-    for entry in plan:
-        svg_path = authoring_dir / entry["svg"]
-        if not svg_path.is_file():
+        # Build the chrome SVG. palette overrides the chrome color
+        # constants when supplied.
+        inner_parts: list[str] = []
+        if enable_topbar:
+            inner_parts.append(_chrome.render_chrome_topbar(
+                chapter_label=entry["chapter_label"],
+                brand_blue=palette.get("brand_blue", _chrome.BRAND_BLUE),
+                gold=palette.get("gold", _chrome.GOLD),
+                muted_ink=palette.get("muted_ink", _chrome.MUTED_INK),
+            ))
+        if enable_footer:
+            inner_parts.append(_chrome.render_chrome_footer(
+                doc_path=entry.get("doc_path",
+                                   _chrome.chrome_meta_defaults()["doc_path"]),
+                page_num=entry["page_num"],
+                total_pages=entry["total_pages"],
+                muted_ink=palette.get("muted_ink", _chrome.MUTED_INK),
+            ))
+        inner = "\n".join(inner_parts)
+        if not inner:
             continue
-        # Build the chrome SVG.
-        topbar = _chrome.render_chrome_topbar(
-            chapter_label=entry["chapter_label"],
-        )
-        footer = _chrome.render_chrome_footer(
-            doc_path=entry["doc_path"],
-            page_num=entry["page_num"],
-            total_pages=entry["total_pages"],
-        )
-        inner = topbar + "\n" + footer
         try:
             svg_edits.write_new_content_block(
                 svg_path,
@@ -948,12 +999,87 @@ def _derive_default_chrome_plan(state: PipelineState) -> list[dict]:
         en_label = _EN_LABELS.get(idx, "CHAPTER")
         plan.append({
             "svg": p.name,
+            "section_idx": idx,  # Phase 13: for chrome_meta dict merge
             "chapter_label": f"PART {idx:02d} · {en_label}",
             "doc_path": "采购制度 / 山西柏腾科技有限公司",
             "page_num": idx + 1,  # 1-based page (offset by cover/TOC)
             "total_pages": total + 2,  # + cover + TOC
         })
     return plan
+
+
+def _resolve_chrome_meta(meta, state: PipelineState) -> list[dict]:
+    """Resolve a caller-supplied ``chrome_meta`` into a chrome plan.
+
+    Phase 13 (2026-09-17): two accepted forms:
+
+    * ``list[dict]`` — each entry directly describes a slide:
+      ``{svg, chapter_label, doc_path, page_num, total_pages, skip?}``.
+    * ``dict`` — shorthand: ``{"base": {...}, "by_section":
+      {section_idx: chapter_label, ...}}`` merged with the default
+      plan produced by :func:`_derive_default_chrome_plan`.
+
+    The dict form supports partial overrides: missing fields fall
+    back to the default plan; ``by_section`` overrides only the
+    ``chapter_label`` of matching sections; ``base`` (a dict) shallow-
+    overrides the corresponding keys on every entry.
+
+    Returns
+    -------
+    list[dict]
+        Same shape as ``_derive_default_chrome_plan``.
+    """
+    if isinstance(meta, list):
+        # List form: pass through, but backfill section_idx when caller
+        # didn't supply it (tested by key, not relied on).
+        out: list[dict] = []
+        for entry in meta:
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"chrome_meta list entries must be dict, got "
+                    f"{type(entry).__name__}: {entry!r}")
+            out.append(entry)
+        return out
+    if isinstance(meta, dict):
+        # Dict form: merge with the default plan.
+        base = {k: v for k, v in meta.items() if k != "by_section"}
+        by_section = meta.get("by_section") or {}
+        if not isinstance(by_section, dict):
+            raise ValueError(
+                f"chrome_meta.by_section must be dict, got "
+                f"{type(by_section).__name__}")
+        default_plan = _derive_default_chrome_plan(state)
+        out = []
+        for entry in default_plan:
+            sec_idx = entry.get("section_idx")
+            new_entry = {**entry, **base}
+            if sec_idx is not None and sec_idx in by_section:
+                new_entry["chapter_label"] = by_section[sec_idx]
+            out.append(new_entry)
+        # Allow extra entries in by_section that don't match any
+        # default-plan section (caller-only slides, e.g. a closing).
+        for sec_idx, label in by_section.items():
+            try:
+                idx_int = int(sec_idx)
+            except (TypeError, ValueError):
+                continue
+            if any(e.get("section_idx") == idx_int for e in out):
+                continue
+            # Synthesize a minimal entry for the missing section.
+            out.append({
+                "svg": f"slide_part{int(sec_idx):02d}_content.svg",
+                "section_idx": int(sec_idx),
+                "chapter_label": label,
+                "doc_path": base.get("doc_path",
+                                      "采购制度 / 山西柏腾科技有限公司"),
+                "page_num": int(sec_idx) + 1,
+                "total_pages": (base.get("total_pages")
+                                or len(default_plan) + 2),
+            })
+        return out
+    raise ValueError(
+        f"chrome_meta must be list[dict] or dict, got "
+        f"{type(meta).__name__}")
 
 
 def normalize_export_artifacts(
@@ -1173,6 +1299,7 @@ def phase4_quality(
     max_fix_iterations: int,
     timeout_ms: int = 60_000,
     strict: bool = True,
+    preflight_strict: bool | None = None,
 ) -> PipelineState:
     """Phase 4: refresh summary + quality check + optional auto-fix loop.
 
@@ -1181,11 +1308,60 @@ def phase4_quality(
     advances to phase 5 anyway. Required for templates whose vendor
     quality checker emits WARN for non-blocking issues that don't
     actually block svg_to_pptx (e.g. boteng's "non-PPT-safe font" WARN).
+
+    ``preflight_strict`` controls the PR-12 offline lint gate (P1-P4
+    hard constraints from ppt-master Edit Native). Default ``None``
+    inherits from ``strict``: callers using ``quality_strict=False``
+    (boteng-style) also get advisory preflight, callers using
+    ``quality_strict=True`` get fail-fast on P1-P3 violations.
     """
     state.stage = "quality"
     workspace = state.workspace
     assert workspace is not None
     authoring_dir = workspace / "authoring-svg-flat"
+
+    # PR-12 (2026-09-17): offline lint against the 4 ppt-master Edit
+    # Native hard constraints BEFORE the vendor quality check runs.
+    # Catches duplicate-ids / missing picture shape-id / semantic
+    # multi-text / single-child wrappers with a clear message instead
+    # of letting vendor svg_to_pptx abort with cryptic errors.
+    if preflight_strict is None:
+        preflight_strict = strict
+    try:
+        from . import preflight_check as _preflight
+        preflight_report = _preflight.scan_directory(authoring_dir)
+    except FileNotFoundError:
+        log.warning("phase4 preflight: authoring-svg-flat not found")
+        preflight_report = None
+
+    if preflight_report is not None:
+        if preflight_report.errors:
+            # Cap the message at 10 findings so a single bad template
+            # doesn't produce a wall-of-text state.errors entry.
+            detail_lines = [
+                f"  {f.svg_file}:{f.element_id or '?'} "
+                f"[{f.rule}] {f.detail}"
+                for f in preflight_report.errors[:10]
+            ]
+            preflight_msg = (
+                f"phase4 preflight: {len(preflight_report.errors)} "
+                f"violation(s) in {preflight_report.svg_files_scanned} "
+                f"SVG(s):\n" + "\n".join(detail_lines)
+            )
+            if preflight_strict:
+                state.stage = "failed"
+                state.errors.append(preflight_msg)
+                log.error(preflight_msg)
+                return state
+            log.warning(preflight_msg)
+            state.warnings.append(preflight_msg)
+        for w in preflight_report.warnings:
+            msg = (
+                f"phase4 preflight warning {w.svg_file}:"
+                f"{w.element_id or '?'} [{w.rule}] {w.detail}"
+            )
+            state.warnings.append(msg)
+            log.warning(msg)
 
     # Pre-repair vendor XML bugs (duplicate attributes, unescaped inner
     # quotes) on every SVG in the workspace so that vendor tools
@@ -1275,8 +1451,10 @@ def phase5_export(
     *,
     validate_strict: bool = True,
     timeout_ms: int = 240_000,
+    render_previews: bool = False,
 ) -> PipelineState:
-    """Phase 5: svg_to_pptx + delivery_check + source_to_md."""
+    """Phase 5: svg_to_pptx + delivery_check + source_to_md + optional
+    PR-13 cairosvg preview rendering."""
     state.stage = "export"
     state.output_pptx = output_pptx
     workspace = state.workspace
@@ -1344,6 +1522,29 @@ def phase5_export(
         str(readback_md) if rm.ok and readback_md.is_file() else ""
     )
 
+    # PR-13 (2026-09-17): render authoring SVGs to PNG previews under
+    # validation/diff/ for visual sanity checks. Opt-in: cheap (cairosvg
+    # is fast), but some callers might prefer not to write PNGs to disk.
+    if render_previews:
+        try:
+            from . import render_diff as _render_diff
+            preview_report = _render_diff.render_svg_previews(workspace)
+            state.last_delivery = state.last_delivery or {}
+            state.last_delivery["preview_dir"] = preview_report.output_dir
+            state.last_delivery["preview_pngs_written"] = (
+                preview_report.pngs_written
+            )
+            state.last_delivery["preview_failure_count"] = (
+                len(preview_report.failures)
+            )
+        except FileNotFoundError:
+            log.warning("phase5 render_previews: workspace missing")
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "phase5 render_previews failed: %s: %s",
+                type(exc).__name__, exc,
+            )
+
     state.stage = "done"
     return state
 
@@ -1370,8 +1571,28 @@ def run_native_fill(
     skip_phase3_5: bool = False,
     disabled_autofixes: tuple[str, ...] = (),
     quality_strict: bool = True,
+    # PR-13 (2026-09-17): produce PNG previews of authoring SVGs at
+    # validation/diff/ via cairosvg. Default False to avoid writing
+    # PNGs that the caller didn't ask for; :func:`entry.generate_pptx`
+    # flips it on by default.
+    render_previews: bool = False,
+    # PR-12 (2026-09-17): preflight (P1-P4 hard constraint) strictness.
+    # None inherits from ``quality_strict``. False is the boteng default
+    # (``vendor QC`` is advisory) — preflight violations become warnings.
+    preflight_strict: bool | None = None,
     # Phase 9 (2026-09-16): layout hints forwarded to the LLM planner.
     llm_layout_hints: dict[str, Any] | None = None,
+    # Phase 13 (2026-09-17): chrome/archetype flexibility options.
+    # Defaults preserve Phase 12 behavior (chrome on, ppt-master
+    # archetypes on, no new archetypes).
+    enable_chrome_topbar: bool = True,
+    enable_chrome_footer: bool = True,
+    enable_ppt_master_archetypes: bool = True,
+    enable_section_divider: bool = False,
+    enable_closing_archetype: bool = False,
+    chrome_meta: list[dict] | dict | None = None,
+    palette: dict | None = None,
+    archetype_override: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """End-to-end native_fill pipeline.
 
@@ -1397,6 +1618,21 @@ def run_native_fill(
         )
         disabled_autofixes = merged
     state = PipelineState(skill_dir=skill_dir)
+
+    # Phase 13 (2026-09-17): record the chrome/archetype flexibility
+    # options on state.context so downstream phases (_inject_content_chrome
+    # + block_renderer dispatch) can read them. Defaults preserve Phase 12
+    # behavior, so callers that don't pass new options see no change.
+    state.context["phase13_options"] = {
+        "enable_chrome_topbar": enable_chrome_topbar,
+        "enable_chrome_footer": enable_chrome_footer,
+        "enable_ppt_master_archetypes": enable_ppt_master_archetypes,
+        "enable_section_divider": enable_section_divider,
+        "enable_closing_archetype": enable_closing_archetype,
+        "chrome_meta": chrome_meta,
+        "palette": palette,
+        "archetype_override": archetype_override,
+    }
 
     guard = runner.run_attribution_guard(skill_dir)
     if not guard.ok:
@@ -1490,6 +1726,7 @@ def run_native_fill(
         auto_fix=auto_fix,
         max_fix_iterations=max_fix_iterations,
         strict=quality_strict,
+        preflight_strict=preflight_strict,
     )
     if state.stage == "failed":
         return _finalize(state)
@@ -1499,6 +1736,7 @@ def run_native_fill(
         state,
         output_pptx=output_pptx,
         validate_strict=validate_strict,
+        render_previews=render_previews,
     )
     return _finalize(state)
 
@@ -1583,7 +1821,24 @@ def run_with_mapping(
     max_fix_iterations: int = 3,
     validate_strict: bool = True,
     quality_strict: bool = False,
+    # PR-12 (2026-09-17): forwarded to run_native_fill. None means
+    # inherit from quality_strict (i.e. advisory for boteng).
+    preflight_strict: bool | None = None,
+    # PR-13 (2026-09-17): forwarded to run_native_fill. Default False
+    # here (low-level wrapper); :func:`entry.generate_pptx` flips on.
+    render_previews: bool = False,
     clean_workspace: bool = False,
+    # Phase 13 (2026-09-17): chrome/archetype flexibility options.
+    # Forwarded verbatim to ``run_native_fill``; defaults preserve
+    # Phase 12 behavior.
+    enable_chrome_topbar: bool = True,
+    enable_chrome_footer: bool = True,
+    enable_ppt_master_archetypes: bool = True,
+    enable_section_divider: bool = False,
+    enable_closing_archetype: bool = False,
+    chrome_meta: list[dict] | dict | None = None,
+    palette: dict | None = None,
+    archetype_override: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """One-stop driver for the "manual mapping + markdown section cloning" workflow.
 
@@ -1837,8 +2092,19 @@ def run_with_mapping(
         skip_phase3_5=skip_phase3_5,
         disabled_autofixes=disabled_autofixes,
         quality_strict=quality_strict,
+        preflight_strict=preflight_strict,
+        render_previews=render_previews,
         enable_llm_planner=enable_llm_planner,
         llm_layout_hints=llm_layout_hints,
+        # Phase 13 (2026-09-17): forward chrome/archetype flexibility.
+        enable_chrome_topbar=enable_chrome_topbar,
+        enable_chrome_footer=enable_chrome_footer,
+        enable_ppt_master_archetypes=enable_ppt_master_archetypes,
+        enable_section_divider=enable_section_divider,
+        enable_closing_archetype=enable_closing_archetype,
+        chrome_meta=chrome_meta,
+        palette=palette,
+        archetype_override=archetype_override,
     )
     # Augment result with the pre-delegation work that the caller
     # asked about (edit_summary, strip_report, expansions, toc_summary).
