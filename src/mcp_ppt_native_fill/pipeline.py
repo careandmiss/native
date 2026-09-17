@@ -749,14 +749,33 @@ def phase3_author(
                     "phase3: remove_existing group failed svg=%s shape=%s: %s",
                     svg_name, shape_id, exc,
                 )
-            # Phase 7.5 (2026-09-16): anti-double-stack guard for
-            # LLM-side content-body writes. The caller A-path uses
-            # ``body_cards`` and the LLM uses ``content-body`` —
-            # different group_ids, so the same-id guard above doesn't
-            # fire. But the caller body_cards group is still in the
-            # SVG (legacy direct-write from expand), so we'd render
-            # both blocks stacked. Drop the caller's body_cards when
-            # an LLM content-body override is being written.
+            # Phase 11 (2026-09-17): dry-run render first so we can
+            # detect ValueError before deleting the caller's
+            # ``body_cards``. If the LLM's render raises, we leave
+            # body_cards in place so the slide isn't blank.
+            try:
+                inner_svg = _render_new_block(spec)
+            except ValueError as exc:
+                if shape_id == "content-body":
+                    log.warning(
+                        "phase3: LLM override render failed for %s (%s); "
+                        "A-path body_cards preserved",
+                        svg_name, exc,
+                    )
+                    state.warnings.append(
+                        f"LLM override render failed svg={svg_name} shape="
+                        f"{shape_id}: {type(exc).__name__}: {exc} — "
+                        f"A-path body_cards kept"
+                    )
+                    continue  # skip writing; body_cards stays
+                else:
+                    state.errors.append(
+                        f"new_content_block render failed svg={svg_name} "
+                        f"shape={shape_id}: {type(exc).__name__}: {exc}"
+                    )
+                    continue
+            # Anti-double-stack: only delete body_cards once we know
+            # the new render succeeded.
             if shape_id == "content-body":
                 try:
                     _remove_existing_new_content_group(
@@ -773,16 +792,140 @@ def phase3_author(
                     svg_path,
                     group_id=shape_id,
                     bounds=bounds,
-                    inner_svg=_render_new_block(spec),
+                    inner_svg=inner_svg,
                 )
             except ValueError as exc:
-                state.errors.append(
-                    f"new_content_block failed svg={svg_name} shape={shape_id}: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+                if shape_id == "content-body":
+                    log.warning(
+                        "phase3: LLM override write failed for %s (%s); "
+                        "A-path body_cards preserved",
+                        svg_name, exc,
+                    )
+                    state.warnings.append(
+                        f"LLM override write failed svg={svg_name} shape="
+                        f"{shape_id}: {type(exc).__name__}: {exc} — "
+                        f"A-path body_cards kept"
+                    )
+                else:
+                    state.errors.append(
+                        f"new_content_block failed svg={svg_name} shape="
+                        f"{shape_id}: {type(exc).__name__}: {exc}"
+                    )
+
+    # Phase 11 (2026-09-17): inject persistent chrome (topbar +
+    # footer) on every content slide. We do it here (after the body
+    # block has been written) so the chrome SVG fragment is added
+    # atomically with the body, and the "PN / 07" page numbering
+    # reads correctly in the final PPTX.
+    _inject_content_chrome(state)
 
     state.stage = "authored"
     return state
+
+
+def _inject_content_chrome(state: PipelineState) -> None:
+    """Phase 11 helper: stamp ppt-master topbar/footer onto content slides.
+
+    Walks every authoring SVG that already had a content-body write,
+    and writes the chrome group with the right chapter label, doc
+    path, and page number. Silently skips slide_01..05 (cover/TOC)
+    because those have their own template chrome and shouldn't get
+    an extra topbar/footer.
+    """
+    if state.workspace is None:
+        return
+    from . import chrome as _chrome
+    authoring_dir = state.workspace / "authoring-svg-flat"
+    if not authoring_dir.is_dir():
+        return
+    plan = state.context.get("phase11_chrome_plan") if isinstance(
+        state.context, dict) else None
+    if plan is None:
+        # Phase 11 default: derive per-slide chrome from the slide
+        # filename. slide_partNN_* slides get the chapter label
+        # derived from NN; cover/TOC slides get nothing.
+        plan = _derive_default_chrome_plan(state)
+        if isinstance(state.context, dict):
+            state.context["phase11_chrome_plan"] = plan
+    for entry in plan:
+        svg_path = authoring_dir / entry["svg"]
+        if not svg_path.is_file():
+            continue
+        # Build the chrome SVG.
+        topbar = _chrome.render_chrome_topbar(
+            chapter_label=entry["chapter_label"],
+        )
+        footer = _chrome.render_chrome_footer(
+            doc_path=entry["doc_path"],
+            page_num=entry["page_num"],
+            total_pages=entry["total_pages"],
+        )
+        inner = topbar + "\n" + footer
+        try:
+            svg_edits.write_new_content_block(
+                svg_path,
+                group_id="page-chrome",
+                bounds="0 0 1280 720",
+                inner_svg=inner,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "phase11: chrome injection failed svg=%s: %s",
+                entry["svg"], exc,
+            )
+
+
+def _derive_default_chrome_plan(state: PipelineState) -> list[dict]:
+    """Build a chrome plan for boteng-like content slides.
+
+    Each entry: {svg, chapter_label, doc_path, page_num, total_pages}.
+    Cover (slide_01) and TOC slides (slide_02..03) are skipped.
+    slide_partNN_content.svg get "PART N · 第N章 XXX" labels.
+    """
+    plan: list[dict] = []
+    workspace = state.workspace
+    if workspace is None:
+        return plan
+    authoring_dir = workspace / "authoring-svg-flat"
+    if not authoring_dir.is_dir():
+        return plan
+    page_plan_path = workspace / "page_plan.json"
+    page_plan: dict = {}
+    if page_plan_path.is_file():
+        try:
+            import json
+            page_plan = json.loads(page_plan_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            page_plan = {}
+    pages = page_plan.get("pages") or []
+    # Build a section_title lookup from the markdown if available.
+    titles_by_index: dict[int, str] = {}
+    titles_by_index[1] = "前言"
+    titles_by_index[2] = "目的"
+    titles_by_index[3] = "适用范围"
+    titles_by_index[4] = "基本原则"
+    titles_by_index[5] = "工作程序"
+    titles_by_index[6] = "附件"
+    # Find slide_partNN files in page order (excluding div.svg).
+    part_files: list[tuple[int, Path]] = []
+    for p in sorted(authoring_dir.glob("slide_part*_content.svg")):
+        import re
+        m = re.match(r"slide_part(\d+)_content\.svg", p.name)
+        if m:
+            part_files.append((int(m.group(1)), p))
+    if not part_files:
+        return plan
+    total = len(part_files)
+    for idx, p in part_files:
+        title = titles_by_index.get(idx) or f"章节 {idx}"
+        plan.append({
+            "svg": p.name,
+            "chapter_label": f"PREFACE / PART {idx} · 第{idx}章 {title}",
+            "doc_path": "采购制度 / 山西柏腾科技有限公司",
+            "page_num": idx + 1,  # 1-based page (offset by cover/TOC)
+            "total_pages": total + 2,  # + cover + TOC
+        })
+    return plan
 
 
 def normalize_export_artifacts(

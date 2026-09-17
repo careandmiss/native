@@ -63,6 +63,18 @@ def escape(text: str) -> str:
     )
 
 
+# Phase 11 (2026-09-17): Chinese number sequence used by
+# procedural-steps to render "阶段一 / 阶段二 / 阶段三 / 阶段四".
+_CN_NUM = ("零", "一", "二", "三", "四", "五", "六", "七", "八", "九")
+
+
+def _cn_num(n: int) -> str:
+    """Return the Chinese ordinal for a 1-based phase number."""
+    if 1 <= n < len(_CN_NUM):
+        return _CN_NUM[n]
+    return str(n)
+
+
 def render_new_block(spec: dict[str, Any]) -> str:
     """Render a ``new_content_block`` spec into raw SVG children.
 
@@ -191,19 +203,19 @@ def render_new_block(spec: dict[str, Any]) -> str:
                 )
         return "\n".join(parts)
     if layout == "revision-table":
+        # Phase 11 (2026-09-17): ppt-master table_summary geometry.
+        # White panel (rx=12) + 6px gold top + 64px #1D2CAB header
+        # bar + 5 alternating body rows 76px each + #C8D2E0 dividers.
         rows = payload.get("rows") or []
-        if not rows:
-            raise ValueError("revision-table requires spec.rows")
+        # Phase 11 (2026-09-17): allow empty rows — we'll render the
+        # 5 alternating placeholder rows anyway. Empty rows is the
+        # boteng 附件 scenario where the markdown has a table header
+        # but no data rows yet.
         bounds = spec.get("bounds") or payload.get("bounds")
         bx, by, bw, bh = (float(t) for t in bounds.split())
-        # Phase 8 (2026-09-16): variable column count. Boteng's 附件
-        # section ships a 6-column revision table (日期 / 状态 /
-        # 修改内容 / 修改人 / 审核人 / 批准人) — we now size columns
-        # by the actual key set in the first non-empty row, falling
-        # back to the historical 4-column defaults if the rows are
-        # all empty or use the legacy keys.
+        scale = bw / 1280.0
+
         keys = ("date", "status", "content", "author")
-        # If a non-empty row exposes extra cols, widen the key list.
         for r in rows:
             if isinstance(r, dict):
                 for k in r.keys():
@@ -212,50 +224,90 @@ def render_new_block(spec: dict[str, Any]) -> str:
                 break
         n_cols = len(keys)
         col_w = bw / n_cols
-        row_h = min(28.0, (bh - 32) / max(len(rows), 1))
+
+        HEADER_H = 64.0 * scale
+        ROW_H = 76.0 * scale
+        GOLD_TOP = 6.0 * scale
+
         parts: list[str] = []
-        # Header background.
+        # 1. White panel (rx=12).
         parts.append(
-            f'<rect x="{bx:g}" y="{by:g}" width="{bw:g}" height="28" '
-            f'fill="#1D2CAB" fill-opacity="0.08"/>'
+            f'<rect x="{bx:g}" y="{by:g}" width="{bw:g}" height="{bh:g}" '
+            f'rx="{12:g}" fill="#FFFFFF"/>'
         )
-        # Header text: prefer caller-supplied ``header`` map; otherwise
-        # synthesize from the key names (date→日期 etc.).
+        # 2. 6px gold top accent.
+        parts.append(
+            f'<rect x="{bx:g}" y="{by:g}" width="{bw:g}" '
+            f'height="{GOLD_TOP:g}" fill="#D4A24C"/>'
+        )
+        # 3. 64px brand-blue header bar.
+        parts.append(
+            f'<rect x="{bx:g}" y="{by + GOLD_TOP:g}" width="{bw:g}" '
+            f'height="{HEADER_H:g}" fill="#1D2CAB"/>'
+        )
+        # 4. Header text.
         header_map = payload.get("headers") or {
-            "date": "日期",
-            "status": "状态",
-            "content": "内容",
-            "author": "修改人",
-            "reviewer": "审核人",
-            "approver": "批准人",
-            "col3": "内容",
-            "col4": "修改人",
-            "col5": "审核人",
-            "col6": "批准人",
+            "date": "日 期",
+            "status": "修订状态",
+            "content": "修 改 内 容",
+            "author": "修 改 人",
+            "reviewer": "审 核 人",
+            "approver": "批 准 人",
         }
         for j, key in enumerate(keys):
+            cx_text = bx + j * col_w + col_w / 2.0
             parts.append(
-                f'<text x="{bx + j * col_w + 12:g}" y="{by + 19:g}" '
-                f'font-size="13" font-weight="bold" fill="#1D2CAB">'
-                f'{escape(header_map.get(key, key))}</text>'
+                f'<text x="{cx_text:g}" y="{by + GOLD_TOP + HEADER_H * 0.6:g}" '
+                f'font-size="{14*scale:g}" font-weight="bold" '
+                f'fill="#FFFFFF" text-anchor="middle">'
+                f'{escape(str(header_map.get(key, key)))}</text>'
             )
-        # Rows.
+        # 5. Header column dividers.
+        for j in range(1, n_cols):
+            div_x = bx + j * col_w
+            parts.append(
+                f'<line x1="{div_x:g}" y1="{by + GOLD_TOP + 4*scale:g}" '
+                f'x2="{div_x:g}" y2="{by + GOLD_TOP + HEADER_H - 4*scale:g}" '
+                f'stroke="#2A4DCB" stroke-width="1"/>'
+            )
+        # 6. Body rows (alternating fill).
+        n_rows = max(len(rows), 5)
+        body_top = by + GOLD_TOP + HEADER_H
+        for i in range(n_rows):
+            ry = body_top + i * ROW_H
+            if ry + ROW_H > by + bh:
+                break
+            row_fill = "#FFFFFF" if i % 2 == 0 else "#F4F7FB"
+            parts.append(
+                f'<rect x="{bx:g}" y="{ry:g}" width="{bw:g}" '
+                f'height="{ROW_H:g}" fill="{row_fill}"/>'
+            )
+            parts.append(
+                f'<line x1="{bx:g}" y1="{ry + ROW_H:g}" '
+                f'x2="{bx + bw:g}" y2="{ry + ROW_H:g}" stroke="#C8D2E0" '
+                f'stroke-width="1"/>'
+            )
+        # 7. Full column dividers.
+        for j in range(1, n_cols):
+            div_x = bx + j * col_w
+            parts.append(
+                f'<line x1="{div_x:g}" y1="{body_top:g}" '
+                f'x2="{div_x:g}" y2="{body_top + n_rows * ROW_H:g}" '
+                f'stroke="#C8D2E0" stroke-width="1"/>'
+            )
+        # 8. Cell text (rows with actual data only).
         for i, row in enumerate(rows):
-            ry = by + 32 + i * row_h
-            if ry + row_h > by + bh:
-                break  # bounds budget exhausted
+            ry = body_top + i * ROW_H
+            if ry + ROW_H > by + bh:
+                break
             for j, key in enumerate(keys):
+                if not isinstance(row, dict):
+                    continue
                 raw_val = row.get(key, "")
-                # Bug 10 fix: list values now render as multiple <tspan>
-                # lines (one per item) instead of "; "-joined into a
-                # single long cell string. The first item stays inline;
-                # subsequent items use dy="14" to step down a line within
-                # the same <text> element (so the cell stays vertically
-                # aligned with its row baseline).
                 if isinstance(raw_val, (list, tuple)):
                     cell_items = [str(v) for v in raw_val]
                 elif isinstance(raw_val, dict):
-                    cell_items = [f"{k}={v}" for k, v in raw_val.items()]
+                    cell_items = [f"{k}={v}" for k, val in raw_val.items()]
                 else:
                     cell_items = [str(raw_val)]
                 tspans = []
@@ -267,14 +319,22 @@ def render_new_block(spec: dict[str, Any]) -> str:
                             f'<tspan x="{bx + j * col_w + 12:g}" dy="14">'
                             f'{escape(item)}</tspan>'
                         )
+                if not cell_items or not str(cell_items[0]):
+                    continue
                 parts.append(
-                    f'<text x="{bx + j * col_w + 12:g}" y="{ry + 18:g}" '
-                    f'font-size="12" fill="#333">{"".join(tspans)}</text>'
+                    f'<text x="{bx + j * col_w + 12:g}" '
+                    f'y="{ry + 22*scale:g}" '
+                    f'font-size="{12*scale:g}" fill="#0E1B2C">'
+                    f'{"".join(tspans)}</text>'
                 )
-            # Row separator.
+        # 9. Placeholder hint.
+        if len(rows) <= 1:
             parts.append(
-                f'<line x1="{bx:g}" y1="{ry + row_h:g}" x2="{bx + bw:g}" '
-                f'y2="{ry + row_h:g}" stroke="#E0E0E0" stroke-width="0.5"/>'
+                f'<text x="{bx + bw/2:g}" '
+                f'y="{by + bh - 24*scale:g}" '
+                f'font-size="{13*scale:g}" fill="#C8D2E0" '
+                f'text-anchor="middle" font-style="italic">'
+                f'首次发布 · 后续修订请按表中栏目填写</text>'
             )
         return "\n".join(parts)
     # Bug 3 fix (Phase B): add 4 new layouts so the LLM has variety
@@ -591,13 +651,25 @@ def render_new_block(spec: dict[str, Any]) -> str:
     # neutral stack: bg #FFFFFF, panel #F4F6F8, hairline #D6DCE3,
     # ink #1E293B, body #64748B, muted #94A3B8).
     if layout == "statement-caption":
-        # ppt-master analog: content_caption (256px left rail + 768px
-        # right panel with vertical divider at x=360 in ppt-master's
-        # 1280px canvas; we anchor to body_bounds so it works on any
-        # caller-supplied bounds).
+        # Phase 11 (2026-09-17): ppt-master's content_caption geometry
+        # (see projects/boteng_ppt_20260916/svg_final/02_preface.svg).
+        # 240px gradient blue rail (top-left) + 876px white panel
+        # (top-right) with vertical hairline at x=320. Rail holds a
+        # 56px gold section index, a 32px white title, an en-subtitle,
+        # a short caption, an optional doc code, and 3 lines of body
+        # summary. Panel holds a 22px blue title, a 14px en-subtitle,
+        # a 96px gold accent, a 72px huge opening quote, multi-line
+        # body, and a takeaway band (90px high) with a 6px gold left
+        # border. Geometry is anchored to ``body_bounds`` (caller may
+        # pass any 1280x720 frame) and scaled.
         title = payload.get("title", "")
-        eyebrow = payload.get("eyebrow", "")  # optional small label
+        eyebrow = payload.get("eyebrow", "")  # optional rail label
+        eyebrow_en = payload.get("eyebrow_en", "")  # optional rail en label
+        index_num = payload.get("index_num", "")  # optional big gold number
+        caption = payload.get("caption", "")  # rail short caption
+        doc_code = payload.get("doc_code", "")  # rail footer (e.g. BT-ZD-001)
         body = payload.get("body", "")
+        takeaway = payload.get("takeaway", "")  # panel bottom band text
         if not isinstance(title, str) or not title:
             raise ValueError("statement-caption requires spec.title")
         if not isinstance(body, str) or not body:
@@ -606,173 +678,403 @@ def render_new_block(spec: dict[str, Any]) -> str:
         bounds = spec.get("bounds") or payload.get("bounds")
         bx, by, bw, bh = (float(t) for t in bounds.split())
 
-        # Geometry: 256px left rail + 16px gutter + 768px right panel.
-        # ppt-master uses 272 = 256 + 16; we anchor the rail to bx so
-        # any caller-supplied body_bounds works (boteng passes
-        # "120 130 1060 480" → rail at x=120..376, divider @ x=392).
-        RAIL_W = 256.0
-        DIV_X = bx + RAIL_W + 16.0
-        PANEL_X = DIV_X + 16.0
-        TOP = by + 24.0
+        # ppt-master geometry: 240px gradient rail + 16px gutter +
+        # rest white panel. We scale so that (rail + gutter + panel)
+        # = bw, with rail = 240 * (bw/1280) and panel absorbs the rest.
+        # boteng's content body_bounds is "120 130 1060 480", so
+        # bw=1060, but the visual product lands in the same relative
+        # proportions.
+        scale = bw / 1280.0
+        RAIL_W = 240.0 * scale
+        GUTTER = 16.0 * scale
+        DIV_X = bx + RAIL_W + GUTTER
+        PANEL_X = DIV_X + GUTTER
 
         parts: list[str] = []
-        # 1. Soft tint behind left rail (NOT a card — flat block).
+        # 0. Gradient definition (id-scoped to this slide). Must come
+        # before any <rect fill="url(#...)"> that references it. Native
+        # svg_to_pptx converts <linearGradient> to <a:gradFill> on the
+        # rect it tints; id collisions are tolerated (last write wins).
+        rail_grad_id = "prefaceRail"
+        parts.append(
+            f'<defs><linearGradient id="{rail_grad_id}" x1="0" '
+            f'y1="0" x2="0" y2="1">'
+            f'<stop offset="0%" stop-color="#1D2CAB"/>'
+            f'<stop offset="100%" stop-color="#2A4DCB"/>'
+            f'</linearGradient></defs>'
+        )
+
+        # 1. Gradient rail (top of card).
         parts.append(
             f'<rect x="{bx:g}" y="{by:g}" width="{RAIL_W:g}" '
-            f'height="{bh:g}" fill="#F4F6F8"/>'
+            f'height="{bh:g}" rx="{12:g}" fill="url(#{rail_grad_id})"/>'
         )
-        # 2. Vertical hairline divider (1px, calm gray).
+        # 2. White panel.
         parts.append(
-            f'<line x1="{DIV_X:g}" y1="{by + 20:g}" '
-            f'x2="{DIV_X:g}" y2="{by + bh - 20:g}" '
-            f'stroke="#D6DCE3" stroke-width="1"/>'
+            f'<rect x="{PANEL_X:g}" y="{by:g}" width="{bw - RAIL_W - 2*GUTTER:g}" '
+            f'height="{bh:g}" rx="{12:g}" fill="#FFFFFF"/>'
         )
-        # 3. Eyebrow (optional small chapter label) — letter-spaced.
-        if eyebrow:
+
+        # === RAIL content ===
+        rail_pad = 28.0 * scale
+        # 3. Big gold section index (e.g. "01").
+        if index_num:
             parts.append(
-                f'<text x="{bx + 32:g}" y="{TOP + 12:g}" font-size="14" '
-                f'font-weight="500" fill="#64748B" letter-spacing="1.2">'
-                f'{escape(eyebrow.upper())}</text>'
+                f'<text x="{bx + rail_pad:g}" y="{by + 80*scale:g}" '
+                f'font-size="{56*scale:g}" font-weight="bold" '
+                f'fill="#D4A24C">{escape(str(index_num))}</text>'
             )
-            title_y = TOP + 56.0
+            parts.append(
+                f'<line x1="{bx + rail_pad:g}" y1="{by + 100*scale:g}" '
+                f'x2="{bx + rail_pad + 88*scale:g}" '
+                f'y2="{by + 100*scale:g}" stroke="#FFFFFF" '
+                f'stroke-width="2" stroke-opacity="0.6"/>'
+            )
+            # Title below index.
+            title_y = by + 148 * scale
         else:
-            title_y = TOP + 32.0
-        # 4. Left rail title (32px 700 ink).
+            title_y = by + 56 * scale
+        # 4. Rail title (32px white bold).
         parts.append(
-            f'<text x="{bx + 32:g}" y="{title_y:g}" font-size="32" '
-            f'font-weight="700" fill="#1E293B">{escape(title)}</text>'
+            f'<text x="{bx + rail_pad:g}" y="{title_y:g}" '
+            f'font-size="{32*scale:g}" font-weight="bold" '
+            f'fill="#FFFFFF">{escape(title)}</text>'
         )
-        # 5. Right panel body — CJK-aware wrap, same approach as
-        # simple-text. Auto-shrink to 14px if lines don't fit bh.
-        from .text_width import chars_that_fit
-        inner_w = bx + bw - PANEL_X - 32.0
-        font_size = 19.0
-        cpl = chars_that_fit(inner_w, font_size)
-        if cpl <= 0:
-            raise ValueError(
-                f"statement-caption bounds too narrow for font_size="
-                f"{font_size} (inner_w={inner_w:g})"
+        # 5. Eyebrow / en-label below title.
+        if eyebrow_en:
+            parts.append(
+                f'<text x="{bx + rail_pad:g}" y="{title_y + 28*scale:g}" '
+                f'font-size="{14*scale:g}" fill="#D2DAF9" '
+                f'letter-spacing="2">{escape(str(eyebrow_en))}</text>'
             )
-        lines = [body[i:i + cpl] for i in range(0, len(body), cpl)]
-        usable = max(1.0, (bh - 2 * 32.0) / (font_size * 1.5))
-        while len(lines) > usable and font_size > 14.0:
-            font_size -= 1.0
-            cpl = chars_that_fit(inner_w, font_size)
-            if cpl <= 0:
+        # 6. Caption (rail mid-section).
+        if caption:
+            cap_y = by + bh * 0.55
+            parts.append(
+                f'<text x="{bx + rail_pad:g}" y="{cap_y:g}" '
+                f'font-size="{14*scale:g}" fill="#FFFFFF">'
+                f'{escape(str(caption))}</text>'
+            )
+            parts.append(
+                f'<line x1="{bx + rail_pad:g}" y1="{cap_y + 14*scale:g}" '
+                f'x2="{bx + rail_pad + (RAIL_W - 2*rail_pad - 20):g}" '
+                f'y2="{cap_y + 14*scale:g}" stroke="#D4A24C" '
+                f'stroke-width="1.5"/>'
+            )
+            # Body 3-line summary.
+            from .text_width import chars_that_fit
+            inner_w = RAIL_W - 2 * rail_pad - 16
+            cpl = chars_that_fit(inner_w, 12.0)
+            if cpl > 0:
+                body_lines = [
+                    body[i:i + cpl] for i in range(0, len(body), cpl)
+                ][:3]
+                for j, ln in enumerate(body_lines):
+                    byline = cap_y + 38 * scale + j * 18 * scale
+                    if byline > by + bh - 50 * scale:
+                        break
+                    parts.append(
+                        f'<text x="{bx + rail_pad:g}" y="{byline:g}" '
+                        f'font-size="{12*scale:g}" fill="#D2DAF9" '
+                        f'letter-spacing="1">{escape(ln)}</text>'
+                    )
+        # 7. Doc code at rail bottom.
+        if doc_code:
+            parts.append(
+                f'<text x="{bx + rail_pad:g}" y="{by + bh - 28*scale:g}" '
+                f'font-size="{11*scale:g}" fill="#D2DAF9" '
+                f'letter-spacing="2">{escape(str(doc_code))}</text>'
+            )
+
+        # === PANEL content ===
+        panel_pad = 36.0 * scale
+        # 8. Panel title (22px blue bold).
+        parts.append(
+            f'<text x="{PANEL_X + panel_pad:g}" '
+            f'y="{by + 56*scale:g}" font-size="{22*scale:g}" '
+            f'font-weight="bold" fill="#1D2CAB">'
+            f'{escape(title)}</text>'
+        )
+        # 9. Panel en-subtitle (14px muted).
+        if eyebrow_en:
+            parts.append(
+                f'<text x="{PANEL_X + panel_pad:g}" '
+                f'y="{by + 82*scale:g}" font-size="{14*scale:g}" '
+                f'fill="#5A6678">{escape(str(eyebrow_en))}</text>'
+            )
+        # 10. Gold accent line (124px).
+        parts.append(
+            f'<line x1="{PANEL_X + panel_pad:g}" y1="{by + 98*scale:g}" '
+            f'x2="{PANEL_X + panel_pad + 124*scale:g}" '
+            f'y2="{by + 98*scale:g}" stroke="#D4A24C" stroke-width="2"/>'
+        )
+        # 11. Big opening quote glyph (72px gold, 18% opacity).
+        parts.append(
+            f'<text x="{PANEL_X + panel_pad:g}" '
+            f'y="{by + 170*scale:g}" font-size="{72*scale:g}" '
+            f'font-weight="bold" fill="#D4A24C" '
+            f'fill-opacity="0.18">"</text>'
+        )
+        # 12. Multi-line body (20px dark ink).
+        inner_w = bw - (PANEL_X - bx) - panel_pad - 16
+        from .text_width import chars_that_fit
+        body_font = 20.0
+        cpl = chars_that_fit(inner_w, body_font)
+        if cpl <= 0:
+            cpl = 20
+        body_lines = [body[i:i + cpl] for i in range(0, len(body), cpl)]
+        # Fit at most 4 lines above the takeaway band.
+        max_lines = 4
+        body_y0 = by + 210 * scale
+        for j, ln in enumerate(body_lines[:max_lines]):
+            ly = body_y0 + j * 32 * scale
+            if takeaway and ly > by + bh - 110 * scale:
                 break
-            lines = [body[i:i + cpl] for i in range(0, len(body), cpl)]
-            usable = max(1.0, (bh - 2 * 32.0) / (font_size * 1.5))
-        for i, line in enumerate(lines):
-            ly = TOP + font_size * (i + 1)
-            if ly > by + bh - 8:
+            if (not takeaway) and ly > by + bh - 16:
                 break
             parts.append(
-                f'<text x="{PANEL_X + 16:g}" y="{ly:g}" '
-                f'font-size="{font_size:g}" fill="#1E293B">'
-                f'{escape(line)}</text>'
+                f'<text x="{PANEL_X + panel_pad:g}" y="{ly:g}" '
+                f'font-size="{body_font*scale:g}" fill="#0E1B2C">'
+                f'{escape(ln)}</text>'
             )
+        # 13. Takeaway band (90px high, 6px gold left border).
+        if takeaway:
+            band_h = 90.0 * scale
+            band_y = by + bh - band_h - 14 * scale
+            parts.append(
+                f'<rect x="{PANEL_X + panel_pad:g}" y="{band_y:g}" '
+                f'width="{bw - (PANEL_X - bx) - panel_pad - 16:g}" '
+                f'height="{band_h:g}" rx="{8:g}" fill="#1D2CAB" '
+                f'fill-opacity="0.08"/>'
+            )
+            parts.append(
+                f'<rect x="{PANEL_X + panel_pad:g}" y="{band_y:g}" '
+                f'width="6" height="{band_h:g}" fill="#D4A24C"/>'
+            )
+            parts.append(
+                f'<text x="{PANEL_X + panel_pad + 28*scale:g}" '
+                f'y="{band_y + 32*scale:g}" font-size="{14*scale:g}" '
+                f'font-weight="bold" fill="#1D2CAB" '
+                f'letter-spacing="3">CORE TAKEAWAY</text>'
+            )
+            # Wrap takeaway into 1-2 lines.
+            take_cpl = max(8, chars_that_fit(
+                bw - (PANEL_X - bx) - panel_pad - 60, 20.0) or 24)
+            take_lines = [
+                str(takeaway)[i:i + take_cpl]
+                for i in range(0, len(str(takeaway)), take_cpl)
+            ][:2]
+            for j, ln in enumerate(take_lines):
+                parts.append(
+                    f'<text x="{PANEL_X + panel_pad + 28*scale:g}" '
+                    f'y="{band_y + (60 + j*22)*scale:g}" '
+                    f'font-size="{20*scale:g}" font-weight="bold" '
+                    f'fill="#0A1A3F">{escape(ln)}</text>'
+                )
         return "\n".join(parts)
     if layout == "procedural-steps":
-        # ppt-master analog: process_timeline (4 evenly-spaced nodes
-        # on horizontal axis) + data_story takeaway band. Used when a
-        # markdown section synthesizes into N macro phases with a
-        # short key-message summary. We anchor the phase row at
-        # y=by+80 and the takeaway band at y=by+250 so the layout
-        # fits any caller-supplied body_bounds.
+        # Phase 11 (2026-09-17): ppt-master's process_timeline geometry
+        # (see projects/boteng_ppt_20260916/svg_final/06_workflow.svg).
+        # Geometry stack:
+        #   - Title row at y=120 (32px bold #0A1A3F + 14px right-aligned
+        #       muted subtitle)
+        #   - 96px gold accent line at y=138
+        #   - Top timeline (y=186): horizontal dashed line + 4 circles
+        #       r=14 (white fill, brand-blue stroke, 3px wide) with
+        #       12px numbers + 13px labels at y=226
+        #   - 2x2 cards grid (each 564×180, rx=12, white fill) starting
+        #       at y=270 with 8px gap. Each card has a 40px gradient
+        #       header band (brand-blue → light blue), containing a
+        #       "PHASE N · 阶段X" white label and a gold subtitle.
+        #   - Card body has a 13px brand-blue section label + 3 bullets
+        #       of 13px dark ink (each prefixed with "· ").
+        # We support 2-5 steps; boteng's 四、工作程序 maps to 4 phases.
         steps = payload.get("steps") or []
-        takeaways = payload.get("takeaways") or []
-        eyebrow = payload.get("eyebrow", "")
         if not 2 <= len(steps) <= 5:
             raise ValueError(
                 f"procedural-steps requires 2-5 steps (got {len(steps)})"
             )
-        if not 1 <= len(takeaways) <= 5:
-            raise ValueError(
-                f"procedural-steps requires 1-5 takeaways "
-                f"(got {len(takeaways)})"
-            )
+        title = payload.get("title", "")  # optional page title
+        subtitle = payload.get("subtitle", "")  # optional subtitle
+        # Each step shape: {label, detail, bullets:[str,str,str]}.
+        # Backward compat: accept legacy {label, detail} and synthesize
+        # bullets from the detail string.
 
         bounds = spec.get("bounds") or payload.get("bounds")
         bx, by, bw, bh = (float(t) for t in bounds.split())
+        scale = bw / 1280.0
 
-        # Phase row geometry.
-        PHASE_COLOR = "#1E293B"  # ink, not the legacy #1D2CAB blue
-        phase_y = by + 80.0
-        phase_h = 140.0
-        margin = 60.0
-        n = len(steps)
-        span = bw - 2 * margin
+        # Normalize step dicts.
+        norm_steps: list[dict] = []
+        for s in steps:
+            if not isinstance(s, dict):
+                s = {"label": str(s), "detail": "", "bullets": []}
+            bullets = s.get("bullets") or []
+            if not bullets and s.get("detail"):
+                # Split detail on sentence boundaries (· / / / ;) so
+                # boteng's prose becomes 1-3 bullets.
+                raw = str(s["detail"])
+                for sep in ("。", "；", ";", "/"):
+                    if sep in raw:
+                        bullets = [
+                            b.strip() + ("。" if sep == "。" else "")
+                            for b in raw.split(sep)
+                            if b.strip()
+                        ][:3]
+                        break
+                if not bullets:
+                    bullets = [raw]
+            s2 = {
+                "label": str(s.get("label", ""))[:16],
+                "detail": str(s.get("detail", ""))[:40],
+                "bullets": [str(b)[:80] for b in bullets[:3]],
+            }
+            norm_steps.append(s2)
 
         parts: list[str] = []
-        # 1. Optional eyebrow (small chapter label).
-        if eyebrow:
+        # 0. Gradient definition (id-scoped).
+        parts.append(
+            f'<defs><linearGradient id="phaseHeader" x1="0" y1="0" '
+            f'x2="1" y2="0">'
+            f'<stop offset="0%" stop-color="#1D2CAB"/>'
+            f'<stop offset="100%" stop-color="#2A4DCB"/>'
+            f'</linearGradient></defs>'
+        )
+
+        # 1. Title row (32px bold ink) + right subtitle.
+        title_y = by + 50 * scale
+        if title:
             parts.append(
-                f'<text x="{bx:g}" y="{by + 16:g}" font-size="12" '
-                f'font-weight="600" fill="#64748B" letter-spacing="2">'
-                f'{escape(eyebrow.upper())}</text>'
+                f'<text x="{bx:g}" y="{title_y:g}" '
+                f'font-size="{32*scale:g}" font-weight="bold" '
+                f'fill="#0A1A3F">{escape(title)}</text>'
             )
-        # 2. Phase circles + connectors.
-        for i, step in enumerate(steps):
+        if subtitle:
+            parts.append(
+                f'<text x="{bx + bw/2:g}" y="{title_y:g}" '
+                f'font-size="{14*scale:g}" fill="#5A6678">'
+                f'{escape(subtitle)}</text>'
+            )
+        # 2. 96px gold accent line at y=138 (relative).
+        parts.append(
+            f'<line x1="{bx:g}" y1="{by + 68*scale:g}" '
+            f'x2="{bx + 96*scale:g}" y2="{by + 68*scale:g}" '
+            f'stroke="#D4A24C" stroke-width="2"/>'
+        )
+
+        # 3. Top timeline (y= by+96): dashed line + circles + labels.
+        axis_y = by + 116 * scale
+        # Dashed connector line.
+        parts.append(
+            f'<line x1="{bx:g}" y1="{axis_y:g}" '
+            f'x2="{bx + bw:g}" y2="{axis_y:g}" stroke="#C8D2E0" '
+            f'stroke-width="2" stroke-dasharray="4,4"/>'
+        )
+        n = len(norm_steps)
+        margin = 60 * scale
+        span = bw - 2 * margin
+        # Phase label y (below circles).
+        label_y = axis_y + 26 * scale
+        for i, step in enumerate(norm_steps):
             cx = bx + margin + span * i / max(n - 1, 1)
-            cy = phase_y + 28.0
+            # Highlight last circle (gold fill, dark border).
+            if i == n - 1:
+                circle_fill = "#D4A24C"
+                stroke_color = "#0A1A3F"
+                num_fill = "#0A1A3F"
+            else:
+                circle_fill = "#FFFFFF"
+                stroke_color = "#1D2CAB"
+                num_fill = "#1D2CAB"
             parts.append(
-                f'<circle cx="{cx:g}" cy="{cy:g}" r="28" '
-                f'fill="{PHASE_COLOR}"/>'
+                f'<circle cx="{cx:g}" cy="{axis_y:g}" r="{14*scale:g}" '
+                f'fill="{circle_fill}" stroke="{stroke_color}" '
+                f'stroke-width="3"/>'
             )
             parts.append(
-                f'<text x="{cx:g}" y="{cy + 6:g}" text-anchor="middle" '
-                f'font-size="16" font-weight="700" fill="#FFFFFF">'
+                f'<text x="{cx:g}" y="{axis_y + 4*scale:g}" '
+                f'text-anchor="middle" font-size="{12*scale:g}" '
+                f'font-weight="bold" fill="{num_fill}">'
                 f'{i + 1}</text>'
             )
-            # Step label below circle (18px ink).
             parts.append(
-                f'<text x="{cx:g}" y="{cy + 56:g}" text-anchor="middle" '
-                f'font-size="18" font-weight="600" fill="#1E293B">'
-                f'{escape(step.get("label", f"Step {i + 1}"))}</text>'
+                f'<text x="{cx:g}" y="{label_y:g}" '
+                f'text-anchor="middle" font-size="{13*scale:g}" '
+                f'font-weight="bold" fill="#0A1A3F">'
+                f'{escape(step["label"])}</text>'
             )
-            # Step detail (14px body, cap 24 chars).
-            detail = step.get("detail", "")
-            if detail:
+
+        # 4. 2x2 cards grid. Card geometry (relative to bw=1280):
+        #   card_w = 564 * scale;  card_h = 180 * scale
+        #   gap = 8 * scale (between cards)
+        #   grid starts at y = by + 200*scale, with 2 columns.
+        card_w = (bw - 16 * scale) / 2
+        card_h = 180 * scale
+        gap_x = 16 * scale
+        gap_y = 14 * scale
+        grid_y0 = by + 200 * scale
+        for i, step in enumerate(norm_steps):
+            row = i // 2
+            col = i % 2
+            cx_card = bx + col * (card_w + gap_x)
+            cy_card = grid_y0 + row * (card_h + gap_y)
+            # 4a. White card with rx=12.
+            parts.append(
+                f'<rect x="{cx_card:g}" y="{cy_card:g}" '
+                f'width="{card_w:g}" height="{card_h:g}" '
+                f'rx="{12:g}" fill="#FFFFFF"/>'
+            )
+            # 4b. 40px gradient header band.
+            header_h = 40 * scale
+            # Last phase uses solid dark variant (per ppt-master).
+            if i == n - 1:
+                header_fill = "#0A1A3F"
+            else:
+                header_fill = "url(#phaseHeader)"
+            parts.append(
+                f'<rect x="{cx_card:g}" y="{cy_card:g}" '
+                f'width="{card_w:g}" height="{header_h:g}" '
+                f'rx="{12:g}" fill="{header_fill}"/>'
+            )
+            parts.append(
+                f'<rect x="{cx_card:g}" y="{cy_card + header_h - 10*scale:g}" '
+                f'width="{card_w:g}" height="{10*scale:g}" '
+                f'fill="{header_fill}"/>'
+            )
+            # 4c. PHASE N · 阶段X label (14px white bold, letter-spaced).
+            parts.append(
+                f'<text x="{cx_card + 20*scale:g}" '
+                f'y="{cy_card + 25*scale:g}" '
+                f'font-size="{14*scale:g}" font-weight="bold" '
+                f'fill="#FFFFFF" letter-spacing="3">'
+                f'PHASE {i + 1} · 阶段{_cn_num(i + 1)}</text>'
+            )
+            # 4d. Gold subtitle (right side of header, text-anchor=end).
+            parts.append(
+                f'<text x="{cx_card + card_w - 20*scale:g}" '
+                f'y="{cy_card + 25*scale:g}" '
+                f'font-size="{14*scale:g}" font-weight="bold" '
+                f'fill="#D4A24C" text-anchor="end" '
+                f'letter-spacing="2">{escape(step["label"])}</text>'
+            )
+            # 4e. Section label (13px brand-blue bold, below header).
+            if step["detail"]:
                 parts.append(
-                    f'<text x="{cx:g}" y="{cy + 84:g}" text-anchor="middle" '
-                    f'font-size="14" fill="#64748B">'
-                    f'{escape(detail[:24])}</text>'
+                    f'<text x="{cx_card + 20*scale:g}" '
+                    f'y="{cy_card + (header_h + 18*scale):g}" '
+                    f'font-size="{13*scale:g}" font-weight="bold" '
+                    f'fill="#1D2CAB">{escape(step["detail"][:32])}</text>'
                 )
-            # Connector to next step.
-            if i < n - 1:
-                next_cx = bx + margin + span * (i + 1) / max(n - 1, 1)
-                parts.append(
-                    f'<line x1="{cx + 30:g}" y1="{cy:g}" '
-                    f'x2="{next_cx - 30:g}" y2="{cy:g}" '
-                    f'stroke="#D6DCE3" stroke-width="2"/>'
-                )
-        # 3. Takeaway band (bottom panel).
-        band_y = phase_y + phase_h + 30.0
-        band_h = by + bh - band_y - 16.0
-        if band_h < 60.0:
-            # bounds too small to fit a takeaway panel — emit just the
-            # heading line as a one-line summary so the page still
-            # produces a polished result.
-            parts.append(
-                f'<text x="{bx:g}" y="{band_y:g}" font-size="16" '
-                f'font-weight="700" fill="#1E293B">关键要点</text>'
-            )
-        else:
-            parts.append(
-                f'<rect x="{bx:g}" y="{band_y:g}" width="{bw:g}" '
-                f'height="{band_h:g}" rx="12" fill="#F4F6F8"/>'
-            )
-            parts.append(
-                f'<text x="{bx + 24:g}" y="{band_y + 28:g}" font-size="16" '
-                f'font-weight="700" fill="#1E293B">关键要点</text>'
-            )
-            for i, msg in enumerate(takeaways):
-                ty = band_y + 60 + i * 28
-                if ty > band_y + band_h - 12:
+            # 4f. Bullets (13px dark ink, prefix "· ").
+            body_y0 = cy_card + header_h + 36 * scale
+            for j, bullet in enumerate(step["bullets"][:3]):
+                byline = body_y0 + j * 22 * scale
+                if byline > cy_card + card_h - 8 * scale:
                     break
                 parts.append(
-                    f'<text x="{bx + 24:g}" y="{ty:g}" font-size="18" '
-                    f'fill="#1E293B">· {escape(msg[:80])}</text>'
+                    f'<text x="{cx_card + 20*scale:g}" '
+                    f'y="{byline:g}" font-size="{13*scale:g}" '
+                    f'fill="#0E1B2C">· {escape(bullet)}</text>'
                 )
         return "\n".join(parts)
     if layout == "three-thesis-cards":
@@ -829,86 +1131,159 @@ def render_new_block(spec: dict[str, Any]) -> str:
                 )
         return "\n".join(parts)
     if layout == "hero_statement":
-        # ppt-master analog: hero_statement (single dominant claim at
-        # ~80pt, centered). Phase 8 (2026-09-16): bridges the visual
-        # gap between simple-text (≤40 char, flat) and statement-caption
-        # (≥80 char, split-rail). Trigger: 20-79 char single sentence.
-        # Background is a soft tint panel so the page reads as a
-        # "feature claim" rather than a flat text card.
-        # Phase 9 (2026-09-16): cap 32 → 60 chars SOFT (auto-shrink to
-        # 36px floor instead of raising ValueError), so longer chapter
-        # intros like "为了规范公司采购行为, 降低采购成本..." (70 chars)
-        # still render with full information.
+        # Phase 11 (2026-09-17): ppt-master's hero_statement geometry
+        # (see projects/boteng_ppt_20260916/svg_final/03_purpose.svg /
+        # 04_scope.svg / 05_principle.svg). Geometry stack:
+        #   - White panel (rx=12)
+        #   - Top claim band (68px tall, full-width #1D2CAB)
+        #       with 22px white section title left + 14px gold en-tag
+        #       right (text-anchor=end)
+        #   - 14px en-subtitle + 96px gold accent line below
+        #   - 32-34px big question / headline (#0A1A3F)
+        #   - 18-20px multi-line body (#0E1B2C)
+        #   - Optional keyword cards (5 cards, 208×56, rx=8, 0.06 fill
+        #       #1D2CAB + 4px left border #1D2CAB, 16px bold ink + 11px
+        #       muted en descriptor)
         from .text_width import chars_that_fit
         headline = payload.get("headline", "")
-        eyebrow = payload.get("eyebrow", "")
-        subline = payload.get("subline", "")
+        eyebrow = payload.get("eyebrow", "")  # Chinese section label
+        eyebrow_en = payload.get("eyebrow_en", "")  # English subtitle
+        en_tag = payload.get("en_tag", "")  # top-right gold tag (e.g. PURPOSE)
+        question = payload.get("question", "")  # big 32-34px question
+        body_lines = payload.get("body_lines") or []  # list of strings
+        if not isinstance(body_lines, list):
+            body_lines = [str(body_lines)]
+        keywords = payload.get("keywords") or []  # list of {word, en}
+        if not isinstance(keywords, list):
+            keywords = []
         if not isinstance(headline, str) or not headline:
             raise ValueError("hero_statement requires spec.headline")
-        if len(headline) > 80:
-            raise ValueError(
-                f"hero_statement headline too long (max 80 chars, "
-                f"got {len(headline)})"
-            )
 
         bounds = spec.get("bounds") or payload.get("bounds")
         bx, by, bw, bh = (float(t) for t in bounds.split())
-        cx = bx + bw / 2.0
+        scale = bw / 1280.0
 
         parts: list[str] = []
-        # 1. Soft tint background panel (full bounds, rx=12).
+        # 1. White panel.
         parts.append(
             f'<rect x="{bx:g}" y="{by:g}" width="{bw:g}" '
-            f'height="{bh:g}" rx="12" fill="#F4F6F8"/>'
+            f'height="{bh:g}" rx="{12:g}" fill="#FFFFFF"/>'
         )
-        # 2. Eyebrow (optional small label, top-left, letter-spaced).
-        if eyebrow:
+        # 2. Top claim band (68px tall, full-width brand blue).
+        band_h = 68.0 * scale
+        parts.append(
+            f'<rect x="{bx:g}" y="{by:g}" width="{bw:g}" '
+            f'height="{band_h:g}" fill="#1D2CAB"/>'
+        )
+        # 3. Section title left in claim band (22px white bold).
+        if headline:
             parts.append(
-                f'<text x="{bx + 32:g}" y="{by + 36:g}" font-size="14" '
-                f'font-weight="500" fill="#64748B" letter-spacing="1.2">'
-                f'{escape(eyebrow.upper()[:20])}</text>'
+                f'<text x="{bx + 36*scale:g}" '
+                f'y="{by + band_h * 0.66:g}" font-size="{22*scale:g}" '
+                f'font-weight="bold" fill="#FFFFFF" '
+                f'letter-spacing="3">{escape(headline)}</text>'
             )
-        # 3. Headline (centered, 68px bold ink, auto-shrink to 36px
-        #    floor if headline overflows the panel).
-        font_size = 68.0
-        max_chars = chars_that_fit(bw - 64.0, font_size)
-        if max_chars <= 0:
-            raise ValueError(
-                f"hero_statement bounds too narrow for font_size="
-                f"{font_size} (bw={bw:g})"
+        # 4. en_tag right (14px gold, text-anchor=end).
+        if en_tag:
+            parts.append(
+                f'<text x="{bx + bw - 36*scale:g}" '
+                f'y="{by + band_h * 0.66:g}" font-size="{14*scale:g}" '
+                f'fill="#D4A24C" text-anchor="end" '
+                f'letter-spacing="3">{escape(str(en_tag))}</text>'
             )
-        # Auto-shrink if headline is longer than fit-at-default.
-        # Phase 9: floor lowered from 14.0 → 36.0 (don't render illegible).
-        while len(headline) > max_chars and font_size > 36.0:
-            font_size -= 2.0
-            max_chars = chars_that_fit(bw - 64.0, font_size)
-            if max_chars <= 0:
-                break
-        # Wrap into at most 2 lines using CJK char count.
-        if len(headline) > max_chars and max_chars > 0:
-            mid = len(headline) // 2
-            line1 = headline[:mid]
-            line2 = headline[mid:]
-            lines = [line1, line2]
+        # 5. En-subtitle below band (14px muted) + 96px gold accent.
+        if eyebrow_en:
+            parts.append(
+                f'<text x="{bx + 36*scale:g}" '
+                f'y="{by + (band_h + 28*scale):g}" '
+                f'font-size="{14*scale:g}" fill="#5A6678" '
+                f'letter-spacing="3">{escape(str(eyebrow_en))}</text>'
+            )
+        parts.append(
+            f'<line x1="{bx + 36*scale:g}" '
+            f'y1="{by + (band_h + 40*scale):g}" '
+            f'x2="{bx + (36+96)*scale:g}" '
+            f'y2="{by + (band_h + 40*scale):g}" stroke="#D4A24C" '
+            f'stroke-width="2"/>'
+        )
+        # 6. Big question (32px bold ink).
+        if question:
+            q_y = by + (band_h + 90 * scale)
+            parts.append(
+                f'<text x="{bx + 36*scale:g}" y="{q_y:g}" '
+                f'font-size="{32*scale:g}" font-weight="bold" '
+                f'fill="#0A1A3F">{escape(str(question))}</text>'
+            )
         else:
-            lines = [headline]
-        headline_y = by + bh * 0.45
-        for i, line in enumerate(lines):
-            ly = headline_y + i * (font_size + 8)
-            if ly > by + bh - 32:
+            q_y = by + (band_h + 90 * scale)
+        # 7. Multi-line body (20px ink). Wrap if needed.
+        inner_w = bw - 72 * scale
+        body_y0 = q_y + 50 * scale
+        body_font = 20.0
+        cpl = chars_that_fit(inner_w, body_font)
+        if cpl <= 0:
+            cpl = 20
+        # If body_lines provided, render verbatim; else fall back to
+        # the headline as a single body line.
+        if not body_lines:
+            body_lines = [headline]
+        # Flatten to a single body string first, then wrap.
+        flat_body = "\n".join(str(x) for x in body_lines)
+        flat_body = flat_body.replace("\n", "").strip()
+        body_text_lines = [
+            flat_body[i:i + cpl]
+            for i in range(0, len(flat_body), cpl)
+        ]
+        max_body_lines = 4 if not keywords else 3
+        for j, ln in enumerate(body_text_lines[:max_body_lines]):
+            ly = body_y0 + j * 34 * scale
+            if keywords and ly > by + bh - 110 * scale:
+                break
+            if (not keywords) and ly > by + bh - 16:
                 break
             parts.append(
-                f'<text x="{cx:g}" y="{ly:g}" text-anchor="middle" '
-                f'font-size="{font_size:g}" font-weight="700" '
-                f'fill="#1E293B">{escape(line)}</text>'
+                f'<text x="{bx + 36*scale:g}" y="{ly:g}" '
+                f'font-size="{body_font*scale:g}" fill="#0E1B2C">'
+                f'{escape(ln)}</text>'
             )
-        # 4. Subline (optional, centered, 18px body).
-        if subline:
-            sub_y = headline_y + len(lines) * (font_size + 8) + 28.0
-            if sub_y <= by + bh - 16:
+        # 8. Keyword cards (5 cards, 208×56, rx=8, 0.06 fill + 4px
+        #    left border). Anchor at body bottom if there's room.
+        if keywords:
+            kw_y = by + bh - 90 * scale
+            # Pad/truncate to exactly 5.
+            kw_list = list(keywords)[:5]
+            while len(kw_list) < 5:
+                kw_list.append({"word": "", "en": ""})
+            n_kw = len(kw_list)
+            kw_gap = 16 * scale
+            kw_w = (bw - 72 * scale - kw_gap * (n_kw - 1)) / n_kw
+            kw_h = 56 * scale
+            for j, kw in enumerate(kw_list):
+                kwx = bx + 36 * scale + j * (kw_w + kw_gap)
+                # Background 0.06 fill.
                 parts.append(
-                    f'<text x="{cx:g}" y="{sub_y:g}" text-anchor="middle" '
-                    f'font-size="18" fill="#64748B">{escape(subline)}</text>'
+                    f'<rect x="{kwx:g}" y="{kw_y:g}" '
+                    f'width="{kw_w:g}" height="{kw_h:g}" rx="{8:g}" '
+                    f'fill="#1D2CAB" fill-opacity="0.06"/>'
+                )
+                # 4px left border #1D2CAB.
+                parts.append(
+                    f'<rect x="{kwx:g}" y="{kw_y:g}" '
+                    f'width="4" height="{kw_h:g}" fill="#1D2CAB"/>'
+                )
+                word = str(kw.get("word", ""))[:12]
+                en = str(kw.get("en", ""))[:16]
+                parts.append(
+                    f'<text x="{kwx + 20*scale:g}" '
+                    f'y="{kw_y + 28*scale:g}" '
+                    f'font-size="{16*scale:g}" font-weight="bold" '
+                    f'fill="#0A1A3F">{escape(word)}</text>'
+                )
+                parts.append(
+                    f'<text x="{kwx + 20*scale:g}" '
+                    f'y="{kw_y + 48*scale:g}" '
+                    f'font-size="{11*scale:g}" fill="#5A6678">'
+                    f'{escape(en)}</text>'
                 )
         return "\n".join(parts)
     if layout == "kpi_row":

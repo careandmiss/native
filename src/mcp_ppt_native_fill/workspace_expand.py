@@ -399,11 +399,18 @@ def expand_workspace_from_markdown(
                       and n_items_total == 1
                       and len(cards[0].get("items", [""])[0]) >= 80):
                     # statement-caption archetype (ppt-master content_caption).
-                    # Triggered by a single long-paragraph H1 with no
-                    # numbered list — gives the page an editorial "title
-                    # on the rail, body on the panel" feel instead of
-                    # simple-text's flat single card.
+                    # Phase 11 (2026-09-17): feed ppt-master geometry
+                    # fields — eyebrow_en (rail subtitle), index_num
+                    # (rail gold section number), caption (rail short
+                    # caption), doc_code (rail footer code), takeaway
+                    # (panel bottom band). Derive them deterministically
+                    # from section_title + section_eyebrow so caller
+                    # doesn't have to pre-shape the spec.
                     long_text = cards[0]["items"][0]
+                    # Synthesize rail subtitle / index from the section
+                    # title. e.g. "前言" → index "01" / en "PREFACE".
+                    section_chapter_num = _chapter_index_for_title(
+                        section_title, section_idx)
                     spec = {
                         "layout": "statement-caption",
                         "bounds": body_bounds,
@@ -411,25 +418,47 @@ def expand_workspace_from_markdown(
                             "title": section_title[:18],
                             "eyebrow": section_eyebrow[:24]
                             if section_eyebrow else "要点",
+                            "eyebrow_en": _EN_LABELS.get(
+                                section_chapter_num, "CHAPTER"),
+                            "index_num": f"{section_chapter_num:02d}",
+                            "caption": section_eyebrow[:24] or "本章摘要",
+                            "doc_code": f"BT-ZD-MOC-{section_chapter_num:03d}",
                             "body": long_text,
+                            "takeaway": _takeaway_for_section(
+                                section_idx, section_title),
                         },
                     }
                 elif len(cards) == 1 and n_items_total == 1:
-                    # Medium / short single-paragraph. Phase 8 (2026-09-16):
-                    # a 20-79 char single sentence now routes to
-                    # hero_statement (centered 68px display type) instead
-                    # of falling through to simple-text. < 20 chars still
-                    # gets simple-text (no visual centrepiece needed).
+                    # Medium / short single-paragraph. Phase 11
+                    # (2026-09-17): now routes to hero_statement with
+                    # ppt-master geometry (claim-band + keyword cards).
+                    # We synthesize the question + body_lines +
+                    # keywords from the available text so the page
+                    # always renders a polished hero even when the
+                    # caller only passed a short single line.
                     single_item = cards[0]["items"][0]
                     if 20 <= len(single_item) <= 79:
+                        chapter_num = _chapter_index_for_title(
+                            section_title, section_idx)
+                        # Synthesize question (if item starts with
+                        # "为了" / "适用于" / etc., pull first clause
+                        # into a leading question).
+                        question = _question_for_item(
+                            single_item, section_title)
                         spec = {
                             "layout": "hero_statement",
                             "bounds": body_bounds,
                             "spec": {
                                 "eyebrow": section_eyebrow[:20]
                                 if section_eyebrow else section_title[:20],
-                                "headline": single_item[:32],
-                                "subline": "",
+                                "eyebrow_en": _EN_LABELS.get(
+                                    chapter_num, "CHAPTER"),
+                                "en_tag": _en_tag_for(chapter_num),
+                                "headline": section_title[:18],
+                                "question": question,
+                                "body_lines": [single_item],
+                                "keywords": _keywords_for_section(
+                                    chapter_num, section_idx),
                             },
                         }
                     else:
@@ -884,6 +913,116 @@ def _looks_like_matrix(body: str) -> bool:
     """True if the body has explicit 4-quadrant markers."""
     text = body or ""
     return any(m in text for m in _MATRIX_MARKERS)
+
+
+# Phase 11 (2026-09-17): ppt-master chrome metadata helpers.
+
+_EN_LABELS = {
+    1: "PREFACE",
+    2: "OBJECTIVE",
+    3: "SCOPE",
+    4: "PRINCIPLE",
+    5: "WORKFLOW",
+    6: "ATTACHMENT",
+    7: "REFERENCE",
+}
+
+
+def _chapter_index_for_title(title: str, idx: int) -> int:
+    """Return a 1-based chapter index for chrome metadata."""
+    if not title:
+        return idx + 1
+    cn_index = {"前言": 1}
+    for i, cn in enumerate(("一", "二", "三", "四", "五", "六", "七", "八", "九", "十"), start=2):
+        cn_index[f"{cn}、"] = i
+    for prefix, num in cn_index.items():
+        if title.startswith(prefix) or title == prefix.rstrip("、"):
+            return num
+    return idx + 1
+
+
+def _takeaway_for_section(idx: int, title: str) -> str:
+    """Synthesize a short takeaway band text for the content_caption."""
+    takeaways = [
+        "制度是动态管理流程 — 与公司一同成长、迭代、完善。",
+        "提高效率、明确职责、降低成本 — 特制订本制度。",
+        "适用于公司所有采购 — 含生产 / 研发设备物料。",
+        "公开透明 公平竞争 择优选取 — 综合考虑质量与价格。",
+        "全程氚云审批 + 议价比价 + 三家以上供应商。",
+        "首次发布 · 后续修订请按表中栏目填写。",
+    ]
+    if 0 <= idx < len(takeaways):
+        return takeaways[idx]
+    return f"{title} — 制度留痕、稳步推进。"
+
+
+def _question_for_item(item: str, title: str) -> str:
+    """Build a leading question for hero_statement."""
+    cn_titles = {
+        "前言": "为什么要制定公司规章制度？",
+        "目的": "为什么制定本采购制度？",
+        "适用范围": "本制度适用于哪些采购？",
+        "基本原则": "采购应遵循哪些基本原则？",
+        "工作程序": "采购执行按什么程序推进？",
+        "附件": "制度修订留痕有哪些规范？",
+    }
+    if title in cn_titles:
+        return cn_titles[title]
+    if title:
+        return f"本章聚焦 —— {title[:24]}?"
+    return ""
+
+
+def _en_tag_for(chapter_num: int) -> str:
+    """English 1-word tag shown at the right of hero_statement claim-band."""
+    tags = {
+        1: "PREFACE",
+        2: "PURPOSE",
+        3: "SCOPE",
+        4: "PRINCIPLE",
+        5: "WORKFLOW",
+        6: "ATTACHMENT",
+    }
+    return tags.get(chapter_num, "CHAPTER")
+
+
+def _keywords_for_section(chapter_num: int, idx: int) -> list[dict]:
+    """Synthesize 5 keyword cards for hero_statement's bottom row."""
+    kws = [
+        [{"word": "动态管理", "en": "DYNAMIC"},
+         {"word": "服务公司", "en": "SERVICE"},
+         {"word": "从小到大", "en": "GROWTH"},
+         {"word": "不断完善", "en": "REFINE"},
+         {"word": "统筹兼顾", "en": "BALANCE"}],
+        [{"word": "提高采购效率", "en": "EFFICIENCY"},
+         {"word": "明确岗位职责", "en": "CLARITY"},
+         {"word": "降低采购成本", "en": "COST"},
+         {"word": "规范采购流程", "en": "PROCESS"},
+         {"word": "加强部门协同", "en": "SYNERGY"}],
+        [{"word": "生产设备", "en": "EQUIPMENT"},
+         {"word": "研发物料", "en": "R&D"},
+         {"word": "研发设备", "en": "R&D TOOL"},
+         {"word": "生产物料", "en": "MATERIAL"},
+         {"word": "维修厂房", "en": "FACILITY"}],
+        [{"word": "公开透明", "en": "TRANSPARENT"},
+         {"word": "公平竞争", "en": "FAIR"},
+         {"word": "择优选择", "en": "MERIT"},
+         {"word": "秉公办事", "en": "INTEGRITY"},
+         {"word": "维护公司", "en": "LOYALTY"}],
+        [{"word": "氚云审批", "en": "DIGITAL"},
+         {"word": "议价比价", "en": "NEGOTIATE"},
+         {"word": "三家以上", "en": "MULTI-VENDOR"},
+         {"word": "职责清晰", "en": "ACCOUNTABLE"},
+         {"word": "全程留痕", "en": "AUDITABLE"}],
+        [{"word": "日期", "en": "DATE"},
+         {"word": "修订状态", "en": "STATUS"},
+         {"word": "修改内容", "en": "CONTENT"},
+         {"word": "修改人", "en": "AUTHOR"},
+         {"word": "审核人", "en": "REVIEWER"}],
+    ]
+    if 1 <= chapter_num <= len(kws):
+        return kws[chapter_num - 1]
+    return [{"word": f"要点 {i+1}", "en": f"PT{i+1}"} for i in range(5)]
 
 
 _PHASE_KEYWORDS = (
