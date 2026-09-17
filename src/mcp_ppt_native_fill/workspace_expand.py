@@ -384,7 +384,10 @@ def expand_workspace_from_markdown(
                             "layout": "procedural-steps",
                             "bounds": body_bounds,
                             "spec": {
-                                "eyebrow": section_title[:20],
+                                # Phase 12 (2026-09-17): drop the in-body
+                                # eyebrow (chapter title duplicate —
+                                # shape-17 already paints it). Only feed
+                                # steps + takeaways to the renderer.
                                 "steps": steps,
                                 "takeaways": takeaways,
                             },
@@ -415,7 +418,12 @@ def expand_workspace_from_markdown(
                         "layout": "statement-caption",
                         "bounds": body_bounds,
                         "spec": {
-                            "title": section_title[:18],
+                            # Phase 12 (2026-09-17): drop the in-body
+                            # chapter title (shape-17 already paints
+                            # the Chinese chapter name). Keep rail
+                            # index "01" + eyebrow_en + caption +
+                            # doc_code so the rail still anchors to the
+                            # section.
                             "eyebrow": section_eyebrow[:24]
                             if section_eyebrow else "要点",
                             "eyebrow_en": _EN_LABELS.get(
@@ -449,13 +457,13 @@ def expand_workspace_from_markdown(
                             "layout": "hero_statement",
                             "bounds": body_bounds,
                             "spec": {
-                                "eyebrow": section_eyebrow[:20]
-                                if section_eyebrow else section_title[:20],
-                                "eyebrow_en": _EN_LABELS.get(
-                                    chapter_num, "CHAPTER"),
+                                # Phase 12 (2026-09-17): drop the in-body
+                                # chapter headline + leading question
+                                # (shape-17 already paints the Chinese
+                                # chapter name; chrome topbar carries
+                                # the section marker). Keep only
+                                # en_tag + body_lines + keywords.
                                 "en_tag": _en_tag_for(chapter_num),
-                                "headline": section_title[:18],
-                                "question": question,
                                 "body_lines": [single_item],
                                 "keywords": _keywords_for_section(
                                     chapter_num, section_idx),

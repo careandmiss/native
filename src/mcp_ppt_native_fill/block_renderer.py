@@ -662,7 +662,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
         # body, and a takeaway band (90px high) with a 6px gold left
         # border. Geometry is anchored to ``body_bounds`` (caller may
         # pass any 1280x720 frame) and scaled.
-        title = payload.get("title", "")
+        title = payload.get("title", "")  # optional (Phase 12)
         eyebrow = payload.get("eyebrow", "")  # optional rail label
         eyebrow_en = payload.get("eyebrow_en", "")  # optional rail en label
         index_num = payload.get("index_num", "")  # optional big gold number
@@ -670,8 +670,11 @@ def render_new_block(spec: dict[str, Any]) -> str:
         doc_code = payload.get("doc_code", "")  # rail footer (e.g. BT-ZD-001)
         body = payload.get("body", "")
         takeaway = payload.get("takeaway", "")  # panel bottom band text
-        if not isinstance(title, str) or not title:
-            raise ValueError("statement-caption requires spec.title")
+        # Phase 12 (2026-09-17): title is now optional — the boteng
+        # template's shape-17 owns the Chinese chapter name. When the
+        # caller passes an empty title the rail / panel skip their title
+        # <text> elements. body is still required (it's the actual
+        # content the panel needs to render).
         if not isinstance(body, str) or not body:
             raise ValueError("statement-caption requires spec.body")
 
@@ -734,12 +737,14 @@ def render_new_block(spec: dict[str, Any]) -> str:
             title_y = by + 148 * scale
         else:
             title_y = by + 56 * scale
-        # 4. Rail title (32px white bold).
-        parts.append(
-            f'<text x="{bx + rail_pad:g}" y="{title_y:g}" '
-            f'font-size="{32*scale:g}" font-weight="bold" '
-            f'fill="#FFFFFF">{escape(title)}</text>'
-        )
+        # 4. Rail title (32px white bold). Phase 12: skipped when
+        # title is empty.
+        if title:
+            parts.append(
+                f'<text x="{bx + rail_pad:g}" y="{title_y:g}" '
+                f'font-size="{32*scale:g}" font-weight="bold" '
+                f'fill="#FFFFFF">{escape(title)}</text>'
+            )
         # 5. Eyebrow / en-label below title.
         if eyebrow_en:
             parts.append(
@@ -788,13 +793,15 @@ def render_new_block(spec: dict[str, Any]) -> str:
 
         # === PANEL content ===
         panel_pad = 36.0 * scale
-        # 8. Panel title (22px blue bold).
-        parts.append(
-            f'<text x="{PANEL_X + panel_pad:g}" '
-            f'y="{by + 56*scale:g}" font-size="{22*scale:g}" '
-            f'font-weight="bold" fill="#1D2CAB">'
-            f'{escape(title)}</text>'
-        )
+        # 8. Panel title (22px blue bold). Phase 12: skipped when
+        # title is empty.
+        if title:
+            parts.append(
+                f'<text x="{PANEL_X + panel_pad:g}" '
+                f'y="{by + 56*scale:g}" font-size="{22*scale:g}" '
+                f'font-weight="bold" fill="#1D2CAB">'
+                f'{escape(title)}</text>'
+            )
         # 9. Panel en-subtitle (14px muted).
         if eyebrow_en:
             parts.append(
@@ -1135,29 +1142,33 @@ def render_new_block(spec: dict[str, Any]) -> str:
         # (see projects/boteng_ppt_20260916/svg_final/03_purpose.svg /
         # 04_scope.svg / 05_principle.svg). Geometry stack:
         #   - White panel (rx=12)
-        #   - Top claim band (68px tall, full-width #1D2CAB)
-        #       with 22px white section title left + 14px gold en-tag
-        #       right (text-anchor=end)
+        #   - Top claim band (68px tall when headline is set, 32px when
+        #       headline is empty — Phase 12) full-width #1D2CAB.
+        #       When headline is empty (Phase 12, content slides already
+        #       get the chapter name from the template's shape-17) the
+        #       band only carries the 14px gold en-tag right.
         #   - 14px en-subtitle + 96px gold accent line below
-        #   - 32-34px big question / headline (#0A1A3F)
+        #   - 32-34px big question / headline (#0A1A3F) — Phase 12
+        #       skipped when question is empty
         #   - 18-20px multi-line body (#0E1B2C)
         #   - Optional keyword cards (5 cards, 208×56, rx=8, 0.06 fill
         #       #1D2CAB + 4px left border #1D2CAB, 16px bold ink + 11px
         #       muted en descriptor)
         from .text_width import chars_that_fit
-        headline = payload.get("headline", "")
-        eyebrow = payload.get("eyebrow", "")  # Chinese section label
+        headline = payload.get("headline", "")  # optional (Phase 12)
         eyebrow_en = payload.get("eyebrow_en", "")  # English subtitle
         en_tag = payload.get("en_tag", "")  # top-right gold tag (e.g. PURPOSE)
-        question = payload.get("question", "")  # big 32-34px question
+        question = payload.get("question", "")  # optional (Phase 12)
         body_lines = payload.get("body_lines") or []  # list of strings
         if not isinstance(body_lines, list):
             body_lines = [str(body_lines)]
         keywords = payload.get("keywords") or []  # list of {word, en}
         if not isinstance(keywords, list):
             keywords = []
-        if not isinstance(headline, str) or not headline:
-            raise ValueError("hero_statement requires spec.headline")
+        # Phase 12 (2026-09-17): headline & question are now optional.
+        # shape-17 already paints the Chinese chapter name on the slide
+        # chrome topbar, so the in-body chapter headline + leading
+        # question no longer need to repeat it.
 
         bounds = spec.get("bounds") or payload.get("bounds")
         bx, by, bw, bh = (float(t) for t in bounds.split())
@@ -1169,13 +1180,19 @@ def render_new_block(spec: dict[str, Any]) -> str:
             f'<rect x="{bx:g}" y="{by:g}" width="{bw:g}" '
             f'height="{bh:g}" rx="{12:g}" fill="#FFFFFF"/>'
         )
-        # 2. Top claim band (68px tall, full-width brand blue).
-        band_h = 68.0 * scale
+        # 2. Top claim band. Phase 12: clamp to 32px when headline is
+        # empty so we don't leave a giant empty blue strip in the top
+        # half of the slide.
+        if headline:
+            band_h = 68.0 * scale
+        else:
+            band_h = 32.0 * scale
         parts.append(
             f'<rect x="{bx:g}" y="{by:g}" width="{bw:g}" '
             f'height="{band_h:g}" fill="#1D2CAB"/>'
         )
-        # 3. Section title left in claim band (22px white bold).
+        # 3. Section title left in claim band (22px white bold). Phase 12:
+        # skipped when headline is empty.
         if headline:
             parts.append(
                 f'<text x="{bx + 36*scale:g}" '
@@ -1206,7 +1223,8 @@ def render_new_block(spec: dict[str, Any]) -> str:
             f'y2="{by + (band_h + 40*scale):g}" stroke="#D4A24C" '
             f'stroke-width="2"/>'
         )
-        # 6. Big question (32px bold ink).
+        # 6. Big question (32px bold ink). Phase 12: skipped when
+        # question is empty.
         if question:
             q_y = by + (band_h + 90 * scale)
             parts.append(
@@ -1225,7 +1243,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
             cpl = 20
         # If body_lines provided, render verbatim; else fall back to
         # the headline as a single body line.
-        if not body_lines:
+        if not body_lines and headline:
             body_lines = [headline]
         # Flatten to a single body string first, then wrap.
         flat_body = "\n".join(str(x) for x in body_lines)

@@ -269,3 +269,43 @@ def write_new_content_block(
     tmp = svg_path.with_suffix(svg_path.suffix + ".tmp")
     tmp.write_bytes(xml_bytes)
     tmp.replace(svg_path)
+
+
+def strip_template_chrome_shapes(
+    svg_path: Path,
+    shape_ids: Iterable[str],
+) -> int:
+    """Remove top-level ``<g id="shape-NN">`` elements by id.
+
+    Phase 12 (2026-09-17): when the cloned template carries title
+    shapes that the body or chrome will replace, drop them BEFORE
+    chrome injection so we never get "section title rendered twice".
+
+    Pattern is deliberately conservative — only matches a top-level
+    ``<g>`` whose first attribute is ``id="<id>"`` so it doesn't
+    trample nested groups. Returns the count of shapes removed
+    (0 = no-op, file untouched on no-op).
+    """
+    import re as _re
+
+    svg_path = Path(svg_path)
+    if not svg_path.is_file():
+        raise FileNotFoundError(f"svg not found: {svg_path}")
+
+    raw = svg_path.read_text(encoding="utf-8")
+    total = 0
+    for sid in shape_ids:
+        pattern = _re.compile(
+            r'<g\s+id="' + _re.escape(str(sid)) + r'"[^>]*>.*?</g>',
+            _re.DOTALL,
+        )
+        new_raw, n = pattern.subn("", raw, count=1)
+        if n:
+            raw = new_raw
+            total += n
+    if total == 0:
+        return 0
+    tmp = svg_path.with_suffix(svg_path.suffix + ".tmp")
+    tmp.write_text(raw, encoding="utf-8")
+    tmp.replace(svg_path)
+    return total

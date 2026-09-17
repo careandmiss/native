@@ -288,6 +288,7 @@ from .workspace_expand import (  # noqa: F401  (re-export for back-compat)
     toc_deletion_marker_path as _toc_deletion_marker_path,
     toc_slide_number as _toc_slide_number,
 )
+from .workspace_expand import _EN_LABELS  # noqa: F401  (Phase 12 chrome topbar)
 
 
 def _merge_new_blocks(
@@ -847,6 +848,26 @@ def _inject_content_chrome(state: PipelineState) -> None:
         plan = _derive_default_chrome_plan(state)
         if isinstance(state.context, dict):
             state.context["phase11_chrome_plan"] = plan
+    # Phase 12 (2026-09-17): strip the template's corner tagline
+    # (shape-22). The LLM previously wrote it; we now drop the
+    # whole shape so chrome topbar doesn't fight with a second
+    # heading in the same vertical band. shape-17 stays — it's
+    # the only place the Chinese chapter name appears.
+    for entry in plan:
+        svg_path = authoring_dir / entry["svg"]
+        if not svg_path.is_file():
+            continue
+        try:
+            removed = svg_edits.strip_template_chrome_shapes(
+                svg_path, shape_ids=("shape-22",))
+            if removed:
+                log.info(
+                    "phase12: stripped %d chrome shapes from %s",
+                    removed, entry["svg"])
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "phase12: strip failed svg=%s: %s",
+                entry["svg"], exc)
     for entry in plan:
         svg_path = authoring_dir / entry["svg"]
         if not svg_path.is_file():
@@ -918,9 +939,16 @@ def _derive_default_chrome_plan(state: PipelineState) -> list[dict]:
     total = len(part_files)
     for idx, p in part_files:
         title = titles_by_index.get(idx) or f"章节 {idx}"
+        # Phase 12 (2026-09-17): the literal chapter name "第N章 XXX"
+        # would duplicate shape-17 (37px brand-blue chapter title
+        # painted by the boteng template's slide_04.svg clone). Drop
+        # the Chinese suffix and let the topbar carry a "PART NN ·
+        # EN_LABEL" header instead. shape-17 stays the single source
+        # of truth for the Chinese chapter name.
+        en_label = _EN_LABELS.get(idx, "CHAPTER")
         plan.append({
             "svg": p.name,
-            "chapter_label": f"PREFACE / PART {idx} · 第{idx}章 {title}",
+            "chapter_label": f"PART {idx:02d} · {en_label}",
             "doc_path": "采购制度 / 山西柏腾科技有限公司",
             "page_num": idx + 1,  # 1-based page (offset by cover/TOC)
             "total_pages": total + 2,  # + cover + TOC

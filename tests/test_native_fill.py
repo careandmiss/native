@@ -4001,14 +4001,18 @@ class TestBlockRendererStatementCaption(unittest.TestCase):
         # Takeaway text.
         self.assertIn("动态管理流程", out)
 
-    def test_rejects_empty_title_or_body(self):
+    def test_rejects_empty_body_but_allows_empty_title(self):
+        # Phase 12 (2026-09-17): title is optional — shape-17 owns the
+        # Chinese chapter name. body must still be non-empty.
         from mcp_ppt_native_fill.pipeline import _render_new_block
-        with self.assertRaises(ValueError):
-            _render_new_block({
-                "layout": "statement-caption",
-                "bounds": "120 130 1060 480",
-                "spec": {"title": "", "body": "x"},
-            })
+        # Empty title is allowed (no raise).
+        out = _render_new_block({
+            "layout": "statement-caption",
+            "bounds": "120 130 1060 480",
+            "spec": {"title": "", "body": "实际正文内容"},
+        })
+        self.assertIn("实际正文内容", out)
+        # Empty body still raises.
         with self.assertRaises(ValueError):
             _render_new_block({
                 "layout": "statement-caption",
@@ -6053,6 +6057,199 @@ class TestPhase9Matrix2x2(unittest.TestCase):
         }
         with self.assertRaises(ValueError):
             render_new_block(spec)
+
+
+class TestPhase12SvgEditsStrip(unittest.TestCase):
+    """Phase 12 (2026-09-17): strip_template_chrome_shapes removes a
+    top-level <g id="shape-NN"> by id while preserving the rest of
+    the SVG. Used to drop the cloned slide_04.svg corner tagline
+    (shape-22) so chrome topbar doesn't fight with a second heading
+    in the same vertical band.
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.svg_path = Path(self._tmpdir.name) / "fixture.svg"
+        self.svg_path.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720">\n'
+            '<rect x="0" y="0" width="1280" height="720" fill="#FFFFFF"/>\n'
+            '<g id="shape-17"><text>前言</text></g>\n'
+            '<g id="shape-22"><text>右上角副标</text></g>\n'
+            '<g id="shape-3"><rect/></g>\n'
+            '</svg>\n',
+            encoding="utf-8",
+        )
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_strip_removes_shape_22_only(self):
+        from mcp_ppt_native_fill.svg_edits import strip_template_chrome_shapes
+        removed = strip_template_chrome_shapes(self.svg_path, ("shape-22",))
+        self.assertEqual(removed, 1)
+        raw = self.svg_path.read_text(encoding="utf-8")
+        self.assertNotIn('id="shape-22"', raw)
+        # shape-17 + shape-3 untouched.
+        self.assertIn('id="shape-17"', raw)
+        self.assertIn('id="shape-3"', raw)
+        self.assertIn("前言", raw)
+
+    def test_strip_idempotent(self):
+        from mcp_ppt_native_fill.svg_edits import strip_template_chrome_shapes
+        n1 = strip_template_chrome_shapes(self.svg_path, ("shape-22",))
+        self.assertEqual(n1, 1)
+        # Second call: shape-22 already gone.
+        n2 = strip_template_chrome_shapes(self.svg_path, ("shape-22",))
+        self.assertEqual(n2, 0)
+        raw = self.svg_path.read_text(encoding="utf-8")
+        self.assertIn('id="shape-17"', raw)
+
+    def test_strip_no_op_for_missing_id(self):
+        from mcp_ppt_native_fill.svg_edits import strip_template_chrome_shapes
+        before = self.svg_path.read_text(encoding="utf-8")
+        n = strip_template_chrome_shapes(self.svg_path, ("shape-9999",))
+        self.assertEqual(n, 0)
+        after = self.svg_path.read_text(encoding="utf-8")
+        self.assertEqual(before, after)
+
+
+class TestPhase12ChromeLabel(unittest.TestCase):
+    """Phase 12 (2026-09-17): chrome topbar label drops the literal
+    "第N章 XXX" redundancy (shape-17 already paints the chapter
+    title). New format is "PART NN · EN_LABEL" derived from
+    workspace_expand._EN_LABELS.
+    """
+
+    def test_topbar_label_uses_en_label(self):
+        from mcp_ppt_native_fill.pipeline import (
+            _derive_default_chrome_plan, PipelineState,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "authoring-svg-flat").mkdir()
+            (ws / "authoring-svg-flat" / "slide_part02_content.svg").write_text(
+                "<svg/>", encoding="utf-8",
+            )
+            (ws / "authoring-svg-flat" / "slide_part03_content.svg").write_text(
+                "<svg/>", encoding="utf-8",
+            )
+            (ws / "page_plan.json").write_text("{}", encoding="utf-8")
+            state = PipelineState(workspace=ws, context={})
+            plan = _derive_default_chrome_plan(state)
+            by_idx = {entry["svg"]: entry for entry in plan}
+            self.assertEqual(
+                by_idx["slide_part02_content.svg"]["chapter_label"],
+                "PART 02 · OBJECTIVE",
+            )
+            self.assertEqual(
+                by_idx["slide_part03_content.svg"]["chapter_label"],
+                "PART 03 · SCOPE",
+            )
+
+
+class TestPhase12HeroStatementSkip(unittest.TestCase):
+    """Phase 12 (2026-09-17): hero_statement drops the in-body chapter
+    title and leading question — shape-17 owns the Chinese chapter
+    name now and chrome topbar carries the section marker. Renderer
+    must skip the 22px white claim-band headline and 32px question
+    text when those fields are empty.
+    """
+
+    def test_hero_skips_22px_white_text_when_headline_empty(self):
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        spec = {
+            "layout": "hero_statement",
+            "bounds": "120 130 1060 480",
+            "spec": {
+                "headline": "",  # Phase 12: skip the 22px white chapter title
+                "question": "",  # Phase 12: skip the 32px leading question
+                "en_tag": "OBJECTIVE",
+                "body_lines": ["本章说明采购制度目的与适用范围。"],
+                "keywords": [
+                    {"word": "效率", "en": "EFFICIENCY"},
+                ],
+            },
+        }
+        svg = render_new_block(spec)
+        # Claim band itself is still painted (visual section indicator).
+        self.assertIn('fill="#1D2CAB"', svg)
+        # en-tag still rendered on the band.
+        self.assertIn("OBJECTIVE", svg)
+        # body still rendered.
+        self.assertIn("本章说明", svg)
+        # The 32px leading question font-size is gone.
+        import re
+        font_sizes = re.findall(r'font-size="([^"]+)"', svg)
+        self.assertNotIn("32", font_sizes,
+                         f"32px question should not render; sizes={font_sizes}")
+
+    def test_hero_band_height_clamps_to_32_when_no_headline(self):
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        # With no headline, the band height drops from 68 to 32 (avoid
+        # leaving an empty blue strip in the slide-top half). The
+        # en-tag font-size is unchanged (14px).
+        spec = {
+            "layout": "hero_statement",
+            "bounds": "120 130 1060 480",
+            "spec": {
+                "headline": "",
+                "question": "",
+                "en_tag": "OBJECTIVE",
+                "body_lines": ["第一章采购制度的目的。"],
+                "keywords": [],
+            },
+        }
+        svg = render_new_block(spec)
+        # Find the band rect — it should be height <= 33 (32*scale with
+        # bw/1280 scale on bw=1060 → 26.5; well under 33). Match rects
+        # whose fill="#1D2CAB" regardless of attribute order.
+        import re
+        rects = re.findall(r'<rect[^>]*?fill="#1D2CAB"[^>]*?/>', svg)
+        self.assertTrue(rects,
+                        f"claim band rect should still render; svg={svg!r}")
+        for rect in rects:
+            m_h = re.search(r'height="([^"]+)"', rect)
+            self.assertTrue(m_h, f"rect missing height: {rect}")
+            self.assertLessEqual(
+                float(m_h.group(1)), 33.0,
+                f"band height should clamp to ~32, got {m_h.group(1)}",
+            )
+
+
+class TestPhase12StatementCaptionSkip(unittest.TestCase):
+    """Phase 12 (2026-09-17): statement-caption drops the in-body
+    chapter title — shape-17 owns the Chinese chapter name now.
+    Renderer must skip the rail 32px white title and panel 22px blue
+    title when ``title`` is empty.
+    """
+
+    def test_statement_caption_skips_rail_and_panel_title_when_empty(self):
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        spec = {
+            "layout": "statement-caption",
+            "bounds": "120 130 1060 480",
+            "spec": {
+                "title": "",  # Phase 12: skip both rail & panel title
+                "eyebrow_en": "PREFACE",
+                "index_num": "01",
+                "caption": "制度建设的动态演进",
+                "doc_code": "BT-ZD-MOC-001",
+                "body": "公司规章制度是保障公司运营的工具。",
+                "takeaway": "制度是动态管理流程。",
+            },
+        }
+        svg = render_new_block(spec)
+        # No raise — title is now optional.
+        # Rail index "01" + takeaway band still render.
+        self.assertIn("01", svg)
+        self.assertIn("PREFACE", svg)
+        self.assertIn("BT-ZD-MOC-001", svg)
+        self.assertIn("CORE TAKEAWAY", svg)
+        # The 32px white rail-title and 22px blue panel-title text
+        # elements must not paint the literal chapter string. (The
+        # template's shape-17 still does, separately.)
 
 
 if __name__ == "__main__":
