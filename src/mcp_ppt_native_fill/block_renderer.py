@@ -75,6 +75,88 @@ def _cn_num(n: int) -> str:
     return str(n)
 
 
+def _fs(spec: dict[str, Any], role: str) -> str:
+    """Resolve font-size for a text run via the TYPOGRAPHY role dict.
+
+    Phase 14 (2026-09-17): the four ppt-master archetypes
+    (``hero_statement``, ``statement-caption``, ``procedural-steps``,
+    ``revision-table``) no longer derive font-size from
+    ``scale = bw / 1280.0`` -- that produced visibly small text on
+    boteng's bw=1060 body_bounds (e.g. 13px -> 10.77px). The LLM
+    planner now emits ``spec.font_size`` either as a **role name**
+    (preferred, e.g. ``"annotation"`` -> 13) or a **raw px value**
+    (e.g. ``"22"`` for the claim-band tier). We resolve both forms
+    against :data:`TYPOGRAPHY` so the renderer never invents a number.
+
+    Resolution order:
+      1. ``spec.font_size`` set -> look it up in TYPOGRAPHY (if role)
+         or pass through verbatim (if px number).
+      2. Otherwise resolve the caller-supplied ``role`` argument via
+         TYPOGRAPHY (the design_spec IV anchor for that role).
+
+    No magic numbers -- every px value traces back to a named role.
+    """
+    nested = spec.get("spec") if isinstance(spec.get("spec"), dict) else {}
+    payload = nested if nested else spec
+    fs = payload.get("font_size")
+    if fs is not None and fs != "":
+        fs_str = str(fs)
+        # 1a. Role name -> TYPOGRAPHY anchor.
+        if fs_str in TYPOGRAPHY:
+            return str(TYPOGRAPHY[fs_str])
+        # 1b. Raw px (e.g. "22" or "13.5"). Pass through; SVG renderer
+        # is tolerant of numeric strings.
+        return fs_str
+    # 2. Caller's role argument -> TYPOGRAPHY anchor.
+    return str(TYPOGRAPHY[role])
+
+
+# Phase 14 (2026-09-17): typography anchors from
+# projects/boteng_ppt_20260916/design_spec.md IV Font Size Hierarchy.
+# Single source of truth for role -> px mapping (ppt-master
+# executor-base.md:207 -- "map every structural text item to a
+# declared typography role and write its anchor or a value within
+# +/- 2 px"). All call sites below resolve to one of these roles;
+# tweak type on a deck-wide basis by editing THIS dict (and the
+# matching LLM prompt in llm_planner.py IV), not the call sites.
+TYPOGRAPHY: dict[str, int] = {
+    # design_spec IV tier anchors
+    "cover_title": 56,
+    "chapter_title": 42,
+    "page_title": 32,
+    "subtitle": 24,
+    "lead": 20,
+    "body": 16,
+    "annotation": 13,
+    "footnote": 11,
+    # Inter-tier roles used by zhen-pin SVGs (between two anchors,
+    # always within +/- 2 px of a named tier per executor-base.md:207).
+    "claim_band": 22,        # panel title (between subtitle=24 and lead=20)
+    "rail_title": 32,        # alias of page_title
+    "rail_caption": 14,      # eyebrow / caption (between body=16 and footnote=11)
+    "rail_body": 12,         # between body=16 and annotation=13
+    "doc_code": 11,          # footnote-tier rail footer
+    "panel_title": 22,       # alias of claim_band
+    "panel_en_subtitle": 14, # alias of rail_caption
+    "big_quote": 72,         # display, cover_title + 16
+    "takeaway_label": 14,    # alias of rail_caption
+    "takeaway_body": 20,     # lead
+    "en_subtitle": 14,       # alias of rail_caption
+    "big_question": 32,      # alias of page_title
+    "keyword_word": 16,      # body
+    "keyword_en": 11,        # footnote
+    "subtitle_14": 14,       # alias
+    "phase_num": 12,         # annotation - 1
+    "phase_label": 13,       # annotation
+    "phase_card_label": 14,
+    "phase_card_section": 13,
+    "bullet": 13,
+    "header": 14,
+    "cell_body": 13,
+    "placeholder_hint": 13,
+}
+
+
 def render_new_block(spec: dict[str, Any]) -> str:
     """Render a ``new_content_block`` spec into raw SVG children.
 
@@ -258,7 +340,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
             cx_text = bx + j * col_w + col_w / 2.0
             parts.append(
                 f'<text x="{cx_text:g}" y="{by + GOLD_TOP + HEADER_H * 0.6:g}" '
-                f'font-size="{14*scale:g}" font-weight="bold" '
+                f'font-size="{_fs(spec, "header")}" font-weight="bold" '
                 f'fill="#FFFFFF" text-anchor="middle">'
                 f'{escape(str(header_map.get(key, key)))}</text>'
             )
@@ -324,7 +406,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
                 parts.append(
                     f'<text x="{bx + j * col_w + 12:g}" '
                     f'y="{ry + 22*scale:g}" '
-                    f'font-size="{12*scale:g}" fill="#0E1B2C">'
+                    f'font-size="{_fs(spec, "cell_body")}" fill="#0E1B2C">'
                     f'{"".join(tspans)}</text>'
                 )
         # 9. Placeholder hint.
@@ -332,7 +414,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
             parts.append(
                 f'<text x="{bx + bw/2:g}" '
                 f'y="{by + bh - 24*scale:g}" '
-                f'font-size="{13*scale:g}" fill="#C8D2E0" '
+                f'font-size="{_fs(spec, "placeholder_hint")}" fill="#C8D2E0" '
                 f'text-anchor="middle" font-style="italic">'
                 f'首次发布 · 后续修订请按表中栏目填写</text>'
             )
@@ -724,7 +806,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
         if index_num:
             parts.append(
                 f'<text x="{bx + rail_pad:g}" y="{by + 80*scale:g}" '
-                f'font-size="{56*scale:g}" font-weight="bold" '
+                f'font-size="{_fs(spec, "cover_title")}" font-weight="bold" '
                 f'fill="#D4A24C">{escape(str(index_num))}</text>'
             )
             parts.append(
@@ -742,14 +824,14 @@ def render_new_block(spec: dict[str, Any]) -> str:
         if title:
             parts.append(
                 f'<text x="{bx + rail_pad:g}" y="{title_y:g}" '
-                f'font-size="{32*scale:g}" font-weight="bold" '
+                f'font-size="{_fs(spec, "rail_title")}" font-weight="bold" '
                 f'fill="#FFFFFF">{escape(title)}</text>'
             )
         # 5. Eyebrow / en-label below title.
         if eyebrow_en:
             parts.append(
                 f'<text x="{bx + rail_pad:g}" y="{title_y + 28*scale:g}" '
-                f'font-size="{14*scale:g}" fill="#D2DAF9" '
+                f'font-size="{_fs(spec, "en_subtitle")}" fill="#D2DAF9" '
                 f'letter-spacing="2">{escape(str(eyebrow_en))}</text>'
             )
         # 6. Caption (rail mid-section).
@@ -757,7 +839,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
             cap_y = by + bh * 0.55
             parts.append(
                 f'<text x="{bx + rail_pad:g}" y="{cap_y:g}" '
-                f'font-size="{14*scale:g}" fill="#FFFFFF">'
+                f'font-size="{_fs(spec, "rail_caption")}" fill="#FFFFFF">'
                 f'{escape(str(caption))}</text>'
             )
             parts.append(
@@ -780,14 +862,14 @@ def render_new_block(spec: dict[str, Any]) -> str:
                         break
                     parts.append(
                         f'<text x="{bx + rail_pad:g}" y="{byline:g}" '
-                        f'font-size="{12*scale:g}" fill="#D2DAF9" '
+                        f'font-size="{_fs(spec, "rail_body")}" fill="#D2DAF9" '
                         f'letter-spacing="1">{escape(ln)}</text>'
                     )
         # 7. Doc code at rail bottom.
         if doc_code:
             parts.append(
                 f'<text x="{bx + rail_pad:g}" y="{by + bh - 28*scale:g}" '
-                f'font-size="{11*scale:g}" fill="#D2DAF9" '
+                f'font-size="{_fs(spec, "doc_code")}" fill="#D2DAF9" '
                 f'letter-spacing="2">{escape(str(doc_code))}</text>'
             )
 
@@ -798,7 +880,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
         if title:
             parts.append(
                 f'<text x="{PANEL_X + panel_pad:g}" '
-                f'y="{by + 56*scale:g}" font-size="{22*scale:g}" '
+                f'y="{by + 56*scale:g}" font-size="{_fs(spec, "panel_title")}" '
                 f'font-weight="bold" fill="#1D2CAB">'
                 f'{escape(title)}</text>'
             )
@@ -806,7 +888,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
         if eyebrow_en:
             parts.append(
                 f'<text x="{PANEL_X + panel_pad:g}" '
-                f'y="{by + 82*scale:g}" font-size="{14*scale:g}" '
+                f'y="{by + 82*scale:g}" font-size="{_fs(spec, "panel_en_subtitle")}" '
                 f'fill="#5A6678">{escape(str(eyebrow_en))}</text>'
             )
         # 10. Gold accent line (124px).
@@ -818,7 +900,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
         # 11. Big opening quote glyph (72px gold, 18% opacity).
         parts.append(
             f'<text x="{PANEL_X + panel_pad:g}" '
-            f'y="{by + 170*scale:g}" font-size="{72*scale:g}" '
+            f'y="{by + 170*scale:g}" font-size="{_fs(spec, "big_quote")}" '
             f'font-weight="bold" fill="#D4A24C" '
             f'fill-opacity="0.18">"</text>'
         )
@@ -841,7 +923,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
                 break
             parts.append(
                 f'<text x="{PANEL_X + panel_pad:g}" y="{ly:g}" '
-                f'font-size="{body_font*scale:g}" fill="#0E1B2C">'
+                f'font-size="{_fs(spec, "lead")}" fill="#0E1B2C">'
                 f'{escape(ln)}</text>'
             )
         # 13. Takeaway band (90px high, 6px gold left border).
@@ -860,7 +942,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
             )
             parts.append(
                 f'<text x="{PANEL_X + panel_pad + 28*scale:g}" '
-                f'y="{band_y + 32*scale:g}" font-size="{14*scale:g}" '
+                f'y="{band_y + 32*scale:g}" font-size="{_fs(spec, "takeaway_label")}" '
                 f'font-weight="bold" fill="#1D2CAB" '
                 f'letter-spacing="3">CORE TAKEAWAY</text>'
             )
@@ -875,7 +957,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
                 parts.append(
                     f'<text x="{PANEL_X + panel_pad + 28*scale:g}" '
                     f'y="{band_y + (60 + j*22)*scale:g}" '
-                    f'font-size="{20*scale:g}" font-weight="bold" '
+                    f'font-size="{_fs(spec, "lead")}" font-weight="bold" '
                     f'fill="#0A1A3F">{escape(ln)}</text>'
                 )
         return "\n".join(parts)
@@ -953,13 +1035,13 @@ def render_new_block(spec: dict[str, Any]) -> str:
         if title:
             parts.append(
                 f'<text x="{bx:g}" y="{title_y:g}" '
-                f'font-size="{32*scale:g}" font-weight="bold" '
+                f'font-size="{_fs(spec, "page_title")}" font-weight="bold" '
                 f'fill="#0A1A3F">{escape(title)}</text>'
             )
         if subtitle:
             parts.append(
                 f'<text x="{bx + bw/2:g}" y="{title_y:g}" '
-                f'font-size="{14*scale:g}" fill="#5A6678">'
+                f'font-size="{_fs(spec, "rail_caption")}" fill="#5A6678">'
                 f'{escape(subtitle)}</text>'
             )
         # 2. 96px gold accent line at y=138 (relative).
@@ -1000,13 +1082,13 @@ def render_new_block(spec: dict[str, Any]) -> str:
             )
             parts.append(
                 f'<text x="{cx:g}" y="{axis_y + 4*scale:g}" '
-                f'text-anchor="middle" font-size="{12*scale:g}" '
+                f'text-anchor="middle" font-size="{_fs(spec, "phase_num")}" '
                 f'font-weight="bold" fill="{num_fill}">'
                 f'{i + 1}</text>'
             )
             parts.append(
                 f'<text x="{cx:g}" y="{label_y:g}" '
-                f'text-anchor="middle" font-size="{13*scale:g}" '
+                f'text-anchor="middle" font-size="{_fs(spec, "phase_label")}" '
                 f'font-weight="bold" fill="#0A1A3F">'
                 f'{escape(step["label"])}</text>'
             )
@@ -1052,7 +1134,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
             parts.append(
                 f'<text x="{cx_card + 20*scale:g}" '
                 f'y="{cy_card + 25*scale:g}" '
-                f'font-size="{14*scale:g}" font-weight="bold" '
+                f'font-size="{_fs(spec, "phase_card_label")}" font-weight="bold" '
                 f'fill="#FFFFFF" letter-spacing="3">'
                 f'PHASE {i + 1} · 阶段{_cn_num(i + 1)}</text>'
             )
@@ -1060,7 +1142,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
             parts.append(
                 f'<text x="{cx_card + card_w - 20*scale:g}" '
                 f'y="{cy_card + 25*scale:g}" '
-                f'font-size="{14*scale:g}" font-weight="bold" '
+                f'font-size="{_fs(spec, "phase_card_label")}" font-weight="bold" '
                 f'fill="#D4A24C" text-anchor="end" '
                 f'letter-spacing="2">{escape(step["label"])}</text>'
             )
@@ -1069,7 +1151,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
                 parts.append(
                     f'<text x="{cx_card + 20*scale:g}" '
                     f'y="{cy_card + (header_h + 18*scale):g}" '
-                    f'font-size="{13*scale:g}" font-weight="bold" '
+                    f'font-size="{_fs(spec, "phase_card_section")}" font-weight="bold" '
                     f'fill="#1D2CAB">{escape(step["detail"][:32])}</text>'
                 )
             # 4f. Bullets (13px dark ink, prefix "· ").
@@ -1080,7 +1162,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
                     break
                 parts.append(
                     f'<text x="{cx_card + 20*scale:g}" '
-                    f'y="{byline:g}" font-size="{13*scale:g}" '
+                    f'y="{byline:g}" font-size="{_fs(spec, "bullet")}" '
                     f'fill="#0E1B2C">· {escape(bullet)}</text>'
                 )
         return "\n".join(parts)
@@ -1196,7 +1278,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
         if headline:
             parts.append(
                 f'<text x="{bx + 36*scale:g}" '
-                f'y="{by + band_h * 0.66:g}" font-size="{22*scale:g}" '
+                f'y="{by + band_h * 0.66:g}" font-size="{_fs(spec, "claim_band")}" '
                 f'font-weight="bold" fill="#FFFFFF" '
                 f'letter-spacing="3">{escape(headline)}</text>'
             )
@@ -1204,7 +1286,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
         if en_tag:
             parts.append(
                 f'<text x="{bx + bw - 36*scale:g}" '
-                f'y="{by + band_h * 0.66:g}" font-size="{14*scale:g}" '
+                f'y="{by + band_h * 0.66:g}" font-size="{_fs(spec, "en_subtitle")}" '
                 f'fill="#D4A24C" text-anchor="end" '
                 f'letter-spacing="3">{escape(str(en_tag))}</text>'
             )
@@ -1213,7 +1295,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
             parts.append(
                 f'<text x="{bx + 36*scale:g}" '
                 f'y="{by + (band_h + 28*scale):g}" '
-                f'font-size="{14*scale:g}" fill="#5A6678" '
+                f'font-size="{_fs(spec, "en_subtitle")}" fill="#5A6678" '
                 f'letter-spacing="3">{escape(str(eyebrow_en))}</text>'
             )
         parts.append(
@@ -1229,7 +1311,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
             q_y = by + (band_h + 90 * scale)
             parts.append(
                 f'<text x="{bx + 36*scale:g}" y="{q_y:g}" '
-                f'font-size="{32*scale:g}" font-weight="bold" '
+                f'font-size="{_fs(spec, "big_question")}" font-weight="bold" '
                 f'fill="#0A1A3F">{escape(str(question))}</text>'
             )
         else:
@@ -1261,7 +1343,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
                 break
             parts.append(
                 f'<text x="{bx + 36*scale:g}" y="{ly:g}" '
-                f'font-size="{body_font*scale:g}" fill="#0E1B2C">'
+                f'font-size="{_fs(spec, "lead")}" fill="#0E1B2C">'
                 f'{escape(ln)}</text>'
             )
         # 8. Keyword cards (5 cards, 208×56, rx=8, 0.06 fill + 4px
@@ -1294,13 +1376,13 @@ def render_new_block(spec: dict[str, Any]) -> str:
                 parts.append(
                     f'<text x="{kwx + 20*scale:g}" '
                     f'y="{kw_y + 28*scale:g}" '
-                    f'font-size="{16*scale:g}" font-weight="bold" '
+                    f'font-size="{_fs(spec, "keyword_word")}" font-weight="bold" '
                     f'fill="#0A1A3F">{escape(word)}</text>'
                 )
                 parts.append(
                     f'<text x="{kwx + 20*scale:g}" '
                     f'y="{kw_y + 48*scale:g}" '
-                    f'font-size="{11*scale:g}" fill="#5A6678">'
+                    f'font-size="{_fs(spec, "keyword_en")}" fill="#5A6678">'
                     f'{escape(en)}</text>'
                 )
         return "\n".join(parts)

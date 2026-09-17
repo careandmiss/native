@@ -138,6 +138,43 @@ At least ONE cloned content page per deck should use a non-default
 layout (``hero-number``, ``callout-box``, ``two-column-compare``, or
 ``timeline``) so the deck doesn't look templated.
 
+§IV Font Size Hierarchy (Phase 14, 2026-09-17)
+---------------------------------------------
+design_spec §IV is the single source of truth for type tiers. ppt-master's
+hard rule: **"shrinking type is last and never deck-wide"** — once you
+pick a tier for a slot, the renderer does NOT scale it further. Pick from
+the table below; do NOT invent values.
+
+| tier           | px | role                                                |
+|----------------|----:|-----------------------------------------------------|
+| cover_title    | 56 | cover 主标题 / divider rail big number              |
+| chapter_title  | 42 | divider 章节名 / hero_statement big question 顶部   |
+| page_title     | 32 | procedural-steps title / hero_statement big question|
+| subtitle       | 24 | statement-caption rail title                        |
+| lead           | 20 | hero_statement / statement-caption body             |
+| body           | 16 | revision-table cell body / 卡片正文 (large cards)   |
+| annotation     | 13 | procedural-steps card body / hero_statement keyword |
+| footnote       | 11 | gold accent / footer / doc_code                     |
+
+For each `new_blocks` entry covering one of the four ppt-master
+archetypes (``hero_statement``, ``statement-caption``,
+``procedural-steps``, ``revision-table``), include a ``font_size``
+field at the top of `spec` whose value is a string from the table
+above. Examples:
+
+  - ``hero_statement`` body line (claim + multi-line) → `spec.font_size = "20"` (lead)
+  - ``hero_statement`` keyword-card word (16px in 真品) → `spec.font_size = "13"` (annotation)
+  - ``procedural-steps`` title row → `spec.font_size = "32"` (page_title)
+  - ``procedural-steps`` card body (13px in 真品) → `spec.font_size = "13"` (annotation)
+  - ``statement-caption`` panel title (22px in 真品) → `spec.font_size = "22"` (use 22 as literal; between subtitle=24 and lead=20)
+  - ``statement-caption`` rail index number (56px) → `spec.font_size = "56"` (cover_title)
+  - ``revision-table`` header (14px) → `spec.font_size = "14"`
+  - ``revision-table`` cell body (12px) → `spec.font_size = "13"` (annotation — closest tier)
+
+If you omit `font_size`, the renderer falls back to a default that
+scales with body_bounds; this produces visibly small text on bw=1060
+frames. **Always include `font_size` on ppt-master archetype blocks.**
+
 Output format (return ONLY this JSON object)
 --------------------------------------------
 {
@@ -1029,6 +1066,22 @@ def _normalize_new_blocks(raw: Any) -> list[dict[str, Any]]:
                     len(steps),
                 )
                 continue
+        # Phase 14 (2026-09-17): default font_size injection for
+        # ppt-master archetypes. When the LLM forgets to emit the
+        # ``font_size`` field on the spec, inject a sane default keyed
+        # off the design_spec §IV table so the renderer doesn't fall
+        # back to ``*scale``-shrunk type (which produces 9.94/10.77/...
+        # px on boteng's bw=1060 body_bounds). LLM-provided values
+        # always win.
+        _ARCHETYPE_DEFAULT_FS = {
+            "hero_statement": "20",       # lead (body)
+            "statement-caption": "20",     # lead (panel body)
+            "procedural-steps": "13",      # annotation (card body)
+            "revision-table": "13",        # annotation (cell body)
+        }
+        default_fs = _ARCHETYPE_DEFAULT_FS.get(layout)
+        if default_fs and not spec.get("font_size"):
+            spec["font_size"] = default_fs
         block_id = entry.get("id") or f"new-block-{len(cleaned) + 1}"
         cleaned.append({
             "svg": svg,

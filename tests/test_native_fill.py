@@ -4243,16 +4243,22 @@ class TestPhase7Dispatch(unittest.TestCase):
         # Phase 11 (2026-09-17): procedural-steps now renders 4 small
         # timeline circles (radius scaled by bw/1280) + 2x2 cards with
         # gradient header bands. Verify the new geometry markers.
+        #
+        # Phase 14 (2026-09-17): boteng H2 titles span all four macro
+        # phases of the new taxonomy (申请与审批 / 采购人职责 /
+        # 采购方式 / 实施付款规范). The test markdown was rewritten
+        # accordingly -- the previous version used only 3 distinct
+        # phases (申请/审批 collapsed into one and 验收 alone).
         import tempfile
         from pathlib import Path as _P
         with tempfile.TemporaryDirectory() as td:
             md_text = (
                 "# 四、工作程序\n\n"
-                "## 采购申请\n"
-                "1. 提交采购申请单\n"
+                "## 采购基本事项\n"
+                "1. 需求登记\n"
                 "\n"
-                "## 总经理审批\n"
-                "1. 财务审批流程\n"
+                "## 采购人职责\n"
+                "1. 责任人确认\n"
                 "\n"
                 "## 采购方式\n"
                 "1. 长期报价采购\n"
@@ -5768,7 +5774,14 @@ class TestPhase8Dispatch(unittest.TestCase):
 
 
 class TestPhase8ClassifyH2(unittest.TestCase):
-    """Phase 8: boteng 7 H2 → 4 macro phases via keyword lookup."""
+    """Phase 8: boteng 7 H2 → 4 macro phases via keyword lookup.
+
+    Phase 14 (2026-09-17): phase labels were renamed from
+    ``{申请, 审批, 采购, 验收}`` to ``{申请与审批, 采购人职责,
+    采购方式, 实施付款规范}`` so procedural-steps can show 4
+    distinct workflow stages with descriptive names (the old 验收
+    label was overloaded for both 验收-验收 and 行为规范).
+    """
 
     def test_seven_boteng_h2_produce_four_macro_phases(self):
         from mcp_ppt_native_fill.workspace_expand import (
@@ -5784,7 +5797,12 @@ class TestPhase8ClassifyH2(unittest.TestCase):
             "行为规范",
         ]
         phases = {_classify_h2_to_phase(t) for t in h2_titles}
-        self.assertEqual(phases, {"申请", "审批", "采购", "验收"})
+        # Phase 14: 4-phase taxonomy (申请与审批 / 采购人职责 /
+        # 采购方式 / 实施付款规范).
+        self.assertEqual(
+            phases,
+            {"申请与审批", "采购人职责", "采购方式", "实施付款规范"},
+        )
 
 
 class TestPhase9LLMWhitelist(unittest.TestCase):
@@ -6250,6 +6268,123 @@ class TestPhase12StatementCaptionSkip(unittest.TestCase):
         # The 32px white rail-title and 22px blue panel-title text
         # elements must not paint the literal chapter string. (The
         # template's shape-17 still does, separately.)
+
+
+class TestPhase14FontSizeByLLM(unittest.TestCase):
+    """Phase 14 (2026-09-17): typography tier is LLM-chosen, not
+    hardcoded. The four ppt-master archetypes (hero_statement /
+    statement-caption / procedural-steps / revision-table) read
+    ``spec.font_size`` -- either as a role name (looked up in
+    :data:`TYPOGRAPHY`) or as a raw px value -- and pass it through
+    verbatim. No ``*scale`` shrinking. See plan v2 (2026-09-17).
+    """
+
+    def test_hero_statement_uses_spec_font_size_role(self):
+        """spec.font_size='lead' (20) -> SVG font-size='20' (no scale)."""
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        svg = render_new_block({
+            "layout": "hero_statement",
+            "bounds": "120 130 1060 480",
+            "spec": {
+                "headline": "一、目 的",
+                "en_tag": "PURPOSE",
+                "question": "为什么制定本采购制度？",
+                "body_lines": ["为了提高公司采购效率..."],
+                "font_size": "lead",  # -> 20
+            },
+        })
+        # Body line uses 'lead' -> 20px. Must NOT be 20*0.828 = 16.56.
+        # The body line is inside <text font-size="20" ...>.
+        self.assertIn('font-size="20"', svg)
+        self.assertNotIn('font-size="16.56', svg)
+        self.assertNotIn('font-size="20*scale', svg)
+
+    def test_hero_statement_uses_spec_font_size_px_raw(self):
+        """spec.font_size='22' (raw px) -> SVG font-size='22' verbatim."""
+        from mcp_ppt_native_fill.block_renderer import render_new_block
+        svg = render_new_block({
+            "layout": "hero_statement",
+            "bounds": "120 130 1060 480",
+            "spec": {
+                "headline": "聚焦目的",
+                "font_size": "22",  # raw px claim_band tier
+            },
+        })
+        # Headline text uses 'claim_band' -> 22. Must appear verbatim.
+        self.assertIn('font-size="22"', svg)
+        # And the claim-band band rect still scales (geometry uses
+        # scale; only font-size is now LLM-chosen).
+        self.assertIn('fill="#1D2CAB"', svg)
+
+    def test_procedural_steps_falls_back_to_typography_anchor(self):
+        """When font_size is missing, role resolves via TYPOGRAPHY dict
+        (design_spec §IV). card body -> 'bullet' -> 13px, NOT 13*scale.
+        """
+        from mcp_ppt_native_fill.block_renderer import render_new_block, TYPOGRAPHY
+        svg = render_new_block({
+            "layout": "procedural-steps",
+            "bounds": "120 130 1060 480",
+            "spec": {
+                "title": "工作程序",
+                "steps": [
+                    {"label": "申请", "detail": "需求登记", "bullets": ["a", "b"]},
+                    {"label": "审批", "detail": "部门审批", "bullets": ["c", "d"]},
+                    {"label": "采购", "detail": "询价比价", "bullets": ["e", "f"]},
+                    {"label": "验收", "detail": "验收入库", "bullets": ["g", "h"]},
+                ],
+                # font_size deliberately omitted -> role fallback
+            },
+        })
+        # bullet role -> 13 (annotation), so bullet text uses
+        # font-size="13". Must NOT be 13*0.828 = 10.77.
+        self.assertIn('font-size="13"', svg)
+        self.assertNotIn('font-size="10.77', svg)
+        # page_title role -> 32. So procedural title "工作程序" uses
+        # font-size="32".
+        self.assertIn('font-size="32"', svg)
+        # Sanity: TYPOGRAPHY dict must expose the role names.
+        self.assertEqual(TYPOGRAPHY["body"], 16)
+        self.assertEqual(TYPOGRAPHY["annotation"], 13)
+        self.assertEqual(TYPOGRAPHY["page_title"], 32)
+
+
+class TestPhase14PhaseKeywords(unittest.TestCase):
+    """Phase 14 (2026-09-17): _PHASE_KEYWORDS now covers 4 macro phases
+    (申请与审批 / 采购人职责 / 采购方式 / 实施付款规范), so boteng's
+    7 H2 sub-sections map to 4 distinct workflow stages instead of 3.
+    """
+
+    def test_classify_h2_routes_to_four_distinct_phases(self):
+        from mcp_ppt_native_fill.workspace_expand import (
+            _classify_h2_to_phase,
+        )
+        cases = [
+            ("一、采购基本事项", "申请与审批"),
+            ("二、采购申请", "申请与审批"),
+            ("三、采购审批", "申请与审批"),
+            ("四、采购人职责", "采购人职责"),
+            ("五、采购方式", "采购方式"),
+            ("六、采购实施", "实施付款规范"),
+            ("七、采购付款方式", "实施付款规范"),
+            ("八、采购经办人行为规范", "实施付款规范"),
+        ]
+        phases = {_classify_h2_to_phase(title) for title, _ in cases}
+        # All 4 macro phases must be represented.
+        self.assertEqual(
+            phases,
+            {"申请与审批", "采购人职责", "采购方式", "实施付款规范"},
+        )
+
+    def test_more_specific_keyword_wins_over_broad_purchase(self):
+        """``采购付款方式`` must route to 实施付款规范, not 采购方式
+        (the standalone 采购 fallback). The keyword list orders
+        付款方式 before 采购 so the more specific match wins.
+        """
+        from mcp_ppt_native_fill.workspace_expand import _classify_h2_to_phase
+        self.assertEqual(
+            _classify_h2_to_phase("采购付款方式"),
+            "实施付款规范",
+        )
 
 
 if __name__ == "__main__":

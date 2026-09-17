@@ -1034,20 +1034,53 @@ def _keywords_for_section(chapter_num: int, idx: int) -> list[dict]:
 
 
 _PHASE_KEYWORDS = (
-    # Phase 8 (2026-09-16): "基本事项" must precede "采购" so
-    # "采购基本事项" matches the more specific keyword and routes
-    # to the 申请 macro phase (rather than collapsing every H2
-    # into 采购 and tripping the synthesis-empty fallback).
-    ("基本事项", "申请"),
-    ("申请", "申请"),
-    ("审批", "审批"),
-    ("实施", "采购"),
-    ("付款", "审批"),
-    ("验收", "验收"),
-    ("行为规范", "验收"),
-    ("职责", "审批"),
-    ("方式", "采购"),
-    ("采购", "采购"),
+    # Phase 14 (2026-09-17): four macro phases aligned with the
+    # boteng 4-stage procurement workflow. Order matters -- more
+    # specific keywords must precede broader ones so "采购付款方式"
+    # routes to 实施付款规范 (not 采购).
+    #
+    # 1. 申请与审批 (申请 / 审批 / 基本事项 / 氚云申请)
+    ("基本事项", "申请与审批"),
+    ("氚云申请", "申请与审批"),
+    ("提交申请", "申请与审批"),
+    ("申请部门", "申请与审批"),
+    ("申请", "申请与审批"),
+    ("审批", "申请与审批"),
+    # 2. 采购人职责 (采购人 / 经办人 / 负责人 / 职责)
+    ("采购经办人", "采购人职责"),
+    ("采购负责人", "采购人职责"),
+    ("采购人", "采购人职责"),
+    ("职责", "采购人职责"),
+    # 3. 采购方式 (议定 / 询价 / 比价 / 议价 / 供应商)
+    ("采购方式", "采购方式"),
+    ("供应商", "采购方式"),
+    ("询价", "采购方式"),
+    ("比价", "采购方式"),
+    ("议价", "采购方式"),
+    ("议定", "采购方式"),
+    # 4. 实施付款规范 (验收 / 付款 / 实施 / 下单 / 入库 / 报销 /
+    #    对公 / 行为规范 / 严禁 / 回扣). This was missing before
+    #    Phase 14 -- boteng's H2 采购实施 / 采购付款方式 /
+    #    采购经办人行为规范 all collapsed into 申请 / 审批 / 采购,
+    #    producing only 3 macro phases and losing the workflow's
+    #    4th stage.
+    #    NOTE: 付款方式 must come BEFORE 方式, otherwise 采购付款方式
+    #    matches the bare 方式 token first and routes to 采购方式.
+    ("行为规范", "实施付款规范"),
+    ("严禁", "实施付款规范"),
+    ("回扣", "实施付款规范"),
+    ("对公", "实施付款规范"),
+    ("报销", "实施付款规范"),
+    ("入库", "实施付款规范"),
+    ("下单", "实施付款规范"),
+    ("付款方式", "实施付款规范"),
+    ("付款", "实施付款规范"),
+    ("验收", "实施付款规范"),
+    ("实施", "实施付款规范"),
+    # Broad matchers (must come last so specific phrases win).
+    ("方式", "采购方式"),
+    # Fallback (must come last).
+    ("采购", "采购方式"),
 )
 
 
@@ -1097,8 +1130,10 @@ def _synthesize_procedural_phases(
         phases.setdefault(phase, []).append(c.get("title", ""))
 
     # Maintain a stable macro order so the page reads in process flow:
-    # 申请 → 审批 → 采购 → 验收. Unknown phases go to the end.
-    macro_order = ["申请", "审批", "采购", "验收"]
+    # 申请与审批 → 采购人职责 → 采购方式 → 实施付款规范. Unknown
+    # phases go to the end. Phase 14 (2026-09-17): taxonomy renamed
+    # from {申请, 审批, 采购, 验收} to the four workflow stages above.
+    macro_order = ["申请与审批", "采购人职责", "采购方式", "实施付款规范"]
     extras = [p for p in phases if p not in macro_order]
     ordered_phases = [p for p in macro_order if p in phases] + extras
 
