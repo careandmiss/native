@@ -226,6 +226,23 @@ synthesized chapter number + keyword concatenation. ``hero-number``
 (layout: hero-number) is reserved for ACTUAL numeric KPIs (e.g. "5"
 with caption "大目标") — not for chapter intros.
 
+**Bounds rule (Phase 16, 2026-09-18)**: do NOT emit a ``bounds`` field
+on ``new_blocks`` entries. The renderer's per-archetype body bounds
+(``archetype_meta.body_bounds``) drive placement; the LLM-supplied
+bounds are ignored. Hardcoding ``"120 130 1060 480"`` (or any literal)
+forces every archetype onto the same frame and breaks visual variety
+across hero / wide / dense archetypes. If you need a different frame
+for a specific archetype, pick the archetype — don't override the
+bound.
+
+**Raw-SVG rule (Phase 16, 2026-09-18)**: prefer ``simple-text`` /
+``bullet-list`` over ``raw`` for prose content. ``raw`` is reserved
+for decorative elements without prose (icons, dividers, ornaments).
+The renderer drops raw blocks that lack a meaningful ``<text>`` node,
+so emitting a raw block with a placeholder body renders as a blank
+slide — use ``simple-text`` for short prose, ``bullet-list`` for
+multi-line prose, ``callout-box`` for one quotation.
+
 At least ONE cloned content page per deck should use a non-default
 layout (``hero-number``, ``callout-box``, ``two-column-compare``, or
 ``timeline``) so the deck doesn't look templated.
@@ -301,7 +318,6 @@ Output format (return ONLY this JSON object)
     {
       "svg": "slide_part02_content.svg",
       "id": "content-body",
-      "bounds": "120 130 1060 480",
       "layout": "3-column-cards",
       "spec": {
         "cards": [
@@ -1154,6 +1170,11 @@ def _normalize_new_blocks(
     (``none`` / ``dense`` / ``balanced``); ``composition_macro`` is free-form
     (no validation) and defaults to ``None``. All four fields are always
     present on the returned dict.
+
+    Phase 16 (2026-09-18): bounds is now optional. When the LLM omits it
+    (or sends an empty string), the normalizer fills in the layout's
+    archetype_meta.body_bounds so each archetype gets its proper frame
+    instead of the historical "120 130 1060 480" hardcode.
     """
     if not isinstance(raw, list):
         log.warning("new_blocks is not a list: %r; dropping", type(raw).__name__)
@@ -1184,9 +1205,24 @@ def _normalize_new_blocks(
         if not isinstance(svg, str) or not svg:
             log.warning("new_block missing svg; dropping")
             continue
+        # Phase 16 (2026-09-18): bounds is optional. When missing,
+        # fill from archetype_meta.body_bounds keyed by the layout so
+        # every archetype gets its per-archetype frame instead of the
+        # historical "120 130 1060 480" hardcode. This is the single
+        # point where LLM bounds get translated into archetype defaults
+        # — downstream consumers (pipeline._render_new_block /
+        # block_renderer / autofix overflow check) all consume the
+        # string we store here.
         if not isinstance(bounds, str) or not bounds:
-            log.warning("new_block %s missing bounds; dropping", svg)
-            continue
+            from .archetype_meta import ARCHETYPE_META, DEFAULT_META
+            meta = ARCHETYPE_META.get(layout, DEFAULT_META)
+            bx, byy, bw, bh = meta["body_bounds"]
+            bounds = f"{bx:g} {byy:g} {bw:g} {bh:g}"
+            log.info(
+                "phase16: new_block %s bounds missing; filled from "
+                "archetype_meta[%s] body_bounds -> %r",
+                svg, layout, bounds,
+            )
         if layout not in {"3-column-cards", "flow-steps",
                           "revision-table", "raw",
                           "hero-number", "callout-box",
@@ -1196,7 +1232,9 @@ def _normalize_new_blocks(
                           # Phase 8 (2026-09-16)
                           "hero_statement", "kpi_row",
                           # Phase 9 (2026-09-16)
-                          "comparison", "matrix_2x2"}:
+                          "comparison", "matrix_2x2",
+                          # Phase 16 (2026-09-18) — simple prose fallbacks
+                          "simple-text", "bullet-list"}:
             log.warning(
                 "new_block %s uses unsupported layout %r; dropping",
                 svg, layout,
@@ -1228,24 +1266,42 @@ def _normalize_new_blocks(
                 log.warning("revision-table requires rows; dropping")
                 continue
         elif layout == "raw":
-            if not isinstance(spec.get("svg"), str) or not spec["svg"]:
-                log.warning("raw new_block requires spec.svg; dropping")
-                continue
-            # Phase 15+ (2026-09-17): heuristic for raw-SVG prose overflow.
-            # ``raw`` is reserved for decorative elements without prose.
-            # If the LLM emits a raw SVG whose <text> contains a long
-            # prose line, log a warning so it can re-route to
-            # hero_statement / comparison / callout-box instead.
+            # Phase 16 (2026-09-18): tighten raw gating. raw is reserved
+            # for decorative elements (no prose). The LLM sometimes
+            # picks raw with placeholder SVG content, which renders as
+            # "一句话 + 空白". Three checks: (1) spec.svg must be a
+            # non-empty string; (2) the SVG must contain at least one
+            # <text> element (otherwise it's a blank box); (3) the
+            # longest <text> line must be under the prose threshold
+            # OR carry an explicit "no-prose" pattern (e.g. icon
+            # glyph). When any check fails, drop the block instead
+            # of shipping a blank slide.
             raw_svg = spec.get("svg", "")
-            if isinstance(raw_svg, str):
-                overflow_chars = _detect_raw_svg_overflow(raw_svg)
-                if overflow_chars and overflow_chars > 80:
-                    log.warning(
-                        "new_block raw SVG has %s-char text; consider "
-                        "routing to hero_statement / comparison / "
-                        "callout-box instead",
-                        overflow_chars,
-                    )
+            if not isinstance(raw_svg, str) or not raw_svg.strip():
+                log.warning(
+                    "phase16: raw new_block %s missing/empty spec.svg; "
+                    "dropping (route to simple-text / hero_statement "
+                    "instead)", svg,
+                )
+                continue
+            import re as _re_raw
+            text_nodes = _re_raw.findall(r"<text\b[^>]*>([^<]*)</text>", raw_svg)
+            meaningful_text = [t.strip() for t in text_nodes if t.strip()]
+            if not meaningful_text:
+                log.warning(
+                    "phase16: raw new_block %s has no <text> content; "
+                    "dropping (route to simple-text / hero_statement "
+                    "instead)", svg,
+                )
+                continue
+            overflow_chars = _detect_raw_svg_overflow(raw_svg)
+            if overflow_chars and overflow_chars > 80:
+                log.warning(
+                    "new_block raw SVG has %s-char text; consider "
+                    "routing to hero_statement / comparison / "
+                    "callout-box instead",
+                    overflow_chars,
+                )
         elif layout == "hero-number":
             if not isinstance(spec.get("value"), str) or not spec["value"]:
                 log.warning(
@@ -1258,6 +1314,39 @@ def _normalize_new_blocks(
                     "callout-box requires spec.quote (string); dropping"
                 )
                 continue
+        elif layout == "statement-caption":
+            # Phase 16 (2026-09-18): guard against the LLM putting the
+            # same long body string into both spec.caption (rail summary,
+            # 32pt white-on-blue) and spec.body (panel body, 22pt dark).
+            # When the rail summary is identical to the panel body the
+            # slide visually duplicates the same text in two fonts and
+            # two backgrounds — a clearly broken read. Two recovery
+            # paths: (a) if caption is missing/empty, leave it empty so
+            # the rail section is skipped (renderer's per-caption
+            # guards already handle empty strings); (b) if caption
+            # equals body (after whitespace normalization), truncate
+            # caption to body[:15] + "..." so the rail carries a true
+            # summary rather than a copy. The truncation is a hard
+            # guarantee: never let the same full sentence appear in
+            # both places.
+            body_str = spec.get("body") or ""
+            cap_str = spec.get("caption") or ""
+            if isinstance(body_str, str) and isinstance(cap_str, str):
+                body_norm = body_str.strip()
+                cap_norm = cap_str.strip()
+                if body_norm and cap_norm and cap_norm == body_norm:
+                    short = body_norm[:15].rstrip() + "..."
+                    spec["caption"] = short
+                    log.warning(
+                        "phase16: new_block %s statement-caption caption==body "
+                        "(%d chars duplicated); truncated caption to %r",
+                        svg, len(body_norm), short,
+                    )
+                if not isinstance(spec.get("body"), str) or not spec["body"]:
+                    log.warning(
+                        "statement-caption requires spec.body (string); dropping"
+                    )
+                    continue
         elif layout == "two-column-compare":
             left = spec.get("left")
             right = spec.get("right")

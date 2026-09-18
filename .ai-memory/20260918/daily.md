@@ -60,3 +60,24 @@
   - 内容密度自适应:LLM 根据段落/要点数决定
 - **结果**: 内容自适应分页生效,19 张 slide 取代 13 张
 
+## [15:00] - Phase 16: 内容页 SVG 排版质量 Tier 1 修复
+
+- **背景**: 用户反馈 "内容页面svg的排版质量太差了 分析可以怎么样改进";诊断报告 `docs/CONTENT_LAYOUT_QUALITY_DIAGNOSIS_2026-09-18.md` 列出 6 类根因 (R1-R6)
+- **文件**:
+  - src/mcp_ppt_native_fill/pipeline.py (Phase A + Phase 15 regex 修复)
+  - src/mcp_ppt_native_fill/llm_planner.py (Phase B + Phase C + Phase D + SYSTEM_PROMPT)
+- **决策**:
+  - Phase A: `_derive_default_chrome_plan` 之前只查 `page_plan_additions.layout`,但 LLM 把 layout 放在 `new_blocks` 里 → 加上 `new_blocks_by_svg` 查表,让 `chrome_suppress_for` 真起作用
+  - Phase 15 regex 修复: `slide_part(\d+)_content\.svg` 只匹配原名,不匹配 `_b/_c/_d` split-content → split-content 没 topbar/footer
+  - Phase B: LLM JSON 示例删硬编码 bounds,normalizer 在 LLM 漏传时自动从 `archetype_meta.body_bounds` 填
+  - Phase C: `statement-caption` 校验 `caption ≠ body`,相等时截断 caption 到 `body[:15]+"..."`
+  - Phase D: 收紧 `raw` 兜底,要求 spec.svg 至少含 1 个非空 `<text>` 节点;同时 whitelist 加 `simple-text` / `bullet-list`
+  - SYSTEM_PROMPT 新增 "Bounds rule" 和 "Raw-SVG rule" 章节,引导 LLM 优先 archetype 不 raw
+- **验证**:
+  - 采购制度文档:8 张 content slide,6 种不同 body_bounds (84 130 1112 440 / 84 140 1112 460 / 96 140 1088 460 / 64 130 1152 460 / 64 150 1152 360 / 160 200 960 280),topbar 随 archetype 切换 (callout-box → OFF,3-column-cards → ON)
+  - 商务部工作手册:slide_part03 (hero-number bounds 200 180 880 380) topbar=0 ✓
+  - 占位文字 "(待补充)/N/A" 全部消失
+  - Phase16 log 9 条 normalizer 命中,每条都从 archetype_meta 填入正确 bounds
+  - ok=True,无 error;preflight P2 picture-missing-shape-id 是既有问题,不归本次
+- **结果**: 推送 commit 准备中
+

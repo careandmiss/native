@@ -1096,10 +1096,14 @@ def _derive_default_chrome_plan(state: PipelineState) -> list[dict]:
     titles_by_index[5] = "工作程序"
     titles_by_index[6] = "附件"
     # Find slide_partNN files in page order (excluding div.svg).
+    # Phase 15+ (2026-09-18): also accept _b/_c/_d suffix variants
+    # (e.g. slide_part04b_content.svg) so split-content pages get
+    # chrome injected. Without the suffix-aware regex, _b/_c/_d slides
+    # ship without topbar/footer.
     part_files: list[tuple[int, Path]] = []
     for p in sorted(authoring_dir.glob("slide_part*_content.svg")):
         import re
-        m = re.match(r"slide_part(\d+)_content\.svg", p.name)
+        m = re.match(r"slide_part(\d+)([a-z]?)_content\.svg", p.name)
         if m:
             part_files.append((int(m.group(1)), p))
     if not part_files:
@@ -1111,12 +1115,27 @@ def _derive_default_chrome_plan(state: PipelineState) -> list[dict]:
     # chrome plan entry. _inject_content_chrome then consults
     # chrome_suppress_for to decide whether to render the topbar.
     additions_by_svg: dict[str, dict] = {}
+    new_blocks_by_svg: dict[str, dict] = {}
     planner_result = state.context.get("planner_result")
     if planner_result is not None:
         for pea in planner_result.page_plan_additions:
             svg_name = pea.get("svg", "")
             if svg_name:
                 additions_by_svg[svg_name] = pea
+        # Phase 14+ (2026-09-18): the planner emits the layout per
+        # `new_blocks` entry (one per svg). _derive_default_chrome_plan
+        # used to only look at page_plan_additions.layout — which the
+        # LLM does not always fill. That meant chrome_suppress_for
+        # got archetype="raw" for hero layouts (callout-box /
+        # hero_statement / statement-caption) and rendered the topbar
+        # when it should have been suppressed. Walk new_blocks once
+        # to build a layout lookup mirroring realize_plan (line 547-560).
+        for nb in (planner_result.new_blocks or []):
+            if not isinstance(nb, dict):
+                continue
+            svg_name = nb.get("svg", "")
+            if svg_name:
+                new_blocks_by_svg[svg_name] = nb
 
     for idx, p in part_files:
         title = titles_by_index.get(idx) or f"章节 {idx}"
@@ -1128,12 +1147,17 @@ def _derive_default_chrome_plan(state: PipelineState) -> list[dict]:
         # of truth for the Chinese chapter name.
         en_label = _EN_LABELS.get(idx, "CHAPTER")
         # Phase 14+: pull archetype meta fields from the planner's
-        # matching page_plan_additions entry (if any).
+        # matching page_plan_additions entry (if any). Layout
+        # resolution order matches realize_plan so chrome suppression
+        # sees the same archetype the page actually rendered.
         pea = additions_by_svg.get(p.name) or {}
         pea_edits = pea.get("edits") or {}
+        nb_entry = new_blocks_by_svg.get(p.name) or {}
         archetype = (
             pea_edits.get("layout")
             or pea.get("layout")
+            or nb_entry.get("layout")
+            or nb_entry.get("archetype")
             or "raw"
         )
         plan.append({
