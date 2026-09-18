@@ -74,9 +74,52 @@ Skeleton detection — when markdown H1 count > (existing non-cover, non-ending 
 you MUST clone the divider + content skeletons to host the overflow. Each new H1
 (except the first one, which usually uses existing content slide) becomes:
   - one new `<stem>_partNN_div.svg` (copy of `divider_id`'s SVG), and
-  - one new `<stem>_partNN_content.svg` (copy of `content_id`'s SVG).
+  - one or more content slides — the number depends on the section's
+    content density (see "Content splitting" below).
 These new SVGs are registered in `page_plan_additions` with their text edits.
 If H1 count <= existing content slides, you MAY keep all edits in existing slots.
+
+Content splitting (Phase 15, 2026-09-18) — one divider per section is
+required, but the number of content pages per section is content-driven,
+not fixed. Decide how many `<stem>_partNN{,_b,_c,...}_content.svg` to
+emit based on the section's actual content:
+
+  - 1 short paragraph (≤80 chars), 0-1 sub-bullets → 1 content page
+  - 2-3 paragraphs OR 2-3 sub-bullets OR 80-200 chars → 1-2 content pages
+    (use 2 if the material has 2 distinct sub-themes that don't fit on one)
+  - 4+ sub-bullets, 3+ paragraphs, or >200 chars → 2-3 content pages;
+    split by sub-theme (e.g. 一个章节的 4 个分要点 → 2 pages of 2 cards each)
+  - 5+ sub-bullets across multiple sub-headings (如 (一) (二) (三)) → 3-4
+    content pages, one per sub-heading or one per pair of sub-headings
+  - 10+ items or a long table → consider `revision-table` layout to
+    compress without losing content (table on one page is better than
+    two sparse pages)
+
+When emitting N>1 content pages for a section, append `_b`, `_c`, `_d`
+suffixes to the part number: `slide_part02_content.svg`,
+`slide_part02b_content.svg`, `slide_part03_content.svg`, etc. Every
+cloned content page MUST have a matching `new_blocks` entry (the
+mandatory-body rule below still applies).
+
+Examples of valid page_plan_additions for a single dense section:
+
+  page_plan_additions: [
+    {source_slide: 3, svg: "slide_part02_div.svg", edits: {...}},        # divider
+    {source_slide: 4, svg: "slide_part02_content.svg", edits: {...}},     # content 1
+    {source_slide: 4, svg: "slide_part02b_content.svg", edits: {...}},    # content 2
+    {source_slide: 4, svg: "slide_part02c_content.svg", edits: {...}},    # content 3
+  ]
+  new_blocks: [
+    {svg: "slide_part02_content.svg", layout: "3-column-cards", spec: {...}},
+    {svg: "slide_part02b_content.svg", layout: "bullet-list", spec: {...}},
+    {svg: "slide_part02c_content.svg", layout: "revision-table", spec: {...}},
+  ]
+
+Rule of thumb: prefer more content pages over cramming too many cards
+into one page. A 3-column-cards page with 4 cards × 4 items each is
+worse than 2 content pages with 2 cards × 3 items each — the reader
+gets more whitespace and the visual variety improves. When in doubt,
+emit one more content page rather than one fewer.
 
 Rules
 -----
@@ -90,11 +133,14 @@ Rules
   into a `new_blocks` entry on the cloned page, not into existing skeleton
   shapes (those are designed for short headers, not paragraphs).
 * **MANDATORY for cloned content pages**: every `slide_partNN_content.svg`
+  (and every `slide_partNN{_b,_c,...}_content.svg` when splitting a section)
   in `page_plan_additions` MUST have a matching entry in `new_blocks`
   (layout = 3-column-cards by default, with 2-3 cards from the section's
   paragraphs). If you forget, the slide renders as a giant blank rectangle
   on the body area. Do not emit a content clone without a `new_blocks`
-  body.
+  body. When splitting, the `new_blocks[svg].layout` should vary across
+  the section's pages (e.g. page 1 = hero_statement intro, page 2 =
+  3-column-cards enumeration, page 3 = bullet-list) to give visual rhythm.
 
 Composition Patterns (Phase B, Bug 3) — pick layout by content shape,
 NOT by template slot. The default of "always 3-column-cards" makes
