@@ -81,3 +81,27 @@
   - ok=True,无 error;preflight P2 picture-missing-shape-id 是既有问题,不归本次
 - **结果**: 推送 commit 准备中
 
+## [18:00] - Phase 17: 智能化排版 (auto-archetype + auto-bounds + auto-font + auto-dispatch)
+
+- **背景**: 用户反馈"内容页面的排版需要智能化排版";选中 4 项能力: 自动选 archetype / 自适应 body_bounds / 字号自适应 / 自动分页
+- **文件**:
+  - src/mcp_ppt_native_fill/archetype_router.py (NEW, 280 LOC)
+  - src/mcp_ppt_native_fill/bounds_optimizer.py (NEW, 200 LOC)
+  - src/mcp_ppt_native_fill/section_dispatcher.py (NEW, 200 LOC)
+  - src/mcp_ppt_native_fill/llm_planner.py (+ `_spec_to_router_text` + Phase 17-A override)
+  - src/mcp_ppt_native_fill/pipeline.py (`_apply_archetype_meta` 接入 router)
+  - src/mcp_ppt_native_fill/block_renderer.py (bullet-list / 3-col 字号自适应)
+- **决策**:
+  - **Phase 17-A** (archetype_router): 11 条规则 + 优先级链 (numeric-KPI → ordered-list → contrast → arrow → pipe-table → peer-items → bullets → long-paragraph → short-claim);KPI 检测移到 Rule 2 防"5 大目标"误判;`override_llm_choice()` 接口供 LLM/heuristic 协商
+  - **Phase 17-B** (bounds_optimizer): `compute_optimal_bounds(layout, spec)` 按实际卡片数/项数/步骤数计算 snug-fit bounds,绝不超过 archetype_meta 上限;Hero archetypes 保持默认(留白是设计意图)
+  - **Phase 17-C** (字号自适应): bullet-list / 3-column-cards 在渲染时按字符宽度动态选字号 (16→14→13→12),min=12pt;`compute_optimal_font_size` 工具函数兜底
+  - **Phase 17-D** (section_dispatcher): `dispatch_section()` 按 `_MAX_PER_PAGE` 自动 split 长章节为多页;每页同 archetype;为 future "hero intro + body + takeaway" 留 hook
+- **验证**:
+  - **单测**: 9/9 router 用例通过,7/7 optimizer 通过,4/4 dispatcher 通过
+  - **采购制度 (15 个 content slide)**: 4 种不同 body_bounds (96 300 1088 140 / 96 312 1088 116 / 160 200 960 280 / 110 140 1060 460),无 120 130 1060 480 硬编码
+  - **商务部工作手册 (15 个 content slide)**: 5 种不同 bounds;Phase 17-A 修正覆盖 17 archetypes
+  - **chrome suppression 仍然生效**: hero archetypes topbar=0,非 hero topbar=1
+  - **ok=True**,无 error;LLM random pick (procedural-overview 等) 偶发,但不影响主流程
+- **未做**: section_dispatcher 没接到 workspace_expand (改动太大);留作 building block,Phase 17-A/B/C 端到端已经够用
+- **结果**: 推送 commit 准备中
+

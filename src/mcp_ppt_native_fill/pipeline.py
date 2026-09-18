@@ -1036,28 +1036,78 @@ def _apply_archetype_meta(state: PipelineState) -> None:
       * Missing ``composition_macro`` defaults to ``None`` (free-form).
     """
     from .relationships_detector import detect as _rd_detect
+    from .archetype_router import route_archetype as _ar_route
     pages = state.context.get("page_plan_pages") or []
     log.info("phase14 _apply_archetype_meta: %d page(s) in page_plan_pages", len(pages))
+    # Phase 17-A (2026-09-18): build a lookup of planner new_blocks
+    # so we can see the archetype the LLM actually picked (page_plan_pages
+    # entries don't always carry the layout field — the LLM emits it
+    # on new_blocks, not on the page_plan_additions). Without this
+    # lookup, every entry looks like archetype=raw and the heuristic
+    # over-fires on divider / cover / TOC slides.
+    new_blocks_by_svg: dict[str, dict] = {}
+    planner_result = state.context.get("planner_result")
+    if planner_result is not None:
+        for nb in (planner_result.new_blocks or []):
+            if not isinstance(nb, dict):
+                continue
+            svg_name = nb.get("svg", "")
+            if svg_name:
+                new_blocks_by_svg[svg_name] = nb
     for entry in pages:
         if not isinstance(entry, dict) or not entry.get("svg"):
             continue
-        # archetype defaults to layout / raw
-        if not entry.get("archetype"):
-            entry["archetype"] = entry.get("layout", "raw")
+        svg_name = entry.get("svg", "")
+        # Phase 17-A (2026-09-18): divider slides have no body
+        # content (just chapter title); the heuristic would mis-classify
+        # them as hero. Skip the override for divider/wrapper/cover
+        # slides; only re-route content slides.
+        if svg_name.endswith("_div.svg") or "_cover" in svg_name or "_toc" in svg_name:
+            entry.setdefault("archetype", entry.get("layout", "raw"))
+            entry.setdefault("relationships_atom", "none")
+            entry.setdefault("page_rhythm", "breathing")
+            entry.setdefault("reading_mode", "presentation")
+            entry.setdefault("composition_macro", None)
+            continue
+        # Resolve the LLM's actual archetype choice from new_blocks
+        # (page_plan_pages entries don't always carry ``layout``).
+        nb_entry = new_blocks_by_svg.get(svg_name) or {}
+        llm_archetype = (
+            entry.get("archetype")
+            or entry.get("layout")
+            or nb_entry.get("layout")
+            or nb_entry.get("archetype")
+        )
         # run detector only if at least one of the 3 derived fields is missing
         needs_detect = any(
             k not in entry
             for k in ("relationships_atom", "page_rhythm")
         )
+        text = (
+            (entry.get("title") or "")
+            + "\n"
+            + (entry.get("body") or "")
+        )
         if needs_detect:
-            text = (
-                (entry.get("title") or "")
-                + "\n"
-                + (entry.get("body") or "")
-            )
             result = _rd_detect(text)
             entry.setdefault("relationships_atom", result["atom"])
             entry.setdefault("page_rhythm", result["suggested_rhythm"])
+        # Phase 17-A (2026-09-18): auto-route archetype from content
+        # shape when the LLM picked ``raw`` (no archetype) or when the
+        # heuristic is high-confidence (>0.85). For hero archetypes we
+        # trust the LLM — semantic choices the heuristic can't reliably
+        # infer from text shape alone.
+        if llm_archetype in (None, "raw", ""):
+            result = _ar_route(text)
+            entry["archetype"] = result["archetype"]
+            log.info(
+                "phase17a: %s archetype=raw → heuristic %s "
+                "(conf=%.2f, %s)",
+                entry.get("svg"), result["archetype"],
+                result["confidence"], result["reason"],
+            )
+        else:
+            entry["archetype"] = llm_archetype
         entry.setdefault("reading_mode", "balanced")
         entry.setdefault("composition_macro", None)
 

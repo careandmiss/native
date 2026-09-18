@@ -1215,12 +1215,22 @@ def _normalize_new_blocks(
         # string we store here.
         if not isinstance(bounds, str) or not bounds:
             from .archetype_meta import ARCHETYPE_META, DEFAULT_META
+            from .bounds_optimizer import compute_optimal_bounds
             meta = ARCHETYPE_META.get(layout, DEFAULT_META)
-            bx, byy, bw, bh = meta["body_bounds"]
+            # Phase 17-B (2026-09-18): when the spec has content, ask
+            # the bounds optimizer to shrink the default frame to snug
+            # fit the actual content. Archetype meta's value is the
+            # upper-bound; the optimizer returns <= the upper-bound.
+            try:
+                opt_bounds = compute_optimal_bounds(layout, spec)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("phase17b: bounds optimizer failed: %s", exc)
+                opt_bounds = tuple(meta["body_bounds"])  # type: ignore[assignment]
+            bx, byy, bw, bh = opt_bounds
             bounds = f"{bx:g} {byy:g} {bw:g} {bh:g}"
             log.info(
                 "phase16: new_block %s bounds missing; filled from "
-                "archetype_meta[%s] body_bounds -> %r",
+                "archetype_meta[%s] -> %r",
                 svg, layout, bounds,
             )
         if layout not in {"3-column-cards", "flow-steps",
@@ -1440,6 +1450,39 @@ def _normalize_new_blocks(
         if "composition_macro" not in entry:
             entry["composition_macro"] = None
 
+        # Phase 17-A (2026-09-18): auto-route archetype via the content-
+        # shape heuristic. We trust the LLM for hero archetypes
+        # (hero_statement / callout-box / hero-number / statement-
+        # caption) — those are semantic choices the heuristic can't
+        # reliably infer. For everything else we override when the
+        # heuristic is high-confidence (>=0.85) so the 17 archetypes
+        # actually get used across the deck.
+        try:
+            from .archetype_router import (
+                route_archetype as _ar_route_phase17,
+                VALID_ARCHETYPES as _ar_valid,
+            )
+            spec_text = _spec_to_router_text(spec, layout)
+            heuristic = _ar_route_phase17(spec_text, llm_choice=layout)
+            if (
+                layout not in {"hero_statement", "callout-box",
+                               "hero-number", "statement-caption"}
+                and heuristic["confidence"] >= 0.85
+                and heuristic["archetype"] in _ar_valid
+                and heuristic["archetype"] != layout
+            ):
+                log.info(
+                    "phase17a: %s layout=%s → heuristic %s (conf=%.2f, %s)",
+                    svg, layout, heuristic["archetype"],
+                    heuristic["confidence"], heuristic["reason"],
+                )
+                layout = heuristic["archetype"]
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "phase17a: archetype_router failed svg=%s layout=%s err=%s",
+                svg, layout, exc,
+            )
+
         block_id = entry.get("id") or f"new-block-{len(cleaned) + 1}"
         cleaned.append({
             "svg": svg,
@@ -1453,6 +1496,71 @@ def _normalize_new_blocks(
             "composition_macro": entry.get("composition_macro"),
         })
     return cleaned
+
+
+def _spec_to_router_text(spec: dict[str, Any], layout: str) -> str:
+    """Extract a plain-text representation of a new_block spec.
+
+    Used by :func:`archetype_router.route_archetype` to derive a
+    section-text-like string when the original section text is no
+    longer available. Concatenates the spec fields that carry prose:
+    cards[*].title / cards[*].items[*] for 3-column-cards;
+    steps[*].label / steps[*].detail for procedural-steps; body / text
+    for simple-text; rows[*][*] for revision-table; etc.
+    """
+    parts: list[str] = []
+    if isinstance(spec, dict):
+        for k in ("body", "text", "headline", "subline", "quote", "caption"):
+            v = spec.get(k)
+            if isinstance(v, str) and v:
+                parts.append(v)
+        cards = spec.get("cards") or []
+        for c in cards:
+            if isinstance(c, dict):
+                t = c.get("title")
+                if isinstance(t, str):
+                    parts.append(t)
+                for it in (c.get("items") or []):
+                    if isinstance(it, str):
+                        parts.append(it)
+        steps = spec.get("steps") or []
+        for s in steps:
+            if isinstance(s, dict):
+                for k in ("label", "detail", "title"):
+                    v = s.get(k)
+                    if isinstance(v, str):
+                        parts.append(v)
+                for it in (s.get("items") or s.get("bullets") or []):
+                    if isinstance(it, str):
+                        parts.append(it)
+        left = spec.get("left") or {}
+        right = spec.get("right") or {}
+        for side in (left, right):
+            if isinstance(side, dict):
+                t = side.get("title")
+                if isinstance(t, str):
+                    parts.append(t)
+                for it in (side.get("items") or side.get("content") or []):
+                    if isinstance(it, str):
+                        parts.append(it)
+        tiles = spec.get("tiles") or []
+        for t in tiles:
+            if isinstance(t, dict):
+                for k in ("keyword", "descriptor", "value"):
+                    v = t.get(k)
+                    if isinstance(v, str):
+                        parts.append(v)
+        rows = spec.get("rows") or []
+        for r in rows:
+            if isinstance(r, (list, tuple)):
+                for cell in r:
+                    if isinstance(cell, str):
+                        parts.append(cell)
+            elif isinstance(r, dict):
+                for v in r.values():
+                    if isinstance(v, str):
+                        parts.append(v)
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------

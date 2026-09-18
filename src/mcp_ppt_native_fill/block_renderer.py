@@ -285,11 +285,25 @@ def render_new_block(spec: dict[str, Any]) -> str:
             bx, by, bw, bh = _body_bounds_default
         gap = 16.0
         card_w = (bw - gap * (n - 1)) / n
+        # Phase 17-C (2026-09-18): auto-shrink item font per-card when
+        # the longest item would overflow the card width. Different
+        # cards may end up at different font sizes — that's fine, the
+        # title font stays at 18 across cards.
+        from .text_width import chars_that_fit as _cpl_card
+        card_inner_w = max(80.0, card_w - 32.0)  # 16px padding each side
         for i, card in enumerate(cards):
             cx = bx + i * (card_w + gap)
             color = card.get("color", "#1D2CAB")
             title = card.get("title", "")
             items = coerce_str_list(card.get("items", []))
+            max_len = max((len(s) for s in items), default=0)
+            item_font = 14.0
+            for try_font in (14.0, 13.0, 12.0):
+                if _cpl_card(card_inner_w, try_font) >= max_len:
+                    item_font = try_font
+                    break
+            else:
+                item_font = 12.0
             parts.append(
                 f'<rect x="{cx:g}" y="{by:g}" width="{card_w:g}" '
                 f'height="{bh:g}" rx="8" fill="{color}" fill-opacity="0.12" '
@@ -307,9 +321,14 @@ def render_new_block(spec: dict[str, Any]) -> str:
                 # the quality checker flagged it as a blocking overflow.
                 if ty > by + bh - 8:
                     break
+                # Phase 17-C: also horizontally clip the item when even
+                # at the smallest font it would overflow.
+                cpl = max(1, _cpl_card(card_inner_w, item_font))
+                display = item[:cpl] + ("…" if len(item) > cpl else "")
                 parts.append(
-                    f'<text x="{cx + 16:g}" y="{ty:g}" font-size="14" '
-                    f'fill="#222">{escape(item)}</text>'
+                    f'<text x="{cx + 16:g}" y="{ty:g}" '
+                    f'font-size="{item_font:g}" fill="#222">'
+                    f'{escape(display)}</text>'
                 )
         return "\n".join(parts)
     if layout == "flow-steps":
@@ -850,6 +869,22 @@ def render_new_block(spec: dict[str, Any]) -> str:
             f'<rect x="{bx:g}" y="{by:g}" width="6" height="{bh:g}" '
             f'fill="{escape(color)}"/>'
         ]
+        # Phase 17-C (2026-09-18): auto-shrink font when text would
+        # overflow the available width. The longest item sets the font
+        # size for the whole list (uniform type hierarchy preserved).
+        from .text_width import chars_that_fit as _cpl
+        text_inner_w = bw - 24.0 - 16.0  # bar + right padding
+        max_item_len = max(len(s) for s in items) if items else 0
+        item_font = 16.0
+        for try_font in (16.0, 14.0, 13.0, 12.0):
+            if _cpl(text_inner_w, try_font) >= max_item_len:
+                item_font = try_font
+                break
+        else:
+            item_font = 12.0
+        # When font shrinks, line_h tightens proportionally so the
+        # whole list still fits in the bounds.
+        line_h = min(30.0, item_font * 1.6, (bh - 40.0) / max(1, len(items)))
         for i, item in enumerate(items):
             ty = by + 30.0 + line_h * i
             # Overflow guard (same pattern as 3-column-cards line 122):
@@ -860,10 +895,12 @@ def render_new_block(spec: dict[str, Any]) -> str:
             # own bounds-check (line 537 ``ty > by + bh - 8``) still
             # drops items that fall past the bottom of the body rect,
             # so we don't risk overflow from the longer truncation.
-            display = item[:80] + ("…" if len(item) > 80 else "")
+            cpl = max(1, _cpl(text_inner_w, item_font))
+            display = item[:cpl] + ("…" if len(item) > cpl else "")
             parts.append(
-                f'<text x="{bx + 24:g}" y="{ty:g}" font-size="16" '
-                f'fill="#222">{i + 1}. {escape(display)}</text>'
+                f'<text x="{bx + 24:g}" y="{ty:g}" '
+                f'font-size="{item_font:g}" fill="#222">'
+                f'{i + 1}. {escape(display)}</text>'
             )
         return "\n".join(parts)
     # Phase 7 (2026-09-16): ppt-master archetype-inspired layouts.
