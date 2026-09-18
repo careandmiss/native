@@ -741,6 +741,24 @@ def phase3_author(
             )
             continue
         for shape_id, spec in blocks.items():
+            # Belt-and-suspenders: reject new_blocks targeting the ending
+            # skeleton. The LLM's correct path for trailing sections is
+            # page_plan_additions, not new_blocks. The _normalize_new_blocks
+            # guard already drops these, but defense-in-depth here protects
+            # against future code paths that bypass the normalizer.
+            _svg_skeleton_kind = (state.context.get("skeleton_kind") or {}).get(svg_name)
+            if _svg_skeleton_kind == "ending":
+                state.errors.append(
+                    f"new_content_block skipped: svg={svg_name} has skeleton_kind="
+                    f"ending (reserved for THANK YOU / chrome); use "
+                    f"page_plan_additions for trailing sections"
+                )
+                log.warning(
+                    "phase3: new_content_block skipped svg=%s shape=%s — "
+                    "ending skeleton reserved for closing chrome",
+                    svg_name, shape_id,
+                )
+                continue
             bounds = spec.get("bounds")
             if not bounds:
                 state.warnings.append(

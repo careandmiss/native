@@ -364,6 +364,107 @@ def fix_text_overflow(
     return records
 
 
+def fix_text_overflow_in_groups(
+    svg_path: Path,
+    group_ids: Iterable[str] = ("content-body", "body_cards"),
+    *,
+    shrink_factor: float = 0.85,
+    min_readable_font: float = 8.0,
+) -> list[dict[str, Any]]:
+    """Shrink/truncate fonts for ``<text>`` whose estimated width
+    overflows the parent ``<g data-pptx-bounds>`` inner width.
+
+    Walks every <text> inside the named groups (e.g. ``content-body``
+    or ``body_cards``), estimates rendered width via
+    ``mcp_ppt_native_fill.text_width.chars_that_fit``, and applies
+    the same shrink-cascade pattern as ``fix_text_overflow``.
+
+    Returns a list of fix records (one per adjustment) so the caller
+    can log them in the autofix round report.
+    """
+    from xml.etree import ElementTree as ET
+    from mcp_ppt_native_fill.text_width import chars_that_fit
+
+    svg_path = Path(svg_path)
+    if not svg_path.is_file():
+        return []
+    try:
+        tree = ET.parse(svg_path)
+    except ET.ParseError:
+        return []
+    root = tree.getroot()
+    svg_ns = "{http://www.w3.org/2000/svg}"
+    target_ids = set(group_ids)
+    records: list[dict[str, Any]] = []
+
+    def _text_width_px(text: str, font_size: float) -> float:
+        """Heuristic rendered width for Latin/CJK mixed text."""
+        cpl = chars_that_fit(1000.0, font_size) or 40
+        # chars_that_fit returns chars per 1000 px; convert to px-per-char.
+        px_per_char = 1000.0 / cpl if cpl > 0 else font_size * 0.6
+        return len(text) * px_per_char
+
+    for g in root.iter(f"{svg_ns}g"):
+        gid = g.get("id")
+        if not gid or gid not in target_ids:
+            continue
+        bounds_attr = g.get("data-pptx-bounds")
+        if not bounds_attr:
+            continue
+        try:
+            bx, by_, bw, bh = (float(p) for p in bounds_attr.split())
+        except (ValueError, TypeError):
+            continue
+        inner_w = bw - 32  # conservative padding
+        for text_el in g.iter(f"{svg_ns}text"):
+            fs_raw = text_el.get("font-size", "13")
+            try:
+                fs = float(fs_raw)
+            except ValueError:
+                fs = 13.0
+            content = (text_el.text or "").strip()
+            if not content:
+                continue
+            width = _text_width_px(content, fs)
+            if width <= inner_w:
+                continue
+            # Shrink cascade: reduce font by shrink_factor until it
+            # fits, or until font reaches min_readable_font, then
+            # truncate with "…".
+            cur_fs = fs
+            while cur_fs > min_readable_font and _text_width_px(content, cur_fs) > inner_w:
+                cur_fs *= shrink_factor
+            if cur_fs <= min_readable_font:
+                # Truncate content with ellipsis.
+                cpl = chars_that_fit(inner_w, min_readable_font) or 20
+                truncated = content[: max(1, cpl - 1)].rstrip() + "…"
+                text_el.text = truncated
+                records.append({
+                    "shape_id": gid,
+                    "action": "truncate",
+                    "font_size": min_readable_font,
+                    "text_preview": truncated[:30],
+                    "svg": str(svg_path),
+                })
+            else:
+                # Apply shrunk font size.
+                new_fs = max(min_readable_font, cur_fs)
+                text_el.set("font-size", f"{new_fs:g}")
+                records.append({
+                    "shape_id": gid,
+                    "action": "shrink",
+                    "old_font_size": fs,
+                    "new_font_size": new_fs,
+                    "text_preview": content[:30],
+                    "svg": str(svg_path),
+                })
+
+    if records:
+        # Re-serialize the modified SVG.
+        tree.write(svg_path, encoding="utf-8", xml_declaration=False)
+    return records
+
+
 # ---------------------------------------------------------------------------
 # Fix 2: missing viewBox.
 # ---------------------------------------------------------------------------
@@ -797,6 +898,12 @@ def run_autofix_round(
         if fix_overflow:
             shape_ids = overflow_by_slide.get(svg_path.name, [])
             records.extend(fix_text_overflow(svg_path, shape_ids))
+        # Fix C-3: walk content-body / body_cards groups for LLM-generated
+        # text that the vendor's shape-N selector can't see.
+        group_records = fix_text_overflow_in_groups(svg_path)
+        for rec in group_records:
+            log.info("autofix: %s %s svg=%s", rec.get("shape_id"),
+                     rec.get("action"), rec.get("svg"))
         if fix_nested_picture:
             try:
                 records.extend(fix_nested_picture_data_attrs(svg_path))

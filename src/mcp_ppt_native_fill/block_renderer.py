@@ -77,40 +77,95 @@ def _cn_num(n: int) -> str:
     return str(n)
 
 
-def _fs(spec: dict[str, Any], role: str) -> str:
-    """Resolve font-size for a text run via the TYPOGRAPHY role dict.
+def _compute_max_body_lines(
+    *,
+    bh: float,
+    by: float,
+    body_y0: float,
+    line_h: float,
+    block_after_h: float = 0.0,
+) -> int:
+    """How many body lines fit given body bounds + line height + below-block.
 
-    Phase 14 (2026-09-17): the four ppt-master archetypes
-    (``hero_statement``, ``statement-caption``, ``procedural-steps``,
-    ``revision-table``) no longer derive font-size from
-    ``scale = bw / 1280.0`` -- that produced visibly small text on
-    boteng's bw=1060 body_bounds (e.g. 13px -> 10.77px). The LLM
-    planner now emits ``spec.font_size`` either as a **role name**
-    (preferred, e.g. ``"annotation"`` -> 13) or a **raw px value**
-    (e.g. ``"22"`` for the claim-band tier). We resolve both forms
-    against :data:`TYPOGRAPHY` so the renderer never invents a number.
+    Used by statement-caption and hero_statement to derive a height-driven
+    line cap instead of hard-coding ``max_lines = 4``.
+    """
+    available = bh - (body_y0 - by) - block_after_h
+    return max(1, int(available // line_h))
+
+
+def _body_lines_cascade(
+    body_lines: list[str],
+    *,
+    max_lines: int,
+    font_attr: str,
+    body_font: float,
+    min_font: float = 12.0,
+    shrink_step: float = 2.0,
+) -> tuple[list[str], str]:
+    """Cascade: trim to max_lines → shrink font → truncate.
+
+    Returns the body lines and the (possibly reduced) font_size string.
+
+    Algorithm:
+      1. If ``body_lines`` fits within ``max_lines``, return as-is.
+      2. Otherwise, shrink font by ``shrink_step`` (recompute max_lines
+         proportionally) until either fits or font reaches ``min_font``.
+      3. If still doesn't fit, truncate to ``max_lines`` (final fallback).
+    """
+    if len(body_lines) <= max_lines:
+        return body_lines, font_attr
+    cur_font = float(font_attr) if font_attr else body_font
+    cur_max = max_lines
+    while cur_font > min_font and len(body_lines) > cur_max:
+        cur_font -= shrink_step
+        # Recompute how many lines fit at the new font size.
+        cur_max = max(max_lines, int((body_font / cur_font) * max_lines))
+    return body_lines[:cur_max], f"{cur_font:g}"
+
+
+def _fs(spec: dict[str, Any], role: str) -> str:
+    """Resolve font-size for a per-call usage role.
 
     Resolution order:
-      1. ``spec.font_size`` set -> look it up in TYPOGRAPHY (if role)
-         or pass through verbatim (if px number).
-      2. Otherwise resolve the caller-supplied ``role`` argument via
-         TYPOGRAPHY (the design_spec IV anchor for that role).
+      1. If ``spec.font_size`` is a TYPOGRAPHY key matching ``role``,
+         return that anchor (role-name-based, e.g. ``"page_title"``).
+      2. If ``spec.font_size`` is a raw px value, find the TYPOGRAPHY
+         role whose default matches that px within ±2 and apply ONLY
+         to that role; other roles fall back to per-role TYPOGRAPHY.
+      3. Otherwise, return the per-call role's TYPOGRAPHY default.
 
-    No magic numbers -- every px value traces back to a named role.
+    This prevents the bug where ``spec.font_size="32"`` was being
+    applied to every text element on the slide (bullets, phase labels,
+    timeline circles), causing vertical text overlap in the 2x2
+    procedural-steps grid. With this rewrite, ``spec.font_size="32``
+    applies only to the page_title tier (TYPOGRAPHY=32), while bullets
+    (TYPOGRAPHY=13), phase labels (TYPOGRAPHY=12), and section labels
+    (TYPOGRAPHY=13) each get their proper per-role size.
     """
     nested = spec.get("spec") if isinstance(spec.get("spec"), dict) else {}
     payload = nested if nested else spec
-    fs = payload.get("font_size")
-    if fs is not None and fs != "":
-        fs_str = str(fs)
-        # 1a. Role name -> TYPOGRAPHY anchor.
-        if fs_str in TYPOGRAPHY:
-            return str(TYPOGRAPHY[fs_str])
-        # 1b. Raw px (e.g. "22" or "13.5"). Pass through; SVG renderer
-        # is tolerant of numeric strings.
-        return fs_str
-    # 2. Caller's role argument -> TYPOGRAPHY anchor.
-    return str(TYPOGRAPHY[role])
+    spec_fs = payload.get("font_size")
+    if spec_fs is not None and spec_fs != "":
+        spec_fs_str = str(spec_fs)
+        # Case 1: spec.font_size is a role name (e.g. "page_title").
+        if spec_fs_str in TYPOGRAPHY:
+            if role == spec_fs_str:
+                return str(TYPOGRAPHY[spec_fs_str])
+            # Role-name mismatch: fall through to per-role TYPOGRAPHY default.
+        else:
+            # Case 2: raw px value. Auto-match to a TYPOGRAPHY role whose
+            # default is within ±2 of this px; only apply to that role.
+            try:
+                target_px = float(spec_fs_str)
+            except ValueError:
+                target_px = None
+            if target_px is not None:
+                for t_role, t_px in TYPOGRAPHY.items():
+                    if abs(float(t_px) - target_px) <= 2.0 and role == t_role:
+                        return str(t_px)
+    # Default: per-call role's TYPOGRAPHY anchor (or fallback 13).
+    return str(TYPOGRAPHY.get(role, "13"))
 
 
 # Phase 14 (2026-09-17): typography anchors from
@@ -909,15 +964,27 @@ def render_new_block(spec: dict[str, Any]) -> str:
         # 12. Multi-line body (20px dark ink).
         inner_w = bw - (PANEL_X - bx) - panel_pad - 16
         from .text_width import chars_that_fit
+
         body_font = 20.0
         cpl = chars_that_fit(inner_w, body_font)
         if cpl <= 0:
             cpl = 20
         body_lines = [body[i:i + cpl] for i in range(0, len(body), cpl)]
-        # Fit at most 4 lines above the takeaway band.
-        max_lines = 4
+        # Fit as many lines as the geometry allows above the takeaway band.
+        block_after_h = 110.0 * scale if takeaway else 16.0
+        max_lines = _compute_max_body_lines(
+            bh=bh, by=by, body_y0=by + 210 * scale,
+            line_h=32 * scale,
+            block_after_h=block_after_h,
+        )
         body_y0 = by + 210 * scale
-        for j, ln in enumerate(body_lines[:max_lines]):
+        body_lines, body_font_attr = _body_lines_cascade(
+            body_lines,
+            max_lines=max_lines,
+            font_attr=str(body_font),
+            body_font=body_font,
+        )
+        for j, ln in enumerate(body_lines):
             ly = body_y0 + j * 32 * scale
             if takeaway and ly > by + bh - 110 * scale:
                 break
@@ -925,7 +992,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
                 break
             parts.append(
                 f'<text x="{PANEL_X + panel_pad:g}" y="{ly:g}" '
-                f'font-size="{_fs(spec, "lead")}" fill="#0E1B2C">'
+                f'font-size="{body_font_attr}" fill="#0E1B2C">'
                 f'{escape(ln)}</text>'
             )
         # 13. Takeaway band (90px high, 6px gold left border).
@@ -1339,7 +1406,23 @@ def render_new_block(spec: dict[str, Any]) -> str:
             for i in range(0, len(flat_body), cpl)
         ]
         max_body_lines = 4 if not keywords else 3
-        for j, ln in enumerate(body_text_lines[:max_body_lines]):
+        block_after_h = 110.0 * scale if keywords else 16.0
+        max_lines = _compute_max_body_lines(
+            bh=bh, by=by, body_y0=body_y0,
+            line_h=34 * scale,
+            block_after_h=block_after_h,
+        )
+        # Clamp by the legacy max_body_lines heuristic (4 with no
+        # keywords, 3 with keywords) so a geometry-derived cap doesn't
+        # accidentally overflow the keyword band on tighter decks.
+        max_lines = min(max_lines, max_body_lines)
+        body_text_lines, body_font_attr = _body_lines_cascade(
+            body_text_lines,
+            max_lines=max_lines,
+            font_attr=str(body_font),
+            body_font=body_font,
+        )
+        for j, ln in enumerate(body_text_lines):
             ly = body_y0 + j * 34 * scale
             if keywords and ly > by + bh - 110 * scale:
                 break
@@ -1347,7 +1430,7 @@ def render_new_block(spec: dict[str, Any]) -> str:
                 break
             parts.append(
                 f'<text x="{bx + 36*scale:g}" y="{ly:g}" '
-                f'font-size="{_fs(spec, "lead")}" fill="#0E1B2C">'
+                f'font-size="{body_font_attr}" fill="#0E1B2C">'
                 f'{escape(ln)}</text>'
             )
         # 8. Keyword cards (5 cards, 208×56, rx=8, 0.06 fill + 4px

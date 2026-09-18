@@ -126,6 +126,25 @@ nine:
   * explicit contrast / side-by-side comparison (新 vs 旧, A vs B) →
     ``comparison`` (two large panels with central divider)
   * 4 quadrants / SWOT / 矩阵 / 象限 → ``matrix_2x2`` (four panels)
+  * 2 juxtaposed procedures or 2 sections each with multi-step bullets
+    → ``comparison`` (with ``spec.left.content`` and ``spec.right.content``
+    as lists of pre-wrapped lines); the renderer wraps text per panel width.
+  * Single long quotation (>80 chars) → ``hero_statement`` (with
+    ``spec.body_lines=[the_quote]`` as a list of pre-wrapped lines) or
+    ``callout-box``; never emit raw SVG for a single quotation.
+  * Do NOT emit raw SVG (``spec.svg``) for content slides; raw is reserved
+    for decorative elements that don't contain prose. If you reach for
+    raw SVG with text content, route to ``comparison``, ``callout-box``,
+    ``statement-caption``, or ``hero_statement`` instead.
+
+* IMPORTANT: Do NOT emit ``new_blocks`` entries whose ``svg`` is the
+  ending skeleton (typically ``slide_05.svg``). The ending slide is
+  reserved for THANK YOU / closing chrome only. For trailing sections
+  like 附件 / appendix that have a pipe-table, emit a
+  ``page_plan_additions`` entry to clone a fresh content slide
+  (``slide_partNN_content.svg``) — the renderer will write the table
+  content there. ``new_blocks`` entries targeting the ending skeleton
+  are rejected by the normalizer.
 
 IMPORTANT: Do NOT fabricate chapter numbers like "1目的" / "2适用范围".
 When rendering chapter intros, use the FULL title verbatim as the
@@ -299,7 +318,10 @@ def plan_content_mapping(
         system=SYSTEM_PROMPT, user=user_prompt, config=llm_config
     )
 
-    result = _parse_planner_response(raw, shape_index)
+    result = _parse_planner_response(
+        raw, shape_index,
+        skeleton_index=(skeleton_index or {}).get("skeleton_kind"),
+    )
     log.info(
         "plan_content_mapping produced mapping=%d slide(s)/%d edit(s), "
         "page_plan_additions=%d, new_blocks=%d",
@@ -728,13 +750,20 @@ def _source_slide_from_filename(name: str) -> int | None:
 # ---------------------------------------------------------------------------
 
 def _parse_planner_response(
-    raw: dict[str, Any], shape_index: dict[str, dict[str, Any]]
+    raw: dict[str, Any],
+    shape_index: dict[str, dict[str, Any]],
+    skeleton_index: dict[str, str] | None = None,
 ) -> PlannerResult:
     """Validate the LLM response and return a PlannerResult.
 
     Accepts both the legacy single-dict shape (``{"slide_NN.svg": {...}}``)
     and the Phase-A four-key shape (content_mapping + page_plan_additions +
     new_blocks + skeleton_kind). Anything else is a hard PlannerError.
+
+    ``skeleton_index`` (Phase 15+, 2026-09-17): the
+    ``{svg_name: kind}`` mapping used to drop ``new_blocks`` entries
+    that target the ending skeleton (reserved for THANK YOU / chrome).
+    When ``None``, the filter is skipped (legacy callers).
     """
     if not isinstance(raw, dict):
         raise PlannerError(
@@ -758,7 +787,10 @@ def _parse_planner_response(
     additions = _normalize_page_plan_additions(
         raw.get("page_plan_additions") or [], shape_index
     )
-    blocks = _normalize_new_blocks(raw.get("new_blocks") or [])
+    blocks = _normalize_new_blocks(
+        raw.get("new_blocks") or [],
+        skeleton_index=skeleton_index,
+    )
     skel = raw.get("skeleton_kind") or {}
     if not isinstance(skel, dict):
         skel = {}
@@ -963,7 +995,57 @@ def _normalize_page_plan_additions(
     return cleaned
 
 
-def _normalize_new_blocks(raw: Any) -> list[dict[str, Any]]:
+def _ending_target_filter(
+    blocks: list[Any], skeleton_index: dict[str, str] | None,
+) -> tuple[list[Any], list[Any]]:
+    """Drop new_blocks whose svg is the ending skeleton.
+
+    Returns (filtered_list, dropped_list) where dropped_list is for
+    warning logs.
+
+    The ending skeleton (typically slide_05.svg) is reserved for the
+    closing template (THANK YOU / chrome only). The LLM should emit
+    a ``page_plan_additions`` entry for trailing sections like 附件,
+    not a ``new_blocks`` entry targeting the ending skeleton.
+    """
+    filtered: list[Any] = []
+    dropped: list[Any] = []
+    if not skeleton_index:
+        return blocks, dropped
+    for block in blocks:
+        svg = block.get("svg") if isinstance(block, dict) else None
+        if svg and skeleton_index.get(svg) == "ending":
+            dropped.append(block)
+        else:
+            filtered.append(block)
+    return filtered, dropped
+
+
+def _detect_raw_svg_overflow(
+    spec_svg: str, *, max_chars_per_line: int = 40,
+) -> int | None:
+    """Quick heuristic: does the raw SVG fragment contain a <text> that
+    likely overflows?
+
+    Returns the longest <text> content's character count if any
+    <text> looks like prose (>max_chars_per_line chars without
+    <tspan> wrapping), else None.
+    """
+    import re as _re
+    text_matches = _re.findall(r"<text[^>]*>([^<]+)</text>", spec_svg)
+    if not text_matches:
+        return None
+    longest = max(len(t.strip()) for t in text_matches)
+    if longest > max_chars_per_line:
+        return longest
+    return None
+
+
+def _normalize_new_blocks(
+    raw: Any,
+    *,
+    skeleton_index: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     """Validate the LLM's new_blocks list.
 
     Each block must have svg + bounds + layout + spec. Supported layouts
@@ -974,6 +1056,20 @@ def _normalize_new_blocks(raw: Any) -> list[dict[str, Any]]:
     if not isinstance(raw, list):
         log.warning("new_blocks is not a list: %r; dropping", type(raw).__name__)
         return []
+    # Filter out new_blocks targeting the ending skeleton — the closing
+    # template is reserved for THANK YOU / chrome. The LLM's correct path
+    # for trailing sections like 附件 is page_plan_additions.
+    if skeleton_index:
+        blocks, dropped = _ending_target_filter(raw, skeleton_index)
+        for d in dropped:
+            svg = d.get("svg") if isinstance(d, dict) else "?"
+            layout = d.get("layout", "?") if isinstance(d, dict) else "?"
+            log.warning(
+                "new_block targets ending skeleton svg=%s layout=%s; "
+                "dropped (use page_plan_additions for trailing sections)",
+                svg, layout,
+            )
+        raw = blocks
     cleaned: list[dict[str, Any]] = []
     for entry in raw:
         if not isinstance(entry, dict):
@@ -1033,6 +1129,21 @@ def _normalize_new_blocks(raw: Any) -> list[dict[str, Any]]:
             if not isinstance(spec.get("svg"), str) or not spec["svg"]:
                 log.warning("raw new_block requires spec.svg; dropping")
                 continue
+            # Phase 15+ (2026-09-17): heuristic for raw-SVG prose overflow.
+            # ``raw`` is reserved for decorative elements without prose.
+            # If the LLM emits a raw SVG whose <text> contains a long
+            # prose line, log a warning so it can re-route to
+            # hero_statement / comparison / callout-box instead.
+            raw_svg = spec.get("svg", "")
+            if isinstance(raw_svg, str):
+                overflow_chars = _detect_raw_svg_overflow(raw_svg)
+                if overflow_chars and overflow_chars > 80:
+                    log.warning(
+                        "new_block raw SVG has %s-char text; consider "
+                        "routing to hero_statement / comparison / "
+                        "callout-box instead",
+                        overflow_chars,
+                    )
         elif layout == "hero-number":
             if not isinstance(spec.get("value"), str) or not spec["value"]:
                 log.warning(
