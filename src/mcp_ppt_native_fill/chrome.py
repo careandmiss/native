@@ -150,10 +150,39 @@ def chrome_meta_defaults() -> dict:
     }
 
 
+def chrome_suppress_for(
+    archetype: str,
+    rhythm: str | None = None,
+) -> tuple[bool, bool, bool]:
+    """Archetype-aware chrome suppression policy.
+
+    Per the content-adaptive layout plan (Layer 1), hero archetypes
+    (hero_statement, hero-number, callout-box, statement-caption)
+    suppress the topbar so big negative-space type isn't fighting a
+    small PART XX label. Footer stays on all archetypes for brand
+    consistency.
+
+    Args:
+        archetype: one of the 17 archetype names; unknown values fall
+            back to the raw meta (no suppression).
+        rhythm: optional page rhythm token ("anchor"/"dense"/"breathing");
+            reserved for Layer 3 — currently unused but accepted for
+            forward-compat.
+
+    Returns:
+        Tuple of (suppress_topbar, suppress_footer, suppress_section_divider).
+    """
+    from .archetype_meta import ARCHETYPE_META, DEFAULT_META
+    meta = ARCHETYPE_META.get(archetype, DEFAULT_META)
+    o = meta["chrome_overrides"]
+    return (o["suppress_topbar"], o["suppress_footer"], o["suppress_section_divider"])
+
+
 __all__: Iterable[str] = (
     "render_chrome_topbar",
     "render_chrome_footer",
     "chrome_meta_defaults",
+    "chrome_suppress_for",
     "BRAND_BLUE",
     "BRAND_BLUE_LIGHT",
     "GOLD",

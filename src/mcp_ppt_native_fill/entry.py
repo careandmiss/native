@@ -186,6 +186,11 @@ def generate_pptx(
     max_fix_iterations = int(hints.get("max_fix_iterations", 3))
     preflight_strict = hints.get("preflight_strict")
     render_previews = bool(hints.get("render_previews", True))
+    # Phase 14+ (2026-09-18): per-archetype content skeleton pool. When
+    # the caller provides this (e.g. from a v2 template cloned via
+    # ``tools/clone_content_template.py``), ``archetype_meta`` routes
+    # each page_plan_additions entry to the right source slide.
+    content_skeleton_pool = hints.get("content_skeleton_pool")
 
     toc_grid_input = hints.get("toc_grid")
     if toc_grid_input is None:
@@ -246,6 +251,7 @@ def generate_pptx(
         preflight_strict=preflight_strict,
         render_previews=render_previews,
         clean_workspace=clean_workspace,
+        content_skeleton_pool=content_skeleton_pool,
         enable_chrome_topbar=enable_chrome_topbar,
         enable_chrome_footer=enable_chrome_footer,
         enable_ppt_master_archetypes=True,

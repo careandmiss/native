@@ -28,6 +28,15 @@ from typing import Any
 
 from xml.etree import ElementTree as ET
 
+# Phase 14+ (2026-09-18): content-adaptive layout -- per-archetype
+# body bounds + chrome overrides. Lazy/conditional import so this
+# module degrades gracefully if archetype_meta is absent (older
+# deployments / standalone usage).
+try:
+    from . import archetype_meta  # noqa: F401  (consulted at runtime)
+except ImportError:  # pragma: no cover -- defensive fallback
+    archetype_meta = None  # type: ignore[assignment]
+
 
 def coerce_str_list(value: Any, sep: str = "; ") -> list[str]:
     """Coerce an LLM-emitted field into a flat list[str].
@@ -237,6 +246,21 @@ def render_new_block(spec: dict[str, Any]) -> str:
     nested = spec.get("spec") if isinstance(spec.get("spec"), dict) else {}
     payload = nested if nested else spec
 
+    # Phase 14+ (2026-09-18): resolve per-archetype body bounds.
+    # Priority: spec/payload "bounds" string (backward compat with
+    # existing test fixtures + callers) wins; otherwise consult
+    # archetype_meta for the per-layout body_bounds; otherwise use
+    # the legacy uniform fallback (83, 110, 1203, 569).
+    if archetype_meta is not None:
+        _meta = archetype_meta.ARCHETYPE_META.get(
+            layout, archetype_meta.DEFAULT_META
+        )
+        _body_bounds_default: tuple[float, float, float, float] = tuple(
+            float(v) for v in _meta["body_bounds"]
+        )
+    else:  # pragma: no cover -- defensive fallback
+        _body_bounds_default = (83.0, 110.0, 1203.0, 569.0)
+
     if layout == "raw":
         inner = payload.get("svg", "") or spec.get("svg", "")
         if not inner:
@@ -252,7 +276,13 @@ def render_new_block(spec: dict[str, Any]) -> str:
         n = len(cards)
         # Geometry derived from bounds; we expect bounds "x y w h".
         bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
+        if bounds:
+            bx, by, bw, bh = (float(t) for t in bounds.split())
+        else:
+            # Phase 14+ (2026-09-18): fall back to per-archetype body
+            # bounds from archetype_meta (or the legacy uniform default
+            # if archetype_meta is unavailable).
+            bx, by, bw, bh = _body_bounds_default
         gap = 16.0
         card_w = (bw - gap * (n - 1)) / n
         for i, card in enumerate(cards):
@@ -287,7 +317,13 @@ def render_new_block(spec: dict[str, Any]) -> str:
         if not 2 <= len(steps) <= 5:
             raise ValueError("flow-steps supports 2-5 steps per row")
         bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
+        if bounds:
+            bx, by, bw, bh = (float(t) for t in bounds.split())
+        else:
+            # Phase 14+ (2026-09-18): fall back to per-archetype body
+            # bounds from archetype_meta (or the legacy uniform default
+            # if archetype_meta is unavailable).
+            bx, by, bw, bh = _body_bounds_default
         parts: list[str] = []
         n = len(steps)
         gap = 16.0
@@ -351,7 +387,13 @@ def render_new_block(spec: dict[str, Any]) -> str:
         # boteng 附件 scenario where the markdown has a table header
         # but no data rows yet.
         bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
+        if bounds:
+            bx, by, bw, bh = (float(t) for t in bounds.split())
+        else:
+            # Phase 14+ (2026-09-18): fall back to per-archetype body
+            # bounds from archetype_meta (or the legacy uniform default
+            # if archetype_meta is unavailable).
+            bx, by, bw, bh = _body_bounds_default
         scale = bw / 1280.0
 
         keys = ("date", "status", "content", "author")
@@ -384,15 +426,23 @@ def render_new_block(spec: dict[str, Any]) -> str:
             f'<rect x="{bx:g}" y="{by + GOLD_TOP:g}" width="{bw:g}" '
             f'height="{HEADER_H:g}" fill="#1D2CAB"/>'
         )
-        # 4. Header text.
-        header_map = payload.get("headers") or {
-            "date": "日 期",
-            "status": "修订状态",
-            "content": "修 改 内 容",
-            "author": "修 改 人",
-            "reviewer": "审 核 人",
-            "approver": "批 准 人",
-        }
+        # 4. Header text. ``payload['headers']`` may arrive as a list
+        # (LLM returns it positionally) — coerce to a dict keyed by
+        # ``keys`` so ``header_map.get(key, key)`` works either way.
+        raw_headers = payload.get("headers")
+        if isinstance(raw_headers, list):
+            header_map = dict(zip(keys, raw_headers))
+        elif isinstance(raw_headers, dict):
+            header_map = raw_headers
+        else:
+            header_map = {
+                "date": "日 期",
+                "status": "修订状态",
+                "content": "修 改 内 容",
+                "author": "修 改 人",
+                "reviewer": "审 核 人",
+                "approver": "批 准 人",
+            }
         for j, key in enumerate(keys):
             cx_text = bx + j * col_w + col_w / 2.0
             parts.append(
@@ -487,7 +537,13 @@ def render_new_block(spec: dict[str, Any]) -> str:
         if not isinstance(value, str) or not value:
             raise ValueError("hero-number requires spec.value (string)")
         bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
+        if bounds:
+            bx, by, bw, bh = (float(t) for t in bounds.split())
+        else:
+            # Phase 14+ (2026-09-18): fall back to per-archetype body
+            # bounds from archetype_meta (or the legacy uniform default
+            # if archetype_meta is unavailable).
+            bx, by, bw, bh = _body_bounds_default
         parts: list[str] = []
         cx = bx + bw / 2
         # Bug 12 fix: shrink font-size to fit short bounds. A 72pt glyph
@@ -518,7 +574,13 @@ def render_new_block(spec: dict[str, Any]) -> str:
         if not isinstance(quote, str) or not quote:
             raise ValueError("callout-box requires spec.quote (string)")
         bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
+        if bounds:
+            bx, by, bw, bh = (float(t) for t in bounds.split())
+        else:
+            # Phase 14+ (2026-09-18): fall back to per-archetype body
+            # bounds from archetype_meta (or the legacy uniform default
+            # if archetype_meta is unavailable).
+            bx, by, bw, bh = _body_bounds_default
         parts: list[str] = []
         # Tinted panel background.
         parts.append(
@@ -576,7 +638,13 @@ def render_new_block(spec: dict[str, Any]) -> str:
                     f"two-column-compare spec.{side_name}.items must be list"
                 )
         bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
+        if bounds:
+            bx, by, bw, bh = (float(t) for t in bounds.split())
+        else:
+            # Phase 14+ (2026-09-18): fall back to per-archetype body
+            # bounds from archetype_meta (or the legacy uniform default
+            # if archetype_meta is unavailable).
+            bx, by, bw, bh = _body_bounds_default
         parts: list[str] = []
         gap = 24.0
         col_w = (bw - gap) / 2
@@ -610,7 +678,13 @@ def render_new_block(spec: dict[str, Any]) -> str:
         if not 2 <= len(steps) <= 5:
             raise ValueError("timeline supports 2-5 steps")
         bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
+        if bounds:
+            bx, by, bw, bh = (float(t) for t in bounds.split())
+        else:
+            # Phase 14+ (2026-09-18): fall back to per-archetype body
+            # bounds from archetype_meta (or the legacy uniform default
+            # if archetype_meta is unavailable).
+            bx, by, bw, bh = _body_bounds_default
         parts: list[str] = []
         n = len(steps)
         # Horizontal axis baseline near vertical middle.
@@ -682,7 +756,13 @@ def render_new_block(spec: dict[str, Any]) -> str:
         if not isinstance(text, str) or not text:
             raise ValueError("simple-text requires spec.text (non-empty string)")
         bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
+        if bounds:
+            bx, by, bw, bh = (float(t) for t in bounds.split())
+        else:
+            # Phase 14+ (2026-09-18): fall back to per-archetype body
+            # bounds from archetype_meta (or the legacy uniform default
+            # if archetype_meta is unavailable).
+            bx, by, bw, bh = _body_bounds_default
         padding = 24.0
         inner_w = bw - 2 * padding
         # CJK-aware line fitting: chars_that_fit does a binary search
@@ -754,7 +834,13 @@ def render_new_block(spec: dict[str, Any]) -> str:
         if not isinstance(color, str) or not color:
             color = "#1D2CAB"
         bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
+        if bounds:
+            bx, by, bw, bh = (float(t) for t in bounds.split())
+        else:
+            # Phase 14+ (2026-09-18): fall back to per-archetype body
+            # bounds from archetype_meta (or the legacy uniform default
+            # if archetype_meta is unavailable).
+            bx, by, bw, bh = _body_bounds_default
         # Adaptive line height: 30px max, scale down for many items so
         # the whole list fits. 40px top/bottom reserved for the bar +
         # breathing room.
@@ -818,7 +904,13 @@ def render_new_block(spec: dict[str, Any]) -> str:
             raise ValueError("statement-caption requires spec.body")
 
         bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
+        if bounds:
+            bx, by, bw, bh = (float(t) for t in bounds.split())
+        else:
+            # Phase 14+ (2026-09-18): fall back to per-archetype body
+            # bounds from archetype_meta (or the legacy uniform default
+            # if archetype_meta is unavailable).
+            bx, by, bw, bh = _body_bounds_default
 
         # ppt-master geometry: 240px gradient rail + 16px gutter +
         # rest white panel. We scale so that (rail + gutter + panel)
@@ -1061,7 +1153,13 @@ def render_new_block(spec: dict[str, Any]) -> str:
         # bullets from the detail string.
 
         bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
+        if bounds:
+            bx, by, bw, bh = (float(t) for t in bounds.split())
+        else:
+            # Phase 14+ (2026-09-18): fall back to per-archetype body
+            # bounds from archetype_meta (or the legacy uniform default
+            # if archetype_meta is unavailable).
+            bx, by, bw, bh = _body_bounds_default
         scale = bw / 1280.0
 
         # Normalize step dicts.
@@ -1250,7 +1348,13 @@ def render_new_block(spec: dict[str, Any]) -> str:
                 f"(got {len(cards)})"
             )
         bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
+        if bounds:
+            bx, by, bw, bh = (float(t) for t in bounds.split())
+        else:
+            # Phase 14+ (2026-09-18): fall back to per-archetype body
+            # bounds from archetype_meta (or the legacy uniform default
+            # if archetype_meta is unavailable).
+            bx, by, bw, bh = _body_bounds_default
 
         GUTTER = 24.0
         STRIDE = (bw - 2 * GUTTER) / 3.0
@@ -1324,7 +1428,13 @@ def render_new_block(spec: dict[str, Any]) -> str:
         # question no longer need to repeat it.
 
         bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
+        if bounds:
+            bx, by, bw, bh = (float(t) for t in bounds.split())
+        else:
+            # Phase 14+ (2026-09-18): fall back to per-archetype body
+            # bounds from archetype_meta (or the legacy uniform default
+            # if archetype_meta is unavailable).
+            bx, by, bw, bh = _body_bounds_default
         scale = bw / 1280.0
 
         parts: list[str] = []
@@ -1488,7 +1598,13 @@ def render_new_block(spec: dict[str, Any]) -> str:
         evidence = payload.get("evidence", "")
 
         bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
+        if bounds:
+            bx, by, bw, bh = (float(t) for t in bounds.split())
+        else:
+            # Phase 14+ (2026-09-18): fall back to per-archetype body
+            # bounds from archetype_meta (or the legacy uniform default
+            # if archetype_meta is unavailable).
+            bx, by, bw, bh = _body_bounds_default
 
         GAP = 20.0
         TILE_H = 200.0
@@ -1574,7 +1690,13 @@ def render_new_block(spec: dict[str, Any]) -> str:
             )
 
         bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
+        if bounds:
+            bx, by, bw, bh = (float(t) for t in bounds.split())
+        else:
+            # Phase 14+ (2026-09-18): fall back to per-archetype body
+            # bounds from archetype_meta (or the legacy uniform default
+            # if archetype_meta is unavailable).
+            bx, by, bw, bh = _body_bounds_default
         parts: list[str] = []
 
         # Optional page title (36px bold ink, top).
@@ -1678,7 +1800,13 @@ def render_new_block(spec: dict[str, Any]) -> str:
             )
 
         bounds = spec.get("bounds") or payload.get("bounds")
-        bx, by, bw, bh = (float(t) for t in bounds.split())
+        if bounds:
+            bx, by, bw, bh = (float(t) for t in bounds.split())
+        else:
+            # Phase 14+ (2026-09-18): fall back to per-archetype body
+            # bounds from archetype_meta (or the legacy uniform default
+            # if archetype_meta is unavailable).
+            bx, by, bw, bh = _body_bounds_default
         parts: list[str] = []
 
         # Optional page title.

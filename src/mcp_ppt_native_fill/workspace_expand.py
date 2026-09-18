@@ -29,7 +29,9 @@ from pathlib import Path
 from typing import Any
 
 from . import svg_edits
+from .archetype_meta import ARCHETYPE_META, DEFAULT_META
 from .block_renderer import render_new_block
+from .relationships_detector import detect as _rd_detect
 from .toc_detection import (
     cards_for_section as _cards_for_section,
     find_toc_svg as _find_toc_svg,
@@ -45,6 +47,7 @@ def expand_workspace_from_markdown(
     *,
     skeleton_divider: int,
     skeleton_content: int,
+    content_skeleton_pool: list[int] | None = None,  # NEW (Phase 14+)
     divider_edits_template: dict[str, str],
     content_edits_template: dict[str, str],
     body_bounds: str = "0 0 1280 720",
@@ -76,6 +79,18 @@ def expand_workspace_from_markdown(
     skeleton_divider / skeleton_content:
         Slide numbers (1-based) of the divider / content skeleton SVGs.
         Required — caller must supply whatever fits their template.
+    content_skeleton_pool:
+        Phase 14 (2026-09-17) Layer-2 routing pool — list of 1-based
+        content slide numbers the per-section picker is allowed to
+        route to. When ``None`` (default), a single-entry pool built
+        from ``skeleton_content`` is used (backward compatible —
+        legacy ``skeleton_content=4`` call sites in ``pipeline.py``
+        and tests behave exactly as before). When the caller passes
+        both ``skeleton_content`` and ``content_skeleton_pool``, the
+        explicit pool wins; each synthesized content slide's
+        ``source_slide`` is then picked from this pool per the
+        heuristic archetype's ``source_slide_hint`` lookup (with a
+        safe fallback to ``content_skeleton_pool[0]``).
     divider_edits_template / content_edits_template:
         ``{shape_id: text_format}`` maps. Each ``text_format`` supports
         ``{nn}`` (zero-padded section index), ``{n}`` (1-based integer),
@@ -154,6 +169,20 @@ def expand_workspace_from_markdown(
         part_names = [s["title"] for s in sections]
     n_parts = min(len(part_names), len(sections))
 
+    # Phase 14 (2026-09-17): resolve the per-page skeleton pool. When
+    # the caller doesn't pass ``content_skeleton_pool`` explicitly,
+    # fall back to a single-entry pool built from ``skeleton_content``
+    # so the legacy ``skeleton_content=4`` call sites (pipeline.py,
+    # tests) behave identically. If both are passed, the explicit pool
+    # wins (per the Phase 14 contract). The pool is consumed by the
+    # per-section archetype meta routing below: each heuristic layout
+    # has a ``source_slide_hint``; we pick the hint when present in
+    # the pool, else fall back to the first pool entry.
+    if content_skeleton_pool is None:
+        content_skeleton_pool = (
+            [skeleton_content] if skeleton_content else [4]
+        )
+
     auth = workspace / "authoring-svg-flat"
     cloned: list[str] = []
     # Phase 6.2b/6.4 (2026-09-16): accumulate caller-side new_blocks here
@@ -161,6 +190,13 @@ def expand_workspace_from_markdown(
     # dict via the same ``new_content_blocks`` channel the LLM uses,
     # which gives the LLM one chance to override the same ``group_id``.
     new_blocks: dict[str, dict[str, Any]] = {}
+    # Phase 14 (2026-09-17): per-content-slide archetype metadata
+    # (heuristic layout + relationships atom + suggested rhythm +
+    # routed ``source_slide``). Keyed by content svg name. Consumed
+    # by ``additions_dicts`` below to enrich the synthesized
+    # ``page_plan.json`` entries — each entry now carries the four
+    # Layer-2 routing fields without re-running the heuristic.
+    content_meta: dict[str, dict[str, Any]] = {}
 
     def _format(template_dict: dict[str, str], *, nn: str, n: int,
                 title: str, title_en: str = "") -> dict[str, str]:
@@ -548,6 +584,50 @@ def expand_workspace_from_markdown(
                         "spec": {"cards": cards},
                         "bounds": body_bounds,
                     }
+            # Phase 14 (2026-09-17): heuristic Relationships-atom
+            # detection + archetype meta routing for the synthesized
+            # ``page_plan.json`` entry. The detector reads the section's
+            # body + title and picks one of seven atoms (order / link /
+            # parent / membership / contrast / overlap / none) plus a
+            # rhythm hint; the meta lookup converts the chosen
+            # heuristic layout into a template source_slide via
+            # ``source_slide_hint`` (Layer-2 routing). This block only
+            # feeds the page_plan entry — the SVG body was already
+            # rendered above via the existing dispatch (the auto-cards
+            # block lives in the same ``content-body`` group the LLM
+            # would also write into). ``section_text`` follows the
+            # docstring contract: body + newline + title.
+            _rd_section_idx = i - 1
+            _rd_section_obj = (
+                sections[_rd_section_idx]
+                if 0 <= _rd_section_idx < len(sections)
+                else None
+            )
+            _section_text = (
+                (_rd_section_obj.get("body", "")
+                 if _rd_section_obj else "")
+                + "\n"
+                + (_rd_section_obj.get("title", "")
+                   if _rd_section_obj else title)
+            )
+            _atom_result = _rd_detect(_section_text)
+            relationships_atom = _atom_result["atom"]
+            suggested_rhythm = _atom_result["suggested_rhythm"]
+            heuristic_archetype = spec.get("layout", "raw")
+            _arch_meta = ARCHETYPE_META.get(
+                heuristic_archetype, DEFAULT_META,
+            )
+            _hint = _arch_meta["source_slide_hint"]
+            source_slide = (
+                _hint if _hint in content_skeleton_pool
+                else content_skeleton_pool[0]
+            )
+            content_meta[cont_svg_name] = {
+                "layout": heuristic_archetype,
+                "relationships_atom": relationships_atom,
+                "suggested_rhythm": suggested_rhythm,
+                "source_slide": source_slide,
+            }
             # Phase 6.2b (2026-09-16): accumulate spec in new_blocks
             # so realize_plan can route it through the unified
             # write_new_content_block path alongside any LLM blocks.
@@ -585,14 +665,38 @@ def expand_workspace_from_markdown(
     exclude_filenames: frozenset[str] = frozenset(
         f"slide_{n:02d}.svg" for n in (exclude_source_slides or [])
     )
-    additions_dicts = [
-        {
-            "source_slide": skeleton_divider if n.endswith("_div.svg")
-            else skeleton_content,
+    additions_dicts: list[dict[str, Any]] = []
+    # Phase 14 (2026-09-17): content slides carry per-section
+    # archetype meta (layout / relationships_atom / suggested_rhythm
+    # / routed source_slide). Divider slides keep the legacy
+    # ``source_slide = skeleton_divider`` behaviour — there is no
+    # per-section archetype for them and the heuristic detector
+    # doesn't apply.
+    for n in cloned:
+        if n.endswith("_div.svg"):
+            additions_dicts.append({
+                "source_slide": skeleton_divider,
+                "svg": n,
+            })
+            continue
+        meta_entry = content_meta.get(n, {})
+        entry: dict[str, Any] = {
             "svg": n,
+            "source_slide": meta_entry.get(
+                "source_slide", skeleton_content,
+            ),
         }
-        for n in cloned
-    ]
+        if "layout" in meta_entry:
+            entry["layout"] = meta_entry["layout"]
+        if "relationships_atom" in meta_entry:
+            entry["relationships_atom"] = meta_entry[
+                "relationships_atom"
+            ]
+        if "suggested_rhythm" in meta_entry:
+            entry["suggested_rhythm"] = meta_entry[
+                "suggested_rhythm"
+            ]
+        additions_dicts.append(entry)
     original_roster = _seed_original_roster(
         auth, exclude=exclude_filenames,
     )

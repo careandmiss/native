@@ -99,15 +99,42 @@ Rules
 Composition Patterns (Phase B, Bug 3) — pick layout by content shape,
 NOT by template slot. The default of "always 3-column-cards" makes
 cloned content pages look identical and rigid. Vary the layout based
-on what the section is actually saying:
+on what the section is actually saying. The ``Atom`` and ``Rhythm``
+columns describe how the page's content units relate to each other
+and how densely the page should be packed; see "Atom, rhythm, and
+reading mode" below for the full taxonomy:
 
-  * 1 big claim / single KPI / total (e.g. "5 章", "200 万") → ``hero-number``
-  * 1 motto / quote / center thesis (e.g. "秉公办事、维护公司利益") → ``callout-box``
-  * 2 juxtaposed alternatives / contrast (e.g. "公开招标 vs 邀请招标") → ``two-column-compare``
-  * 5+ ordered steps in time (e.g. "申请 → 审批 → 采购 → 验收入库") → ``timeline`` (or ``flow-steps`` if 2-4 steps)
-  * 4+ parallel peer items (≤3 columns of comparable things) → ``3-column-cards``
-  * version / revision history (date / status / author) → ``revision-table``
-  * dense paragraphs with no clear structure → ``3-column-cards`` (default fallback)
+| Content shape | Archetype | Atom | Rhythm |
+|------------------|----------------------|-------------|----------|
+| 1 big claim / single KPI / total (e.g. "5 章", "200 万") | ``hero-number`` | none | breathing |
+| 1 motto / quote / center thesis (e.g. "秉公办事、维护公司利益") | ``callout-box`` | none | breathing |
+| 2 juxtaposed alternatives / contrast (e.g. "公开招标 vs 邀请招标") | ``two-column-compare`` | contrast | dense |
+| 5+ ordered steps in time (e.g. "申请 → 审批 → 采购 → 验收入库") | ``timeline`` (or ``flow-steps`` if 2-4 steps) | order | anchor |
+| 4+ parallel peer items (≤3 columns of comparable things) | ``3-column-cards`` | membership | dense |
+| version / revision history (date / status / author) | ``revision-table`` | order | dense |
+| Hero statement (single short idea / metric; 20-79 chars) | ``hero_statement`` | overlap | breathing |
+| Single long quotation (>80 chars) | ``hero_statement`` (or ``callout-box``) | overlap | breathing |
+| dense paragraphs with no clear structure | ``3-column-cards`` (default fallback) | membership | dense |
+
+Atom, rhythm, and reading mode (Phase 14+, 2026-09-18) — for every
+page_plan_additions entry, also emit three additional fields:
+
+  * ``relationships_atom``: one of {``order``, ``link``, ``parent``,
+    ``membership``, ``contrast``, ``overlap``, ``none``}. Pick the
+    atom that best describes how the page's CONTENT UNITS relate to
+    each other — NOT how they relate to other slides. ``order`` for
+    numbered/sequential steps; ``contrast`` for A vs B comparison;
+    ``membership`` for 3+ peer items in same category; ``parent`` for
+    nested hierarchy (e.g. one intro with sub-bullets); ``link`` for
+    flow with arrows; ``overlap`` when content units share a subset;
+    ``none`` when no clear relationship.
+  * ``page_rhythm``: one of {``anchor``, ``dense``, ``breathing``}.
+    ``anchor`` for declarative/structural pages (1 takeaway); ``dense``
+    for data/comparison/tables (4+ items); ``breathing`` for single
+    thought / quote / hero pages with negative space.
+  * ``reading_mode``: one of {``text``, ``balanced``, ``presentation``}.
+    ``text`` when the reader will read line by line; ``balanced`` for
+    visual + text; ``presentation`` when the visual carries the meaning.
 
 Phase 7+ extended archetypes (ppt-master presentation_core / report_core
 inspired, 2026-09-16). Use these when they fit better than the legacy
@@ -211,6 +238,17 @@ Output format (return ONLY this JSON object)
       "source_slide": <content_id 1-based>,
       "svg": "slide_part02_content.svg",
       "edits": {"shape-<page_title_id>": "二、章节名"}
+    },
+    {
+      "source_slide": 8,
+      "svg": "slide_part05_content.svg",
+      "title": "...",
+      "layout": "3-column-cards",
+      "relationships_atom": "membership",
+      "page_rhythm": "dense",
+      "composition_macro": "triad",
+      "reading_mode": "balanced",
+      "edits": {"shape-<title_id>": "..."}
     }
   ],
   "new_blocks": [
@@ -1041,6 +1079,17 @@ def _detect_raw_svg_overflow(
     return None
 
 
+# Phase 14+ (2026-09-18): relationships_atom / page_rhythm /
+# reading_mode / composition_macro whitelist. Used by
+# ``_normalize_new_blocks`` to validate the new optional fields
+# the LLM emits per ppt-master §2.2 nine-step decision chain.
+ALLOWED_RELATIONSHIPS_ATOMS = frozenset({
+    "order", "link", "parent", "membership", "contrast", "overlap", "none",
+})
+ALLOWED_PAGE_RHYTHMS = frozenset({"anchor", "dense", "breathing"})
+ALLOWED_READING_MODES = frozenset({"text", "balanced", "presentation"})
+
+
 def _normalize_new_blocks(
     raw: Any,
     *,
@@ -1052,6 +1101,13 @@ def _normalize_new_blocks(
     match those supported by ``pipeline._render_new_block``; unsupported
     layouts are dropped with a warning. ``raw`` layout gets minimal
     validation; structural layouts get per-layout spec validation.
+
+    Phase 14+ (2026-09-18): also normalizes the optional ``relationships_atom``,
+    ``page_rhythm``, ``reading_mode`` and ``composition_macro`` fields. Invalid
+    enum values trigger a log warning and fall back to a safe default
+    (``none`` / ``dense`` / ``balanced``); ``composition_macro`` is free-form
+    (no validation) and defaults to ``None``. All four fields are always
+    present on the returned dict.
     """
     if not isinstance(raw, list):
         log.warning("new_blocks is not a list: %r; dropping", type(raw).__name__)
@@ -1207,6 +1263,48 @@ def _normalize_new_blocks(
         default_fs = _ARCHETYPE_DEFAULT_FS.get(layout)
         if default_fs and not spec.get("font_size"):
             spec["font_size"] = default_fs
+        # Phase 14+ (2026-09-18): relationships_atom / page_rhythm /
+        # reading_mode / composition_macro per-entry normalization.
+        # Invalid enum values trigger a warning and fall back to a safe
+        # default; ``composition_macro`` is free-form and defaults to
+        # None. The four fields are always present on the returned dict
+        # so downstream consumers (chrome / pipeline) can rely on them.
+        rel_atom = entry.get("relationships_atom", "none")
+        if rel_atom not in ALLOWED_RELATIONSHIPS_ATOMS:
+            log.warning(
+                "phase14: new_block %s has invalid relationships_atom=%r; "
+                "defaulting to 'none'",
+                svg, rel_atom,
+            )
+            rel_atom = "none"
+        entry["relationships_atom"] = rel_atom
+
+        page_rhythm = entry.get("page_rhythm", "dense")
+        if page_rhythm not in ALLOWED_PAGE_RHYTHMS:
+            log.warning(
+                "phase14: new_block %s has invalid page_rhythm=%r; "
+                "defaulting to 'dense'",
+                svg, page_rhythm,
+            )
+            page_rhythm = "dense"
+        entry["page_rhythm"] = page_rhythm
+
+        reading_mode = entry.get("reading_mode", "balanced")
+        if reading_mode not in ALLOWED_READING_MODES:
+            log.warning(
+                "phase14: new_block %s has invalid reading_mode=%r; "
+                "defaulting to 'balanced'",
+                svg, reading_mode,
+            )
+            reading_mode = "balanced"
+        entry["reading_mode"] = reading_mode
+
+        # composition_macro: free-form string from the LLM (e.g.
+        # "triad", "compare_a_b", "stack"). No enum validation; if the
+        # LLM omits it, store None so downstream code can detect.
+        if "composition_macro" not in entry:
+            entry["composition_macro"] = None
+
         block_id = entry.get("id") or f"new-block-{len(cleaned) + 1}"
         cleaned.append({
             "svg": svg,
@@ -1214,6 +1312,10 @@ def _normalize_new_blocks(
             "bounds": bounds,
             "layout": layout,
             "spec": spec,
+            "relationships_atom": rel_atom,
+            "page_rhythm": page_rhythm,
+            "reading_mode": reading_mode,
+            "composition_macro": entry.get("composition_macro"),
         })
     return cleaned
 

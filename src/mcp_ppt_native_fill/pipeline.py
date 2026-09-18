@@ -445,6 +445,7 @@ def realize_plan(
     *,
     caller_page_plan: list[dict] | None = None,
     caller_new_blocks: dict[str, dict[str, dict[str, Any]]] | None = None,
+    content_skeleton_pool: list[int] | None = None,
 ) -> PipelineState:
     """Phase 2c: materialize LLM planner output (Phase A expansion).
 
@@ -531,6 +532,39 @@ def realize_plan(
     for entry in planner_result.page_plan_additions:
         new_svg_name = entry.get("svg")
         source_slide = int(entry.get("source_slide", 0))
+        # Phase 14+ (2026-09-18): when the planner emits the legacy
+        # default ``source_slide: 4`` (single content skeleton) and the
+        # caller has provided a content_skeleton_pool, route through
+        # archetype_meta to pick the per-archetype source slide.
+        if source_slide in (0, 4) and content_skeleton_pool:
+            from . import archetype_meta as _arch_mod
+            # Layout may live in three places: edits.layout (rare),
+            # entry.layout (rare), or — most commonly — the matching
+            # ``new_blocks`` entry the planner emits alongside the
+            # page_plan_addition. ``new_blocks`` is a list (not a dict)
+            # of block specs; find the one whose ``svg`` matches
+            # ``new_svg_name``.
+            nb_entry: dict = {}
+            for nb in (planner_result.new_blocks or []):
+                if isinstance(nb, dict) and nb.get("svg") == new_svg_name:
+                    nb_entry = nb
+                    break
+            layout_hint = (
+                (entry.get("edits") or {}).get("layout")
+                or entry.get("layout")
+                or nb_entry.get("layout")
+                or nb_entry.get("archetype")
+                or "raw"
+            )
+            meta = _arch_mod.ARCHETYPE_META.get(
+                layout_hint, _arch_mod.DEFAULT_META
+            )
+            hint = meta["source_slide_hint"]
+            source_slide = hint if hint in content_skeleton_pool else content_skeleton_pool[0]
+            log.info(
+                "phase14: route %s → slide_%02d.svg (archetype=%s)",
+                new_svg_name, source_slide, layout_hint,
+            )
         edits = entry.get("edits") or {}
         if not new_svg_name or source_slide < 1:
             state.warnings.append(
@@ -836,6 +870,11 @@ def phase3_author(
                         f"{shape_id}: {type(exc).__name__}: {exc}"
                     )
 
+    # Phase 14+ (2026-09-18): back-fill archetype meta fields via
+    # relationships_detector before chrome injection so the suppression
+    # policy has accurate inputs.
+    _apply_archetype_meta(state)
+
     # Phase 11 (2026-09-17): inject persistent chrome (topbar +
     # footer) on every content slide. We do it here (after the body
     # block has been written) so the chrome SVG fragment is added
@@ -930,17 +969,28 @@ def _inject_content_chrome(state: PipelineState) -> None:
         svg_path = authoring_dir / entry["svg"]
         if not svg_path.is_file():
             continue
+        # Phase 14+ (2026-09-18): archetype-aware chrome suppression.
+        # Hero archetypes (hero_statement / callout-box / statement-caption
+        # / hero-number) suppress the topbar so big negative-space type is
+        # not fighting a small PART XX label; footer stays for brand
+        # consistency. ``archetype`` is set by _derive_default_chrome_plan
+        # from the matching page_plan_additions entry's layout.
+        archetype = entry.get("archetype") or entry.get("layout", "raw")
+        rhythm = entry.get("page_rhythm")
+        suppress_t, suppress_f, suppress_sd = _chrome.chrome_suppress_for(
+            archetype, rhythm
+        )
         # Build the chrome SVG. palette overrides the chrome color
         # constants when supplied.
         inner_parts: list[str] = []
-        if enable_topbar:
+        if enable_topbar and not suppress_t:
             inner_parts.append(_chrome.render_chrome_topbar(
                 chapter_label=entry["chapter_label"],
                 brand_blue=palette.get("brand_blue", _chrome.BRAND_BLUE),
                 gold=palette.get("gold", _chrome.GOLD),
                 muted_ink=palette.get("muted_ink", _chrome.MUTED_INK),
             ))
-        if enable_footer:
+        if enable_footer and not suppress_f:
             inner_parts.append(_chrome.render_chrome_footer(
                 doc_path=entry.get("doc_path",
                                    _chrome.chrome_meta_defaults()["doc_path"]),
@@ -965,10 +1015,59 @@ def _inject_content_chrome(state: PipelineState) -> None:
             )
 
 
+def _apply_archetype_meta(state: PipelineState) -> None:
+    """Phase 14+ (2026-09-18): fill missing archetype_meta fields.
+
+    Walks ``state.context["page_plan_pages"]`` and back-fills any of
+    the four new fields (``archetype`` / ``relationships_atom`` /
+    ``page_rhythm`` / ``reading_mode`` / ``composition_macro``) using
+    :func:`relationships_detector.detect` against the entry's title +
+    body text. Called after the LLM planner has produced its plan and
+    before :func:`_inject_content_chrome` so the chrome suppression
+    policy has accurate inputs.
+
+    Behavior:
+      * Missing ``archetype`` falls back to ``entry.get("layout",
+        "raw")``.
+      * Missing ``relationships_atom`` / ``page_rhythm`` come from
+        :func:`relationships_detector.detect` with default confidence
+        0.5 → atom="none", rhythm="breathing".
+      * Missing ``reading_mode`` defaults to ``"balanced"``.
+      * Missing ``composition_macro`` defaults to ``None`` (free-form).
+    """
+    from .relationships_detector import detect as _rd_detect
+    pages = state.context.get("page_plan_pages") or []
+    log.info("phase14 _apply_archetype_meta: %d page(s) in page_plan_pages", len(pages))
+    for entry in pages:
+        if not isinstance(entry, dict) or not entry.get("svg"):
+            continue
+        # archetype defaults to layout / raw
+        if not entry.get("archetype"):
+            entry["archetype"] = entry.get("layout", "raw")
+        # run detector only if at least one of the 3 derived fields is missing
+        needs_detect = any(
+            k not in entry
+            for k in ("relationships_atom", "page_rhythm")
+        )
+        if needs_detect:
+            text = (
+                (entry.get("title") or "")
+                + "\n"
+                + (entry.get("body") or "")
+            )
+            result = _rd_detect(text)
+            entry.setdefault("relationships_atom", result["atom"])
+            entry.setdefault("page_rhythm", result["suggested_rhythm"])
+        entry.setdefault("reading_mode", "balanced")
+        entry.setdefault("composition_macro", None)
+
+
 def _derive_default_chrome_plan(state: PipelineState) -> list[dict]:
     """Build a chrome plan for boteng-like content slides.
 
-    Each entry: {svg, chapter_label, doc_path, page_num, total_pages}.
+    Each entry: {svg, chapter_label, doc_path, page_num, total_pages,
+    archetype, relationships_atom, page_rhythm, reading_mode,
+    composition_macro}.
     Cover (slide_01) and TOC slides (slide_02..03) are skipped.
     slide_partNN_content.svg get "PART N · 第N章 XXX" labels.
     """
@@ -1006,6 +1105,19 @@ def _derive_default_chrome_plan(state: PipelineState) -> list[dict]:
     if not part_files:
         return plan
     total = len(part_files)
+    # Phase 14+ (2026-09-18): build a lookup of page_plan_additions
+    # so we can propagate archetype / relationships_atom / page_rhythm /
+    # reading_mode / composition_macro from the planner into each
+    # chrome plan entry. _inject_content_chrome then consults
+    # chrome_suppress_for to decide whether to render the topbar.
+    additions_by_svg: dict[str, dict] = {}
+    planner_result = state.context.get("planner_result")
+    if planner_result is not None:
+        for pea in planner_result.page_plan_additions:
+            svg_name = pea.get("svg", "")
+            if svg_name:
+                additions_by_svg[svg_name] = pea
+
     for idx, p in part_files:
         title = titles_by_index.get(idx) or f"章节 {idx}"
         # Phase 12 (2026-09-17): the literal chapter name "第N章 XXX"
@@ -1015,6 +1127,15 @@ def _derive_default_chrome_plan(state: PipelineState) -> list[dict]:
         # EN_LABEL" header instead. shape-17 stays the single source
         # of truth for the Chinese chapter name.
         en_label = _EN_LABELS.get(idx, "CHAPTER")
+        # Phase 14+: pull archetype meta fields from the planner's
+        # matching page_plan_additions entry (if any).
+        pea = additions_by_svg.get(p.name) or {}
+        pea_edits = pea.get("edits") or {}
+        archetype = (
+            pea_edits.get("layout")
+            or pea.get("layout")
+            or "raw"
+        )
         plan.append({
             "svg": p.name,
             "section_idx": idx,  # Phase 13: for chrome_meta dict merge
@@ -1022,6 +1143,12 @@ def _derive_default_chrome_plan(state: PipelineState) -> list[dict]:
             "doc_path": "采购制度 / 山西柏腾科技有限公司",
             "page_num": idx + 1,  # 1-based page (offset by cover/TOC)
             "total_pages": total + 2,  # + cover + TOC
+            # Phase 14+: archetype meta fields propagated from planner.
+            "archetype": archetype,
+            "relationships_atom": pea.get("relationships_atom", "none"),
+            "page_rhythm": pea.get("page_rhythm", "dense"),
+            "reading_mode": pea.get("reading_mode", "balanced"),
+            "composition_macro": pea.get("composition_macro"),
         })
     return plan
 
@@ -1345,6 +1472,20 @@ def phase4_quality(
     # of letting vendor svg_to_pptx abort with cryptic errors.
     if preflight_strict is None:
         preflight_strict = strict
+
+    # Pre-repair vendor XML bugs (duplicate attributes, unescaped inner
+    # quotes) on every SVG in the workspace so that preflight (and the
+    # vendor quality check) don't choke on them. Run this BEFORE the
+    # preflight scan so ET.parse sees well-formed XML.
+    repaired = autofix.repair_workspace_svgs(authoring_dir)
+    if repaired:
+        log.info("phase4 pre-repair: fixed %d SVG file(s)", repaired)
+    # Restore data-pptx-* attrs that the XML repair (or any earlier edit)
+    # may have dropped. The snapshot was taken at the end of phase2.
+    restored = autofix.restore_shape_attrs(authoring_dir)
+    if restored:
+        log.info("phase4 pre-export: restored data-pptx-* attrs on %d svg(s)", restored)
+
     try:
         from . import preflight_check as _preflight
         preflight_report = _preflight.scan_directory(authoring_dir)
@@ -1383,16 +1524,9 @@ def phase4_quality(
 
     # Pre-repair vendor XML bugs (duplicate attributes, unescaped inner
     # quotes) on every SVG in the workspace so that vendor tools
-    # (svg_quality_checker, svg_to_pptx) don't choke on them.
-    repaired = autofix.repair_workspace_svgs(authoring_dir)
-    if repaired:
-        log.info("phase4 pre-repair: fixed %d SVG file(s)", repaired)
-    # Restore data-pptx-* attrs that the XML repair (or any earlier edit)
-    # may have dropped. The snapshot was taken at the end of phase2.
-    restored = autofix.restore_shape_attrs(authoring_dir)
-    if restored:
-        log.info("phase4 pre-export: restored data-pptx-* attrs on %d svg(s)", restored)
-
+    # (svg_quality_checker, svg_to_pptx) don't choke on them. This now
+    # runs BEFORE the preflight scan (see above) so ET.parse sees
+    # well-formed XML.
     # Bug 18 fix: removed redundant re-assignment of authoring_dir
     # (it was already bound to workspace / "authoring-svg-flat" above).
     slide_files = sorted(authoring_dir.glob("slide_*.svg"))
@@ -1611,6 +1745,13 @@ def run_native_fill(
     chrome_meta: list[dict] | dict | None = None,
     palette: dict | None = None,
     archetype_override: dict[str, str] | None = None,
+    # Phase 14+ (2026-09-18): when the caller provides a content
+    # skeleton pool (multiple slide variants in the template,
+    # produced by ``tools/clone_content_template.py``), route each
+    # page_plan_additions entry through ``archetype_meta`` to pick
+    # the per-archetype source slide. None means single skeleton
+    # (legacy behavior).
+    content_skeleton_pool: list[int] | None = None,
 ) -> dict[str, Any]:
     """End-to-end native_fill pipeline.
 
@@ -1705,10 +1846,14 @@ def run_native_fill(
     # Phase 2c — materialize LLM planner output (Phase A expansion):
     # clone skeleton SVGs for page_plan_additions, register new_blocks.
     # Falls through as a no-op when the planner did not run.
+    # Phase 14+ (2026-09-18): forward the content_skeleton_pool so
+    # archetype_meta can route hero archetypes to slide_06, kpi/table to
+    # slide_07, dense archetypes to slide_08.
     state = realize_plan(
         state,
         caller_page_plan=page_plan,
         caller_new_blocks=new_content_blocks,
+        content_skeleton_pool=content_skeleton_pool,
     )
     if state.stage == "failed":
         return _finalize(state)
@@ -1857,6 +2002,7 @@ def run_with_mapping(
     chrome_meta: list[dict] | dict | None = None,
     palette: dict | None = None,
     archetype_override: dict[str, str] | None = None,
+    content_skeleton_pool: list[int] | None = None,
 ) -> dict[str, Any]:
     """One-stop driver for the "manual mapping + markdown section cloning" workflow.
 
@@ -2123,6 +2269,7 @@ def run_with_mapping(
         chrome_meta=chrome_meta,
         palette=palette,
         archetype_override=archetype_override,
+        content_skeleton_pool=content_skeleton_pool,
     )
     # Augment result with the pre-delegation work that the caller
     # asked about (edit_summary, strip_report, expansions, toc_summary).
