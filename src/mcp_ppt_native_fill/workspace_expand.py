@@ -729,9 +729,13 @@ def build_toc_slot_edits(
     For slot ``slot_indices[i]`` we set:
       * ``title_ids[slot_indices[i]]`` -> ``titles_for_slots[i]``
         (or "" if i out of range -> clear the text).
-      * ``sub_ids[slot_indices[i]]`` -> same as title when subtitles
-        are provided (caller can post-edit if they want different
-        subtitle text per slot).
+      * ``sub_ids[slot_indices[i]]`` -> ``""`` (cleared) when subtitles
+        are provided. Previously this wrote the title text into the
+        subtitle shape, which duplicated each chapter heading twice on
+        the TOC slide (one 32pt, one 16pt). We now emit empty subtitle
+        edits; callers that have semantically-rich subtitle text should
+        post-merge their own ``sub_ids[i] -> text`` edits onto the
+        returned dict before passing it to ``svg_edits.apply_text_edits``.
 
     Out-of-range titles_for_slots entries mean "clear this slot's text".
     """
@@ -740,7 +744,7 @@ def build_toc_slot_edits(
         text = titles_for_slots[i] if i < len(titles_for_slots) else ""
         edits[title_ids[slot_idx]] = text
         if sub_ids is not None:
-            edits[sub_ids[slot_idx]] = text
+            edits[sub_ids[slot_idx]] = ""
     return edits
 
 
