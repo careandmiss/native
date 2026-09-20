@@ -47,7 +47,27 @@ _DEFAULT_POSIX_SKILL_DIR = Path.home() / ".claude/skills/ppt-master"
 
 
 def resolve_skill_dir(skill_dir: str | os.PathLike | None = None) -> Path:
-    """Resolve the ppt-master skill directory per the 5-step priority."""
+    """Resolve the ppt-master skill directory per the 5-step priority.
+
+    Resolution order:
+        1. Vendored copy at ``<repo>/vendor/pptx_master`` (highest priority —
+           enables ``git clone`` + ``pip install`` without depending on
+           ``~/.claude/skills/ppt-master``).
+        2. Explicit ``skill_dir`` argument.
+        3. ``PPT_MASTER_SKILL_DIR`` env var.
+        4. ``~/.claude/skills/ppt-master`` (default install).
+        5. ``<cwd>/ppt-master`` probe.
+        6. Upward walk (helps when MCP is run from a sub-project).
+    """
+    # 1. Vendored copy at repo root — src/mcp_ppt_native_fill/runner.py
+    #    → ../../.. → repo root → vendor/pptx_master.
+    #    Returned with the trailing "/scripts" stripped so callers can
+    #    append "scripts/<entry>.py" exactly like the external layout.
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    vendor_dir = repo_root / "vendor" / "pptx_master"
+    if (vendor_dir / "scripts" / "attribution_guard.py").is_file():
+        return vendor_dir.resolve()
+
     if skill_dir is not None:
         p = Path(skill_dir).expanduser().resolve()
         if (p / "scripts" / "attribution_guard.py").is_file():
