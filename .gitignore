@@ -27,6 +27,7 @@ Thumbs.db
 
 # Project-specific: round-trip workspaces and exports.
 projects/
+workspace/
 *.pptx
 !docs/**/*.pptx
 
