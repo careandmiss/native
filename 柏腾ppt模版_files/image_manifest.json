@@ -1,0 +1,175 @@
+[
+  {
+    "index": 1,
+    "filename": "image1.png",
+    "original_filename": "image1.png",
+    "asset_kind": "bitmap",
+    "svg_renderable": true,
+    "pptx_native_supported": true,
+    "source_kind": "pptx_picture",
+    "source_ext": ".png",
+    "source_target": "ppt/media/image1.png",
+    "content_type": "image/png",
+    "display_left_emu": 0,
+    "display_top_emu": 0,
+    "display_width_emu": 12184380,
+    "display_height_emu": 6858000,
+    "display_width_in": 13.325,
+    "display_height_in": 7.5,
+    "display_ratio": 1.776667,
+    "pixel_width": 1920,
+    "pixel_height": 1128,
+    "pixel_ratio": 1.702128,
+    "occurrences": [
+      {
+        "slide_index": 1,
+        "shape_name": "图片 1",
+        "display_left_emu": 0,
+        "display_top_emu": 0,
+        "display_width_emu": 12184380,
+        "display_height_emu": 6858000,
+        "display_width_in": 13.325,
+        "display_height_in": 7.5,
+        "display_ratio": 1.776667
+      },
+      {
+        "slide_index": 3,
+        "shape_name": "图片 7",
+        "display_left_emu": 0,
+        "display_top_emu": 0,
+        "display_width_emu": 12192000,
+        "display_height_emu": 6858000,
+        "display_width_in": 13.3333,
+        "display_height_in": 7.5,
+        "display_ratio": 1.777778
+      },
+      {
+        "slide_index": 5,
+        "shape_name": "图片 1",
+        "display_left_emu": 0,
+        "display_top_emu": 0,
+        "display_width_emu": 12184380,
+        "display_height_emu": 6858000,
+        "display_width_in": 13.325,
+        "display_height_in": 7.5,
+        "display_ratio": 1.776667
+      }
+    ],
+    "usage_count": 3,
+    "display_ratio_variants": [
+      1.776667,
+      1.777778
+    ]
+  },
+  {
+    "index": 2,
+    "filename": "image2.png",
+    "original_filename": "image2.png",
+    "asset_kind": "bitmap",
+    "svg_renderable": true,
+    "pptx_native_supported": true,
+    "source_kind": "pptx_picture",
+    "source_ext": ".png",
+    "source_target": "ppt/media/image2.png",
+    "content_type": "image/png",
+    "display_left_emu": 638810,
+    "display_top_emu": 458470,
+    "display_width_emu": 1656080,
+    "display_height_emu": 434975,
+    "display_width_in": 1.8111,
+    "display_height_in": 0.4757,
+    "display_ratio": 3.807299,
+    "pixel_width": 251,
+    "pixel_height": 66,
+    "pixel_ratio": 3.80303,
+    "occurrences": [
+      {
+        "slide_index": 1,
+        "shape_name": "Image 4",
+        "display_left_emu": 638810,
+        "display_top_emu": 458470,
+        "display_width_emu": 1656080,
+        "display_height_emu": 434975,
+        "display_width_in": 1.8111,
+        "display_height_in": 0.4757,
+        "display_ratio": 3.807299
+      },
+      {
+        "slide_index": 3,
+        "shape_name": "Image 4",
+        "display_left_emu": 849630,
+        "display_top_emu": 525145,
+        "display_width_emu": 1656080,
+        "display_height_emu": 434975,
+        "display_width_in": 1.8111,
+        "display_height_in": 0.4757,
+        "display_ratio": 3.807299
+      },
+      {
+        "slide_index": 5,
+        "shape_name": "Image 4",
+        "display_left_emu": 680720,
+        "display_top_emu": 458470,
+        "display_width_emu": 1656080,
+        "display_height_emu": 434975,
+        "display_width_in": 1.8111,
+        "display_height_in": 0.4757,
+        "display_ratio": 3.807299
+      }
+    ],
+    "usage_count": 3,
+    "display_ratio_variants": [
+      3.807299
+    ]
+  },
+  {
+    "index": 3,
+    "filename": "image3.png",
+    "original_filename": "image3.png",
+    "asset_kind": "bitmap",
+    "svg_renderable": true,
+    "pptx_native_supported": true,
+    "source_kind": "pptx_picture",
+    "source_ext": ".png",
+    "source_target": "ppt/media/image3.png",
+    "content_type": "image/png",
+    "display_left_emu": 0,
+    "display_top_emu": 0,
+    "display_width_emu": 19200,
+    "display_height_emu": 10800,
+    "display_width_in": 0.021,
+    "display_height_in": 0.0118,
+    "display_ratio": 1.777778,
+    "pixel_width": 1920,
+    "pixel_height": 1080,
+    "pixel_ratio": 1.777778,
+    "occurrences": [
+      {
+        "slide_index": 2,
+        "shape_name": "图片 54",
+        "display_left_emu": 0,
+        "display_top_emu": 0,
+        "display_width_emu": 19200,
+        "display_height_emu": 10800,
+        "display_width_in": 0.021,
+        "display_height_in": 0.0118,
+        "display_ratio": 1.777778
+      },
+      {
+        "slide_index": 4,
+        "shape_name": "图片 1",
+        "display_left_emu": 0,
+        "display_top_emu": 0,
+        "display_width_emu": 12192000,
+        "display_height_emu": 6858000,
+        "display_width_in": 13.3333,
+        "display_height_in": 7.5,
+        "display_ratio": 1.777778
+      }
+    ],
+    "usage_count": 2,
+    "display_ratio_variants": [
+      1.777778
+    ]
+  }
+]

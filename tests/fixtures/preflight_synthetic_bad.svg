@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="1280" height="720" viewBox="0 0 1280 720">
+  <!-- P1: duplicate id 'bad' appears twice -->
+  <rect id="bad" x="0" y="0" width="100" height="100" fill="#FFF" />
+  <rect id="bad" x="0" y="0" width="100" height="100" fill="#000" />
+
+  <!-- P2: picture without shape-id / shape-scope -->
+  <g id="pic-1" data-pptx-object="picture" data-pptx-frame="0 0 100 100">
+    <image data-pptx-object="picture" href="x.png" x="0" y="0" width="100" height="100" />
+  </g>
+
+  <!-- P3: semantic shape with 2 direct text children -->
+  <g id="sem-1" data-pptx-object="shape" data-pptx-source-ref="slide:1" data-pptx-semantic-object="shape">
+    <path d="M 0 0 L 100 0 L 100 100 L 0 100 Z" fill="none" data-pptx-part="geometry" />
+    <text x="10" y="20" font-size="14">first</text>
+    <text x="10" y="60" font-size="14">second</text>
+  </g>
+
+  <!-- P4: single-child group wrapper -->
+  <g id="wrap-1" data-pptx-object="group">
+    <rect id="bad" x="200" y="0" width="100" height="100" fill="#888" />
+  </g>
+</svg>
