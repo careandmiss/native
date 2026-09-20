@@ -1042,6 +1042,21 @@ def _normalize_page_plan_additions(
         if not isinstance(svg, str) or not svg:
             log.warning("page_plan_additions entry missing svg; dropping")
             continue
+        # Phase 18 follow-up (2026-09-20): reject ``_b/_c/_d/_e`` suffix
+        # splits on cloned content slides. The system prompt still
+        # describes the splitting feature, but in practice it produced
+        # sparse pages with mixed chrome (the suffix slides were
+        # emitted with source_slide=3 instead of 4, breaking the
+        # chrome template). Until Phase 19 properly wires section
+        # splitting + chrome consistency, drop suffix clones outright
+        # — the LLM should pack one rich content page per section.
+        if re.match(r"^slide_part\d{2}[b-z]_content\.svg$", svg):
+            log.warning(
+                "page_plan_additions[%s] is a suffix-split clone; "
+                "rejecting (Phase 18 follow-up: section splitting "
+                "disabled until chrome routing is fixed)", svg,
+            )
+            continue
         if not isinstance(source_slide, int) or source_slide < 1:
             log.warning(
                 "page_plan_additions entry %s missing valid source_slide; "

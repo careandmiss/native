@@ -1951,6 +1951,33 @@ class PlannerResultTests(unittest.TestCase):
         result = _parse_planner_response(raw, self._shape_index())
         self.assertEqual(len(result.page_plan_additions), 1)
 
+    def test_parse_drops_suffix_split_clones(self):
+        """Phase 18 follow-up (2026-09-20): suffix-split content clones
+        (``slide_partNNX_content.svg`` where X is a letter) are dropped
+        outright. The system prompt still describes splitting, but the
+        chrome routing for suffix clones is broken (they were emitted
+        with source_slide=3 instead of 4). This guard prevents the LLM
+        from sneaking sparse suffix pages back in until Phase 19 wires
+        the feature properly.
+        """
+        from mcp_ppt_native_fill.llm_planner import _parse_planner_response
+        raw = {"page_plan_additions": [
+            # base + suffix mixed: only the base should survive
+            {"source_slide": 3, "svg": "slide_part05_div.svg", "edits": {}},
+            {"source_slide": 4, "svg": "slide_part05_content.svg",
+             "edits": {}},
+            {"source_slide": 3, "svg": "slide_part05b_content.svg",
+             "edits": {}},  # dropped (suffix)
+            {"source_slide": 3, "svg": "slide_part05c_content.svg",
+             "edits": {}},  # dropped (suffix)
+        ]}
+        result = _parse_planner_response(raw, self._shape_index())
+        svgs = {p["svg"] for p in result.page_plan_additions}
+        self.assertEqual(
+            svgs,
+            {"slide_part05_div.svg", "slide_part05_content.svg"},
+        )
+
 
 class PipelinePhase26Tests(unittest.TestCase):
     """Phase-2.6 materialize LLM planner output (Phase A expansion)."""
