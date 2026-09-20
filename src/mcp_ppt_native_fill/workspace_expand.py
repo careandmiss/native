@@ -680,22 +680,22 @@ def expand_workspace_from_markdown(
             })
             continue
         meta_entry = content_meta.get(n, {})
+        # NOTE (Phase 18 root-cause fix, 2026-09-20): only emit
+        # ``{svg, source_slide}`` — the schema enforced by
+        # ``ppt-master/scripts/authoring_roundtrip.py`` rejects any
+        # other keys with "unsupported field(s)" at Phase 5. The three
+        # meta fields (layout / relationships_atom / suggested_rhythm)
+        # are kept in ``content_meta`` for internal use only; the LLM
+        # pipeline reads them off the ``new_blocks`` payload, not off
+        # ``page_plan.json``. Writing them here pollutes the schema
+        # and breaks ``svg_to_pptx.py`` for any markdown that hits the
+        # A-path auto-detect (boteng, archetype_demo).
         entry: dict[str, Any] = {
             "svg": n,
             "source_slide": meta_entry.get(
                 "source_slide", skeleton_content,
             ),
         }
-        if "layout" in meta_entry:
-            entry["layout"] = meta_entry["layout"]
-        if "relationships_atom" in meta_entry:
-            entry["relationships_atom"] = meta_entry[
-                "relationships_atom"
-            ]
-        if "suggested_rhythm" in meta_entry:
-            entry["suggested_rhythm"] = meta_entry[
-                "suggested_rhythm"
-            ]
         additions_dicts.append(entry)
     original_roster = _seed_original_roster(
         auth, exclude=exclude_filenames,
