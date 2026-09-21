@@ -212,6 +212,30 @@ def expand_workspace_from_markdown(
 
     for i, title in enumerate(part_names[:n_parts], start=1):
         nn = f"{i:02d}"
+        section = sections[i-1] if i - 1 < len(sections) else {}
+        section_body = (section.get("body") if section else "") or ""
+
+        # Phase 20 P0-C (2026-09-20): rule-based skip of content
+        # slides for short-body sections. When ``select_layout_for_section``
+        # returns ``"merge-to-divider"``, the body is too short to
+        # warrant a separate content slide; the divider already
+        # shows the section title + EN subtitle, and a one-line
+        # body inline below would crowd the divider chrome. We
+        # generate the divider (above) and skip the content clone
+        # (below). The total slide count drops by one per
+        # merge-to-divider section. This is the central Phase 20
+        # design choice: stop forcing 1:1 mapping of H1 → 1
+        # content slide for trivial sections.
+        merge_to_divider = False
+        from .layout_rules import select_layout_for_section
+        rule = select_layout_for_section(section)
+        if rule["layout"] == "merge-to-divider":
+            log.info(
+                "phase20: short-body section %s (%d chars, rule=%s) "
+                "merges into divider; content slide skipped",
+                title, len(section_body.strip()), rule["rule"],
+            )
+            merge_to_divider = True
 
         # 1) divider clone
         div_svg_name = f"slide_part{nn}_div.svg"
@@ -245,7 +269,13 @@ def expand_workspace_from_markdown(
         # 2) content clone + new_block
         cont_svg_name = f"slide_part{nn}_content.svg"
         cont_skeleton = auth / f"slide_{skeleton_content:02d}.svg"
-        if cont_skeleton.is_file():
+        # Phase 20 P0-C: short-body sections skip the content clone
+        # entirely. The divider (created in step 1 above) already
+        # conveys the section title + EN subtitle; a one-line body
+        # rendered as a full content slide would be more chrome
+        # than content. See phase20 P0-A rule for the threshold
+        # (60 chars AND ≤ 2 lines).
+        if cont_skeleton.is_file() and not merge_to_divider:
             shutil.copy2(cont_skeleton, auth / cont_svg_name)
             cont_edits = _format(content_edits_template,
                                  nn=nn, n=i, title=title)

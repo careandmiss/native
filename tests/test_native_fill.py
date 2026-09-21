@@ -6994,6 +6994,139 @@ class TestArchetypeRouterRulePrecheck(unittest.TestCase):
         self.assertEqual(result["confidence"], 1.0)
 
 
+class TestWorkspaceExpandMergeToDivider(unittest.TestCase):
+    """Phase 20 P0-C (2026-09-20): workspace_expand
+    expand_workspace_from_markdown must skip the content-slide
+    clone when the section body is short enough to merge into
+    the divider (Rule 1 in layout_rules).
+
+    Before P0-C: every H1 → 1 divider + 1 content slide (1:1 mapping).
+    After P0-C: short-body H1 → 1 divider only, no content slide.
+
+    Two pinned cases:
+    1. long body → both divider AND content slide generated.
+    2. short body → divider generated, content slide SKIPPED.
+    """
+
+    def _setup_workspace(self, td: Path) -> Path:
+        """Create a minimal workspace with skeleton div + content SVGs."""
+        ws = Path(td)
+        auth = ws / "authoring-svg-flat"
+        auth.mkdir(parents=True, exist_ok=True)
+        # skeleton divider (slide_03) and content (slide_04) — both
+        # required for expand_workspace_from_markdown's normal path.
+        (auth / "slide_03.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg">'
+            '<g id="shape-4"><text>PART</text></g>'
+            '<g id="shape-5"><text>title</text></g>'
+            "</svg>",
+            encoding="utf-8",
+        )
+        (auth / "slide_04.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg">'
+            '<g id="shape-17"><text>title</text></g>'
+            "</svg>",
+            encoding="utf-8",
+        )
+        # ending skeleton (slide_05) — required for proper end-handling.
+        (auth / "slide_05.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg">'
+            '<text>THANK YOU</text></svg>',
+            encoding="utf-8",
+        )
+        return ws
+
+    def _md_short_body(self, td: Path) -> Path:
+        """MD with one short body section triggering merge-to-divider.
+        前言 body = 14 chars (Rule 1 fires, content slide skipped).
+        一、目的 body = long enough to bypass Rule 1 (content slide kept)."""
+        md = td / "short.md"
+        md.write_text(
+            "# 前言\n"
+            "为了规范公司商务行为管理。\n"  # 14 chars, 1 line — short body
+            "\n"
+            "# 一、目的\n"
+            "本节介绍公司商务部的整体组织架构与人员配置情况，"
+            "涵盖各岗位的职责分工与协作流程。\n"
+            "各部门之间通过标准化的沟通机制实现信息共享与业务协同，"
+            "确保商务活动的高效开展与持续改进。",
+            encoding="utf-8",
+        )
+        return md
+
+    def _md_long_body(self, td: Path) -> Path:
+        """MD with one long body section NOT triggering merge-to-divider.
+        Body must be > 60 chars AND > 2 lines to bypass Rule 1."""
+        md = td / "long.md"
+        md.write_text(
+            "# 一、目的\n"
+            "本节介绍公司商务部的整体组织架构与人员配置情况，"
+            "涵盖各岗位的职责分工与协作流程。\n"
+            "各部门之间通过标准化的沟通机制实现信息共享与业务协同，"
+            "确保商务活动的高效开展与持续改进。",
+            encoding="utf-8",
+        )
+        return md
+
+    def test_short_body_skips_content_clone(self):
+        """When the section body is short, only the divider SVG
+        is generated; no slide_part{NN}_content.svg is written."""
+        from mcp_ppt_native_fill.workspace_expand import (
+            expand_workspace_from_markdown,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ws = self._setup_workspace(td)
+            md = self._md_short_body(td)
+            result = expand_workspace_from_markdown(
+                workspace=ws,
+                md_path=md,
+                skeleton_divider=3,
+                skeleton_content=4,
+                divider_edits_template={"shape-4": "PART {nn}",
+                                        "shape-5": "{title}"},
+                content_edits_template={"shape-17": "{title}"},
+                exclude_source_slides=[3, 4],
+                ending_svg="slide_05.svg",
+            )
+            cloned = result["cloned_svgs"]
+            # Both divs (前言, 一、目的) must exist.
+            self.assertIn("slide_part01_div.svg", cloned)
+            self.assertIn("slide_part02_div.svg", cloned)
+            # 一、目的 content slide (long body) must exist.
+            self.assertIn("slide_part02_content.svg", cloned)
+            # 前言 content slide (short body → merge-to-divider)
+            # must NOT be generated.
+            self.assertNotIn("slide_part01_content.svg", cloned)
+
+    def test_long_body_keeps_content_clone(self):
+        """Sanity check: when the section body is long enough
+        (> 60 chars OR > 2 lines), the content clone runs as
+        before — no regression on the existing 1:1 mapping for
+        substantial sections."""
+        from mcp_ppt_native_fill.workspace_expand import (
+            expand_workspace_from_markdown,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ws = self._setup_workspace(td)
+            md = self._md_long_body(td)
+            result = expand_workspace_from_markdown(
+                workspace=ws,
+                md_path=md,
+                skeleton_divider=3,
+                skeleton_content=4,
+                divider_edits_template={"shape-4": "PART {nn}",
+                                        "shape-5": "{title}"},
+                content_edits_template={"shape-17": "{title}"},
+                exclude_source_slides=[3, 4],
+                ending_svg="slide_05.svg",
+            )
+            cloned = result["cloned_svgs"]
+            self.assertIn("slide_part01_div.svg", cloned)
+            self.assertIn("slide_part01_content.svg", cloned)
+
+
 class TestEmptyBodyFallback(unittest.TestCase):
     """Phase 19 P0-B-3 (2026-09-20): _fill_missing_content_blocks
     must synthesize placeholder cards for EVERY content SVG in the
