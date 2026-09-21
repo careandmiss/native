@@ -70,8 +70,17 @@ def render_chrome_topbar(
     return (
         f'<g id="slide-topbar" data-pptx-role="decoration" '
         f'data-pptx-bounds="64 {topbar_top:g} 1216 36">'
-        f'<text x="64" y="{label_y:g}" font-size="12" font-weight="bold" '
-        f'fill="{muted_ink}" letter-spacing="{letter_spacing:g}">'
+        # Phase 19 P0-B-fix-topbar-overlap (2026-09-20): right-anchor
+        # the label so it never collides with the boteng template's
+        # shape-17 hero title (frame ~x=104 y=25, text spans x≈113-337
+        # and y≈24-62). Topbar label now lives in the upper-right
+        # corner (x=1216, text-anchor=end) where there is no hero
+        # type on the boteng divider/content skeletons. Accent line
+        # stays at the left under the chrome rail so the visual
+        # anchor still reads as "top of slide".
+        f'<text x="1216" y="{label_y:g}" font-size="12" font-weight="bold" '
+        f'fill="{muted_ink}" letter-spacing="{letter_spacing:g}" '
+        f'text-anchor="end">'
         f'{_esc(chapter_label)}</text>'
         f'<line x1="{accent_x1:g}" y1="{accent_y:g}" '
         f'x2="{accent_x2:g}" y2="{accent_y:g}" stroke="{gold}" '
