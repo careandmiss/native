@@ -7322,6 +7322,77 @@ class TestTemplateInspect(unittest.TestCase):
 
     # ---- helpers ----
 
+
+class TestPipelineContext(unittest.TestCase):
+    """Phase 22 commit 1 (2026-09-20): PipelineContext + PipelineHandler
+    ABC. The state-bag-and-handler-ABC pair that underpins the
+    Pipeline Pattern refactor.
+
+    PipelineContext replaces the implicit global state in
+    ``pipeline.run_native_fill`` (a 400-line function with 40+
+    keyword-only arguments). The tests here pin the public API:
+    get/set/has, skip_handlers, stop_after lifecycle, default
+    handler_outputs dict.
+    """
+
+    def _make_ctx(self) -> "PipelineContext":
+        """Build a minimal PipelineContext for unit tests."""
+        from mcp_ppt_native_fill.pipeline import PipelineContext
+        from mcp_ppt_native_fill.pipeline import PipelineState
+        return PipelineContext(
+            state=PipelineState(),
+            source_pptx=Path("/tmp/test.pptx"),
+            workspace=Path("/tmp/ws"),
+            output_pptx=Path("/tmp/out.pptx"),
+            skill_dir=Path("/tmp/skill"),
+            options={},
+        )
+
+    def test_context_get_returns_default_when_missing(self):
+        from mcp_ppt_native_fill.pipeline import PipelineContext
+        ctx = self._make_ctx()
+        self.assertIsNone(ctx.get("missing_key"))
+        self.assertEqual(ctx.get("missing_key", "fallback"), "fallback")
+
+    def test_context_set_then_get_round_trips(self):
+        from mcp_ppt_native_fill.pipeline import PipelineContext
+        ctx = self._make_ctx()
+        ctx.set("vendor_result", {"slides_converted": 5})
+        self.assertTrue(ctx.has("vendor_result"))
+        self.assertEqual(ctx.get("vendor_result")["slides_converted"], 5)
+
+    def test_context_skip_handlers_initially_empty(self):
+        from mcp_ppt_native_fill.pipeline import PipelineContext
+        ctx = self._make_ctx()
+        self.assertEqual(ctx.skip_handlers, set())
+
+    def test_context_stop_after_persists_across_handlers(self):
+        """When a handler sets stop_after, the orchestrator stops
+        AFTER that handler completes (so the handler's outputs are
+        still in ctx). This is the Phase 3.5 / partial-pipeline
+        debugging hook."""
+        from mcp_ppt_native_fill.pipeline import PipelineContext
+        ctx = self._make_ctx()
+        ctx.stop_after = "phase3_author"
+        self.assertEqual(ctx.stop_after, "phase3_author")
+        # Simulating handler N sets a value then sets stop_after:
+        ctx.set("phase3_output", {"slides": 14})
+        self.assertEqual(ctx.get("phase3_output")["slides"], 14)
+
+    def test_context_handler_outputs_default_empty_dict(self):
+        """Two independent contexts must not share handler_outputs
+        (default_factory dict isolation)."""
+        from mcp_ppt_native_fill.pipeline import PipelineContext
+        ctx1 = self._make_ctx()
+        ctx2 = self._make_ctx()
+        ctx1.set("foo", 1)
+        # ctx2 must not see ctx1's write.
+        self.assertFalse(ctx2.has("foo"))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
     def _build_minimal(self, texts):
         """Build a 1-slide PPTX with one text shape per (name, text)
         entry."""

@@ -1,15 +1,15 @@
-"""pipeline.py — orchestrate the native fill state machine.
+"""pipeline.py 鈥?orchestrate the native fill state machine.
 
-State machine (plan §5):
+State machine (plan 搂5):
 
-    INIT → IMPORTED → PLANNED → AUTHORED → QUALITY_PASSED → EXPORTED → VALIDATED → DONE
-                                                                       ↘ FAILED
+    INIT 鈫?IMPORTED 鈫?PLANNED 鈫?AUTHORED 鈫?QUALITY_PASSED 鈫?EXPORTED 鈫?VALIDATED 鈫?DONE
+                                                                       鈫?FAILED
 
 Phases:
-  - Phase 2 (IMPORTED)        — pptx_to_svg.py --roundtrip
-  - Phase 3 (PLANNED→AUTHORED) — write page_plan.json + apply content_mapping + new_blocks
-  - Phase 4 (QUALITY_PASSED)  — svg_authoring_view refresh + svg_quality_checker --roundtrip
-  - Phase 5 (EXPORTED→DONE)   — svg_to_pptx + pptx_delivery_check + source_to_md
+  - Phase 2 (IMPORTED)        鈥?pptx_to_svg.py --roundtrip
+  - Phase 3 (PLANNED鈫扐UTHORED) 鈥?write page_plan.json + apply content_mapping + new_blocks
+  - Phase 4 (QUALITY_PASSED)  鈥?svg_authoring_view refresh + svg_quality_checker --roundtrip
+  - Phase 5 (EXPORTED鈫扗ONE)   鈥?svg_to_pptx + pptx_delivery_check + source_to_md
 
 Auto-fix loop runs between QUALITY and EXPORT: if Phase 4 returns exit 1 we
 re-try up to ``max_fix_iterations`` times (default 3) before giving up.
@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import autofix, io_utils, runner, svg_edits, workspace_expand
+from .. import autofix, io_utils, runner, svg_edits, workspace_expand
 
 log = logging.getLogger("mcp_ppt_native_fill.pipeline")
 
@@ -60,7 +60,7 @@ class PipelineState:
 # ---------------------------------------------------------------------------
 
 def write_page_plan(workspace: Path, pages: list[dict]) -> Path:
-    """Persist ``page_plan.json`` per master §4 schema.
+    """Persist ``page_plan.json`` per master 搂4 schema.
 
     ``pages`` is a list of ``{"source_slide": int, "svg": str}``. Each svg
     filename must be unique and live under ``authoring-svg-flat/``.
@@ -102,7 +102,7 @@ def phase2_import(
     inheritance_mode: str = "both",
     timeout_ms: int = 120_000,
 ) -> PipelineState:
-    """Phase 2: PPTX → authoring-svg-flat workspace."""
+    """Phase 2: PPTX 鈫?authoring-svg-flat workspace."""
     state.stage = "import"
     state.workspace = workspace
     state.output_pptx  # type: ignore[misc]
@@ -146,7 +146,7 @@ def llm_plan(
     workspace = state.workspace
     assert workspace is not None
 
-    from . import llm_planner  # late import to avoid pulling HTTP deps
+    from .. import llm_planner  # late import to avoid pulling HTTP deps
 
     try:
         # Phase 9 (2026-09-16): propagate caller-supplied
@@ -249,7 +249,7 @@ def llm_plan(
 # TOC detection / cleanup / placeholder helpers moved to
 # ``mcp_ppt_native_fill.toc_detection``. Imported below so existing
 # call sites in pipeline.py keep their underscore-prefixed aliases.
-from .toc_detection import (  # noqa: F401  (re-export for back-compat)
+from ..toc_detection import (  # noqa: F401  (re-export for back-compat)
     TOC_PLACEHOLDER_PHRASES as _TOC_PLACEHOLDER_PHRASES,
     cards_for_section as _cards_for_section,
     cards_from_body as _cards_from_body,
@@ -263,9 +263,9 @@ from .toc_detection import (  # noqa: F401  (re-export for back-compat)
     split_markdown_sections as _split_markdown_sections,
     strip_inline_markdown as _strip_inline_markdown,
 )
-# Block rendering (new_content_block spec → SVG) moved to
+# Block rendering (new_content_block spec 鈫?SVG) moved to
 # ``mcp_ppt_native_fill.block_renderer``.
-from .block_renderer import (  # noqa: F401  (re-export for back-compat)
+from ..block_renderer import (  # noqa: F401  (re-export for back-compat)
     coerce_str_list as _coerce_str_list,
     escape as _escape,
     render_new_block as _render_new_block,
@@ -277,7 +277,7 @@ from .block_renderer import (  # noqa: F401  (re-export for back-compat)
 # The two no-op / legacy stubs plus the public entry points are
 # re-exported so external callers (tests, third-party code) keep
 # working through ``pipeline.<name>``.
-from .workspace_expand import (  # noqa: F401  (re-export for back-compat)
+from ..workspace_expand import (  # noqa: F401  (re-export for back-compat)
     apply_toc_deletion_marker as _apply_toc_deletion_marker,
     build_toc_phase3_edits as _build_toc_phase3_edits,
     build_toc_slot_edits as _build_toc_slot_edits,
@@ -288,7 +288,7 @@ from .workspace_expand import (  # noqa: F401  (re-export for back-compat)
     toc_deletion_marker_path as _toc_deletion_marker_path,
     toc_slide_number as _toc_slide_number,
 )
-from .workspace_expand import (  # noqa: F401  (Phase 12 chrome topbar; legacy shim)
+from ..workspace_expand import (  # noqa: F401  (Phase 12 chrome topbar; legacy shim)
     _EN_LABELS,
     detect_section_intent,
     intent_label_pair,
@@ -307,8 +307,8 @@ def _merge_new_blocks(
     SVG-write path (:func:`svg_edits.write_new_content_block` inside
     :func:`realize_plan`). When caller and planner emit the SAME
     ``group_id`` (key under per-svg dict) for the same svg, planner
-    wins — so the LLM can override caller A-path auto-fill instead of
-    stacking a second card. Different ``group_id`` → both kept.
+    wins 鈥?so the LLM can override caller A-path auto-fill instead of
+    stacking a second card. Different ``group_id`` 鈫?both kept.
     """
     merged: dict[str, dict[str, Any]] = {}
     for svg_name, blocks in (caller_blocks or {}).items():
@@ -324,7 +324,7 @@ def _remove_existing_new_content_group(svg_path: Path, group_id: str) -> None:
     """Remove any existing top-level ``<g id="<group_id>">`` from an SVG.
 
     Phase 6.2b (2026-09-16): ``write_new_content_block`` appends rather
-    than replaces — when the caller path already wrote a
+    than replaces 鈥?when the caller path already wrote a
     ``body_cards`` group, a later LLM re-write would produce a
     duplicate ``<g id="body_cards">`` and svg_to_pptx rejects the
     duplicate. Drop the existing same-id group before writing.
@@ -366,13 +366,13 @@ def _seed_original_roster(
     names in ``exclude`` (the LLM's cloned PART_* files).
 
     The pipeline must register the original cover/toc/divider/ending
-    pages — otherwise they vanish from the export and the user sees
+    pages 鈥?otherwise they vanish from the export and the user sees
     "no cover, blank content".
 
     ``ending_last=True`` (Phase B, Bug 1 fix): when set, identify the
     ``ending`` skeleton and append it AFTER all other originals instead
     of letting ``source_slide`` ordering place it in the middle.
-    ``skeleton_kind`` is consulted first (mapping ``"slide_NN.svg" →
+    ``skeleton_kind`` is consulted first (mapping ``"slide_NN.svg" 鈫?
     "ending"|...``); if not provided or no ending entry is found, fall
     back to the slide with the highest source_slide (the boteng
     template's slide_05.svg is always the closing slide).
@@ -395,10 +395,10 @@ def _seed_original_roster(
 
     # Identify the ending slide (pop it out so we can re-append at the
     # end). Three strategies, in priority order:
-    #   1. skeleton_kind[name] == "ending" — planner already labelled it
-    #   2. body text contains THANK YOU / 谢谢 / Q&A — semantic signal
-    #   3. filename matches thank|ending|closing — defensive filename match
-    #   4. last by source_slide — last-resort fallback
+    #   1. skeleton_kind[name] == "ending" 鈥?planner already labelled it
+    #   2. body text contains THANK YOU / 璋㈣阿 / Q&A 鈥?semantic signal
+    #   3. filename matches thank|ending|closing 鈥?defensive filename match
+    #   4. last by source_slide 鈥?last-resort fallback
     ending_idx: int | None = None
     if ending_last and candidates:
         for idx, (_, name) in enumerate(candidates):
@@ -407,10 +407,10 @@ def _seed_original_roster(
                 break
         if ending_idx is None:
             # Bug 08 fix: scan SVG bodies for ending markers (THANK YOU /
-            # 谢谢 / Q&A). Templates that append an appendix slide at a
+            # 璋㈣阿 / Q&A). Templates that append an appendix slide at a
             # higher source_slide than the actual ending would otherwise
             # mis-pick the appendix as ending.
-            ending_keywords = ("THANK", "谢谢", "Q&A", "答疑", "再见")
+            ending_keywords = ("THANK", "璋㈣阿", "Q&A", "绛旂枒", "鍐嶈")
             for idx, (_, name) in enumerate(candidates):
                 try:
                     body = (authoring_dir / name).read_text(
@@ -463,7 +463,7 @@ def realize_plan(
       1. Append to the working ``new_content_blocks`` dict (caller keys
          win on collision).
 
-    Errors are non-fatal — collected as warnings so the pipeline can
+    Errors are non-fatal 鈥?collected as warnings so the pipeline can
     still complete (export will surface the missing page later if any).
     """
     state.stage = "plan_realize"
@@ -478,13 +478,13 @@ def realize_plan(
     opts = state.context.get("phase13_options") if isinstance(
         state.context, dict) else None
     if isinstance(opts, dict):
-        from . import block_renderer as _br_mod
+        from .. import block_renderer as _br_mod
         _br_mod._ALLOW_PPT_MASTER_ARCHETYPES = bool(
             opts.get("enable_ppt_master_archetypes", True))
         _br_mod._PALETTE_OVERRIDE = opts.get("palette") or {}
     planner_result = state.context.get("planner_result")
     if planner_result is None:
-        # No planner ran (caller-only path) — nothing to realize.
+        # No planner ran (caller-only path) 鈥?nothing to realize.
         # If the caller did not supply a page_plan, still seed with the
         # original workspace roster (cover/toc/divider/content/ending)
         # so the export at least mirrors the source PPTX.
@@ -502,7 +502,7 @@ def realize_plan(
 
     # Resolve which source slide each skeleton comes from. We trust the
     # planner's source_slide field, but fall back to the skeleton's own
-    # filename ordering (slide_NN.svg → N).
+    # filename ordering (slide_NN.svg 鈫?N).
     import shutil
 
     final_pages: list[dict[str, Any]] = list(caller_page_plan or [])
@@ -541,9 +541,9 @@ def realize_plan(
         # caller has provided a content_skeleton_pool, route through
         # archetype_meta to pick the per-archetype source slide.
         if source_slide in (0, 4) and content_skeleton_pool:
-            from . import archetype_meta as _arch_mod
+            from .. import archetype_meta as _arch_mod
             # Layout may live in three places: edits.layout (rare),
-            # entry.layout (rare), or — most commonly — the matching
+            # entry.layout (rare), or 鈥?most commonly 鈥?the matching
             # ``new_blocks`` entry the planner emits alongside the
             # page_plan_addition. ``new_blocks`` is a list (not a dict)
             # of block specs; find the one whose ``svg`` matches
@@ -566,7 +566,7 @@ def realize_plan(
             hint = meta["source_slide_hint"]
             source_slide = hint if hint in content_skeleton_pool else content_skeleton_pool[0]
             log.info(
-                "phase14: route %s → slide_%02d.svg (archetype=%s)",
+                "phase14: route %s 鈫?slide_%02d.svg (archetype=%s)",
                 new_svg_name, source_slide, layout_hint,
             )
         edits = entry.get("edits") or {}
@@ -593,7 +593,7 @@ def realize_plan(
             shutil.copy2(skeleton_path, new_path)
         except OSError as exc:
             state.warnings.append(
-                f"phase2.6: copy {skeleton_path.name} → {new_svg_name} "
+                f"phase2.6: copy {skeleton_path.name} 鈫?{new_svg_name} "
                 f"failed: {exc}"
             )
             continue
@@ -647,11 +647,11 @@ def realize_plan(
     # forgot to give a ``new_blocks`` entry, synthesize a default
     # 3-column-cards block from the markdown text. Without this, the cloned
     # content page renders as a giant blank rectangle (shape-3 in slide_04
-    # skeleton, 1124×530) because the skeleton only ships a title bar.
+    # skeleton, 1124脳530) because the skeleton only ships a title bar.
     # Phase 19 P0-B-3 (2026-09-20): union the LLM-identified content
     # SVGs (from page_plan_additions) with EVERY content SVG in
     # final_pages so an LLM-missed section (e.g. boteng Part 04
-    # "四、职能部门权责" which has empty body) still gets a
+    # "鍥涖€佽亴鑳介儴闂ㄦ潈璐? which has empty body) still gets a
     # synthesized placeholder. Without this union, slide_part04_content
     # rendered completely blank because the LLM did not list it in
     # page_plan_additions, so the original safety net never fired
@@ -773,7 +773,7 @@ def phase3_author(
             # mark_empty_as_carrier=True so re-cleared TOC slot <text>
             # elements (post-phase2_import overwrite) survive vendor
             # convert_text compilation. Only fires for new_text == "";
-            # filled edits are unaffected. Idempotent — running again
+            # filled edits are unaffected. Idempotent 鈥?running again
             # just sets the same attr.
             audit = svg_edits.apply_text_edits(
                 svg_path, edits, mark_empty_as_carrier=True,
@@ -815,7 +815,7 @@ def phase3_author(
                     f"page_plan_additions for trailing sections"
                 )
                 log.warning(
-                    "phase3: new_content_block skipped svg=%s shape=%s — "
+                    "phase3: new_content_block skipped svg=%s shape=%s 鈥?"
                     "ending skeleton reserved for closing chrome",
                     svg_name, shape_id,
                 )
@@ -848,16 +848,16 @@ def phase3_author(
                 )
                 state.warnings.append(
                     f"LLM override render failed svg={svg_name} shape="
-                    f"{shape_id}: {type(exc).__name__}: {exc} — "
+                    f"{shape_id}: {type(exc).__name__}: {exc} 鈥?"
                     f"prior body group kept"
                 )
                 continue  # skip writing; existing group stays
-            # Render succeeded → now safe to drop the existing same-id
+            # Render succeeded 鈫?now safe to drop the existing same-id
             # group (idempotency) and any sibling body group.
             # Phase 19 P0-B-2 (2026-09-20): regardless of which
             # shape_id we are about to write, also drop the OTHER
-            # body group (content-body ↔ body_cards). Phase 18
-            # cleanup was one-directional (content-body write →
+            # body group (content-body 鈫?body_cards). Phase 18
+            # cleanup was one-directional (content-body write 鈫?
             # body_cards drop) and let duplicate body groups slip
             # through whenever the LLM produced shape_id="body_cards"
             # on a slide where _fill_missing_content_blocks had
@@ -897,7 +897,7 @@ def phase3_author(
                     )
                     state.warnings.append(
                         f"LLM override write failed svg={svg_name} shape="
-                        f"{shape_id}: {type(exc).__name__}: {exc} — "
+                        f"{shape_id}: {type(exc).__name__}: {exc} 鈥?"
                         f"A-path body_cards kept"
                     )
                 else:
@@ -931,7 +931,7 @@ def _inject_content_chrome(state: PipelineState) -> None:
     because those have their own template chrome and shouldn't get
     an extra topbar/footer.
 
-    Phase 13 (2026-09-17) — flexibility: when ``state.context[
+    Phase 13 (2026-09-17) 鈥?flexibility: when ``state.context[
     "phase13_options"]["enable_chrome_topbar"]`` is False, no
     topbar is injected; same for footer. When both are False, the
     function is a no-op (so templates that already have their own
@@ -942,7 +942,7 @@ def _inject_content_chrome(state: PipelineState) -> None:
     """
     if state.workspace is None:
         return
-    from . import chrome as _chrome
+    from .. import chrome as _chrome
     authoring_dir = state.workspace / "authoring-svg-flat"
     if not authoring_dir.is_dir():
         return
@@ -954,7 +954,7 @@ def _inject_content_chrome(state: PipelineState) -> None:
     enable_topbar = bool(opts.get("enable_chrome_topbar", True))
     enable_footer = bool(opts.get("enable_chrome_footer", True))
     if not (enable_topbar or enable_footer):
-        # Chrome fully disabled — keep the template's own chrome intact.
+        # Chrome fully disabled 鈥?keep the template's own chrome intact.
         return
     palette = opts.get("palette") or {}
     plan = state.context.get("phase11_chrome_plan") if isinstance(
@@ -976,7 +976,7 @@ def _inject_content_chrome(state: PipelineState) -> None:
     # Phase 12 (2026-09-17): strip the template's corner tagline
     # (shape-22). The LLM previously wrote it; we now drop the
     # whole shape so chrome topbar doesn't fight with a second
-    # heading in the same vertical band. shape-17 stays — it's
+    # heading in the same vertical band. shape-17 stays 鈥?it's
     # the only place the Chinese chapter name appears.
     #
     # Phase 13: only strip when the topbar is enabled. If the caller
@@ -1067,17 +1067,17 @@ def _apply_archetype_meta(state: PipelineState) -> None:
         "raw")``.
       * Missing ``relationships_atom`` / ``page_rhythm`` come from
         :func:`relationships_detector.detect` with default confidence
-        0.5 → atom="none", rhythm="breathing".
+        0.5 鈫?atom="none", rhythm="breathing".
       * Missing ``reading_mode`` defaults to ``"balanced"``.
       * Missing ``composition_macro`` defaults to ``None`` (free-form).
     """
-    from .relationships_detector import detect as _rd_detect
-    from .archetype_router import route_archetype as _ar_route
+    from ..relationships_detector import detect as _rd_detect
+    from ..archetype_router import route_archetype as _ar_route
     pages = state.context.get("page_plan_pages") or []
     log.info("phase14 _apply_archetype_meta: %d page(s) in page_plan_pages", len(pages))
     # Phase 17-A (2026-09-18): build a lookup of planner new_blocks
     # so we can see the archetype the LLM actually picked (page_plan_pages
-    # entries don't always carry the layout field — the LLM emits it
+    # entries don't always carry the layout field 鈥?the LLM emits it
     # on new_blocks, not on the page_plan_additions). Without this
     # lookup, every entry looks like archetype=raw and the heuristic
     # over-fires on divider / cover / TOC slides.
@@ -1131,13 +1131,13 @@ def _apply_archetype_meta(state: PipelineState) -> None:
         # Phase 17-A (2026-09-18): auto-route archetype from content
         # shape when the LLM picked ``raw`` (no archetype) or when the
         # heuristic is high-confidence (>0.85). For hero archetypes we
-        # trust the LLM — semantic choices the heuristic can't reliably
+        # trust the LLM 鈥?semantic choices the heuristic can't reliably
         # infer from text shape alone.
         if llm_archetype in (None, "raw", ""):
             result = _ar_route(text)
             entry["archetype"] = result["archetype"]
             log.info(
-                "phase17a: %s archetype=raw → heuristic %s "
+                "phase17a: %s archetype=raw 鈫?heuristic %s "
                 "(conf=%.2f, %s)",
                 entry.get("svg"), result["archetype"],
                 result["confidence"], result["reason"],
@@ -1155,7 +1155,7 @@ def _derive_default_chrome_plan(state: PipelineState) -> list[dict]:
     archetype, relationships_atom, page_rhythm, reading_mode,
     composition_macro}.
     Cover (slide_01) and TOC slides (slide_02..03) are skipped.
-    slide_partNN_content.svg get "PART N · 第N章 XXX" labels.
+    slide_partNN_content.svg get "PART N 路 绗琋绔?XXX" labels.
     """
     plan: list[dict] = []
     workspace = state.workspace
@@ -1175,12 +1175,12 @@ def _derive_default_chrome_plan(state: PipelineState) -> list[dict]:
     pages = page_plan.get("pages") or []
     # Build a section_title lookup from the markdown if available.
     titles_by_index: dict[int, str] = {}
-    titles_by_index[1] = "前言"
-    titles_by_index[2] = "目的"
-    titles_by_index[3] = "适用范围"
-    titles_by_index[4] = "基本原则"
-    titles_by_index[5] = "工作程序"
-    titles_by_index[6] = "附件"
+    titles_by_index[1] = "鍓嶈█"
+    titles_by_index[2] = "鐩殑"
+    titles_by_index[3] = "閫傜敤鑼冨洿"
+    titles_by_index[4] = "鍩烘湰鍘熷垯"
+    titles_by_index[5] = "宸ヤ綔绋嬪簭"
+    titles_by_index[6] = "闄勪欢"
     # Find slide_partNN files in page order (excluding div.svg).
     # Phase 15+ (2026-09-18): also accept _b/_c/_d suffix variants
     # (e.g. slide_part04b_content.svg) so split-content pages get
@@ -1210,7 +1210,7 @@ def _derive_default_chrome_plan(state: PipelineState) -> list[dict]:
                 additions_by_svg[svg_name] = pea
         # Phase 14+ (2026-09-18): the planner emits the layout per
         # `new_blocks` entry (one per svg). _derive_default_chrome_plan
-        # used to only look at page_plan_additions.layout — which the
+        # used to only look at page_plan_additions.layout 鈥?which the
         # LLM does not always fill. That meant chrome_suppress_for
         # got archetype="raw" for hero layouts (callout-box /
         # hero_statement / statement-caption) and rendered the topbar
@@ -1224,11 +1224,11 @@ def _derive_default_chrome_plan(state: PipelineState) -> list[dict]:
                 new_blocks_by_svg[svg_name] = nb
 
     for idx, p in part_files:
-        title = titles_by_index.get(idx) or f"章节 {idx}"
-        # Phase 12 (2026-09-17): the literal chapter name "第N章 XXX"
+        title = titles_by_index.get(idx) or f"绔犺妭 {idx}"
+        # Phase 12 (2026-09-17): the literal chapter name "绗琋绔?XXX"
         # would duplicate shape-17 (37px brand-blue chapter title
         # painted by the boteng template's slide_04.svg clone). Drop
-        # the Chinese suffix and let the topbar carry a "PART NN ·
+        # the Chinese suffix and let the topbar carry a "PART NN 路
         # EN_LABEL" header instead. shape-17 stays the single source
         # of truth for the Chinese chapter name.
         # Phase 19 P0-B-1 (2026-09-20): use section_title-driven intent
@@ -1256,8 +1256,8 @@ def _derive_default_chrome_plan(state: PipelineState) -> list[dict]:
         plan.append({
             "svg": p.name,
             "section_idx": idx,  # Phase 13: for chrome_meta dict merge
-            "chapter_label": f"PART {idx:02d} · {en_label}",
-            "doc_path": "采购制度 / 山西柏腾科技有限公司",
+            "chapter_label": f"PART {idx:02d} 路 {en_label}",
+            "doc_path": "閲囪喘鍒跺害 / 灞辫タ鏌忚吘绉戞妧鏈夐檺鍏徃",
             "page_num": idx + 1,  # 1-based page (offset by cover/TOC)
             "total_pages": total + 2,  # + cover + TOC
             # Phase 14+: archetype meta fields propagated from planner.
@@ -1275,9 +1275,9 @@ def _resolve_chrome_meta(meta, state: PipelineState) -> list[dict]:
 
     Phase 13 (2026-09-17): two accepted forms:
 
-    * ``list[dict]`` — each entry directly describes a slide:
+    * ``list[dict]`` 鈥?each entry directly describes a slide:
       ``{svg, chapter_label, doc_path, page_num, total_pages, skip?}``.
-    * ``dict`` — shorthand: ``{"base": {...}, "by_section":
+    * ``dict`` 鈥?shorthand: ``{"base": {...}, "by_section":
       {section_idx: chapter_label, ...}}`` merged with the default
       plan produced by :func:`_derive_default_chrome_plan`.
 
@@ -1333,7 +1333,7 @@ def _resolve_chrome_meta(meta, state: PipelineState) -> list[dict]:
                 "section_idx": int(sec_idx),
                 "chapter_label": label,
                 "doc_path": base.get("doc_path",
-                                      "采购制度 / 山西柏腾科技有限公司"),
+                                      "閲囪喘鍒跺害 / 灞辫タ鏌忚吘绉戞妧鏈夐檺鍏徃"),
                 "page_num": int(sec_idx) + 1,
                 "total_pages": (base.get("total_pages")
                                 or len(default_plan) + 2),
@@ -1362,9 +1362,9 @@ def normalize_export_artifacts(
 
     Three independent fix groups, each opt-out via the ``disabled``
     tuple:
-      * ``render_compat``        — gradient / picture / font rewrites
-      * ``connector_preserve``   — zero-stroke connector path rewriting
-      * ``source_ref``           — invalid ``data-pptx-source-ref`` strip
+      * ``render_compat``        鈥?gradient / picture / font rewrites
+      * ``connector_preserve``   鈥?zero-stroke connector path rewriting
+      * ``source_ref``           鈥?invalid ``data-pptx-source-ref`` strip
     """
     workspace = state.workspace
     assert workspace is not None
@@ -1404,18 +1404,18 @@ def normalize_export_artifacts(
             # byte-rehydrate every shape on a slide; if ANY ref points
             # at a source slide whose cNvPr.id doesn't actually exist
             # there (a known vendor round-trip bug for boteng slide_04
-            # shape-2 → source slide 2 where id=2 is absent), the export
+            # shape-2 鈫?source slide 2 where id=2 is absent), the export
             # aborts with "Edited round-trip source object did not
             # produce a DrawingML shape: N".
             #
             # Two opt-in modes determine the strip_all set:
             #
             # A) Normal mode (render_compat ran in this function):
-            #    edited_slides = edited_svg_paths ∪ content_mapping
-            #    keys ∪ baseline-diff. The render_compat pass rewrote
+            #    edited_slides = edited_svg_paths 鈭?content_mapping
+            #    keys 鈭?baseline-diff. The render_compat pass rewrote
             #    picture_structure / gradient / font, making the
             #    baseline slides' source-refs consistent. Only the
-            #    framework-authored SVGs (clones, overflow, …) need
+            #    framework-authored SVGs (clones, overflow, 鈥? need
             #    refs stripped.
             #
             # B) Bypass mode (render_compat in `disabled`):
@@ -1423,7 +1423,7 @@ def normalize_export_artifacts(
             #    (boteng nested-SVG compatibility). The baseline
             #    SVGs' source-refs may be inconsistent with their
             #    rewritten geometry, so we MUST strip refs from EVERY
-            #    SVG — the same semantics as the legacy `skip_phase3_5`
+            #    SVG 鈥?the same semantics as the legacy `skip_phase3_5`
             #    bypass path. This matches the pre-refactor behavior
             #    where smart_toc_fill.py + skip_phase3_5=True worked.
             baseline = {f"slide_{n:02d}.svg" for n in valid_source_slides}
@@ -1438,7 +1438,7 @@ def normalize_export_artifacts(
                 edited_slides: set[str] = {f.name for f in slide_files}
                 log.debug(
                     "normalize_export_artifacts: render_compat disabled "
-                    "→ strip_all=True on %d slide(s)",
+                    "鈫?strip_all=True on %d slide(s)",
                     len(edited_slides),
                 )
             else:
@@ -1565,7 +1565,7 @@ def phase4_quality(
 ) -> PipelineState:
     """Phase 4: refresh summary + quality check + optional auto-fix loop.
 
-    ``strict=False`` treats quality-check WARN/ERROR as advisory — the
+    ``strict=False`` treats quality-check WARN/ERROR as advisory 鈥?the
     pipeline records them in ``state.warnings`` / ``state.errors`` but
     advances to phase 5 anyway. Required for templates whose vendor
     quality checker emits WARN for non-blocking issues that don't
@@ -1604,7 +1604,7 @@ def phase4_quality(
         log.info("phase4 pre-export: restored data-pptx-* attrs on %d svg(s)", restored)
 
     try:
-        from . import preflight_check as _preflight
+        from .. import preflight_check as _preflight
         preflight_report = _preflight.scan_directory(authoring_dir)
     except FileNotFoundError:
         log.warning("phase4 preflight: authoring-svg-flat not found")
@@ -1754,7 +1754,7 @@ def phase5_export(
     state.last_export_receipt = (res.parsed or {}).get("export_summary")
     state.stage = "exported"
 
-    # Phase 5b — delivery check.
+    # Phase 5b 鈥?delivery check.
     state.stage = "validate"
     validation_dir = workspace / "validation"
     io_utils.ensure_dir(validation_dir)
@@ -1778,7 +1778,7 @@ def phase5_export(
             )
             return state
 
-    # Phase 5c — readback.md.
+    # Phase 5c 鈥?readback.md.
     readback_md = validation_dir / "readback.md"
     rm = runner.run_source_to_md(
         state.skill_dir,  # type: ignore[arg-type]
@@ -1796,7 +1796,7 @@ def phase5_export(
     # is fast), but some callers might prefer not to write PNGs to disk.
     if render_previews:
         try:
-            from . import render_diff as _render_diff
+            from .. import render_diff as _render_diff
             preview_report = _render_diff.render_svg_previews(workspace)
             state.last_delivery = state.last_delivery or {}
             state.last_delivery["preview_dir"] = preview_report.output_dir
@@ -1847,7 +1847,7 @@ def run_native_fill(
     render_previews: bool = False,
     # PR-12 (2026-09-17): preflight (P1-P4 hard constraint) strictness.
     # None inherits from ``quality_strict``. False is the boteng default
-    # (``vendor QC`` is advisory) — preflight violations become warnings.
+    # (``vendor QC`` is advisory) 鈥?preflight violations become warnings.
     preflight_strict: bool | None = None,
     # Phase 9 (2026-09-16): layout hints forwarded to the LLM planner.
     llm_layout_hints: dict[str, Any] | None = None,
@@ -1942,13 +1942,13 @@ def run_native_fill(
     )
     log.info("phase2: snapshotted data-pptx-* attrs on %d shape(s)", captured)
 
-    # Phase 2b — optional LLM-driven content planning. Runs only when the
+    # Phase 2b 鈥?optional LLM-driven content planning. Runs only when the
     # caller passed both `content_markdown` and `llm_plan=true`. The
     # LLM-derived mapping is merged into the caller-supplied
     # ``content_mapping`` (caller entries win on conflict).
     if content_markdown is not None and enable_llm_planner:
         # Phase 9 (2026-09-16): stash caller-supplied layout hints so
-        # llm_plan → plan_content_mapping can bias toward new
+        # llm_plan 鈫?plan_content_mapping can bias toward new
         # archetypes.
         if llm_layout_hints:
             state.context["llm_layout_hints"] = llm_layout_hints
@@ -1960,7 +1960,7 @@ def run_native_fill(
     else:
         merged_mapping = content_mapping
 
-    # Phase 2c — materialize LLM planner output (Phase A expansion):
+    # Phase 2c 鈥?materialize LLM planner output (Phase A expansion):
     # clone skeleton SVGs for page_plan_additions, register new_blocks.
     # Falls through as a no-op when the planner did not run.
     # Phase 14+ (2026-09-18): forward the content_skeleton_pool so
@@ -2058,7 +2058,7 @@ def _finalize(state: PipelineState) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # run_with_mapping: one-shot driver that delegates phase2/3/4/5 to
 # run_native_fill. Vendored from generate_local_ppt.run_manual but
-# fully generic — no hardcoded boteng shape ids / section names /
+# fully generic 鈥?no hardcoded boteng shape ids / section names /
 # body bounds. All template-specific bits are caller-supplied.
 # ---------------------------------------------------------------------------
 
@@ -2093,7 +2093,7 @@ def run_with_mapping(
     skip_phase3_5: bool = False,
     disabled_autofixes: tuple[str, ...] = (),
     enable_llm_planner: bool = False,
-    # Smart TOC fill (opt-in; auto-detects TOC slide from 目录/CONTENTS)
+    # Smart TOC fill (opt-in; auto-detects TOC slide from 鐩綍/CONTENTS)
     expand_toc_from_markdown: bool = False,
     expand_toc_slot_grid: dict[str, Any] | None = None,
     # run_native_fill params
@@ -2124,7 +2124,7 @@ def run_with_mapping(
     """One-stop driver for the "manual mapping + markdown section cloning" workflow.
 
     Sequence:
-      1. ``runner.run_pptx_to_svg`` → authoring-svg-flat/*.svg
+      1. ``runner.run_pptx_to_svg`` 鈫?authoring-svg-flat/*.svg
       2. apply ``content_mapping`` text edits
       3. optional ``autofix.repair_nested_picture_attrs`` (boteng workaround)
       4. optional ``expand_workspace_from_markdown`` (per-section cloning)
@@ -2244,7 +2244,7 @@ def run_with_mapping(
             continue
         # mark_empty_as_carrier=True so re-cleared TOC slot <text>
         # elements (post-phase2_import overwrite) survive convert_text
-        # compilation. The flag is no-op on filled edits — only fires
+        # compilation. The flag is no-op on filled edits 鈥?only fires
         # for new_text == "". Idempotent with the earlier
         # expand_workspace_from_toc pass which already marked the
         # cleared slots.
@@ -2263,7 +2263,7 @@ def run_with_mapping(
     if fix_nested_picture:
         strip_report = autofix.repair_nested_picture_attrs(auth)
 
-    # Markdown → page_plan expansion (only when caller supplied the
+    # Markdown 鈫?page_plan expansion (only when caller supplied the
     # four required template params). Phase 21 P0-B (2026-09-20):
     # when caller omits expand_divider_edits_template /
     # expand_content_edits_template, auto-inspect the template to
@@ -2284,10 +2284,9 @@ def run_with_mapping(
             or expand_content_edits_template is None
         ):
             try:
-                from .template_adapter import (
-                    inspect_template,
-                    ensure_ascii_path,
-                )
+                from .. import template_adapter
+                inspect_template = template_adapter.inspect_template
+                ensure_ascii_path = template_adapter.ensure_ascii_path
                 pptx_for_inspect = ensure_ascii_path(source_pptx)
                 profile = inspect_template(pptx_for_inspect)
                 if expand_skeleton_divider is None and profile.divider_skeleton:
@@ -2313,7 +2312,7 @@ def run_with_mapping(
                 if expand_body_bounds == "0 0 1280 720" and profile.body_bounds:
                     expand_body_bounds = profile.body_bounds
                 log.info(
-                    "phase21: auto-inspected template %s → divider=%s "
+                    "phase21: auto-inspected template %s 鈫?divider=%s "
                     "content=%s ending=%s toc_grid=%s body_bounds=%s",
                     pptx_for_inspect.name,
                     expand_skeleton_divider,
@@ -2453,10 +2452,10 @@ def run_with_mapping(
 
 
 # ---------------------------------------------------------------------------
-# Markdown → page_plan expansion (no-LLM).
+# Markdown 鈫?page_plan expansion (no-LLM).
 #
 # Vendored from generate_local_ppt.expand_workspace_from_markdown and
-# made fully generic — no hardcoded boteng section names, shape ids,
+# made fully generic 鈥?no hardcoded boteng section names, shape ids,
 # or body bounds. All template-specific bits are caller-supplied.
 # ---------------------------------------------------------------------------
 
@@ -2466,9 +2465,11 @@ def run_with_mapping(
 # row-major fill order). Function: auto-detects the TOC slide, fills
 # < N slots and clears the rest, clones overflow into
 # slide_partNN_toc.svg, and updates page_plan.json so clones follow the
-# original TOC. Fully generic — no per-template shape ids, no font-size
-# heuristics, no SVG parsing beyond the 目录/CONTENTS marker detection
+# original TOC. Fully generic 鈥?no per-template shape ids, no font-size
+# heuristics, no SVG parsing beyond the 鐩綍/CONTENTS marker detection
 # in :func:`_find_toc_svg`.
 # ---------------------------------------------------------------------------
+
+
 
 
