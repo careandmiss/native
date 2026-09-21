@@ -1032,16 +1032,102 @@ def _looks_like_matrix(body: str) -> bool:
 
 
 # Phase 11 (2026-09-17): ppt-master chrome metadata helpers.
+# Phase 19 (2026-09-20): replaced the position-cycled hardcoded labels
+# (which printed PREFACE / OBJECTIVE / SCOPE / PRINCIPLE / WORKFLOW /
+# ATTACHMENT / REFERENCE regardless of section semantics) with a
+# section_intent-driven label set. Each H1 title is classified by
+# keyword match into one of 7 intents, and the matching
+# ``(en_label, body_label)`` pair is used for the topbar / body_cards
+# chrome. Unknown / empty titles fall back to ``"CHAPTER"``.
 
-_EN_LABELS = {
-    1: "PREFACE",
-    2: "OBJECTIVE",
-    3: "SCOPE",
-    4: "PRINCIPLE",
-    5: "WORKFLOW",
-    6: "ATTACHMENT",
-    7: "REFERENCE",
+# Keyword regex patterns, ordered by priority. First match wins.
+# ``re.search`` is used so the keyword can appear anywhere in the
+# title (typical Chinese titles place the chapter name after the
+# numeral prefix, e.g. ``一、工作手册的原则`` — keyword "原则" is
+# NOT at index 0).
+_SECTION_INTENT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("principles",    re.compile(r"原则|准则|方针|宗旨")),
+    ("scope",         re.compile(r"范围|适用|应用")),
+    ("specification", re.compile(r"规范.{0,3}文件|规范性文件|标准|文件清单|规章制度")),
+    ("authority",     re.compile(r"职责|权限|权责|职能.{0,3}部门|岗位.{0,3}职责")),
+    ("organization",  re.compile(r"组织.{0,3}架构|组织.{0,3}结构|部门.{0,3}架构|岗位.{0,3}编制")),
+    ("procedure",     re.compile(r"流程|程序|步骤|订货|报价|开票|发货|回款|签订|审批")),
+    ("appendix",      re.compile(r"附件|附录|附则|修订")),
+]
+
+# Intent -> (topbar en_label, body_cards label)
+_INTENT_LABELS: dict[str, tuple[str, str]] = {
+    "principles":    ("PRINCIPLES",       "PRINCIPLE"),
+    "scope":         ("APPLICATION SCOPE", "SCOPE"),
+    "specification": ("SPECIFICATIONS",   "SPECIFICATION"),
+    "authority":     ("AUTHORITY",        "AUTHORITY"),
+    "organization":  ("ORGANIZATION",     "ORG CHART"),
+    "procedure":     ("PROCEDURE",        "PROCEDURE"),
+    "appendix":      ("APPENDIX",         "APPENDIX"),
+    # Fallback when no keyword matches.
+    "default":       ("CHAPTER",          "CHAPTER"),
 }
+
+
+def detect_section_intent(title: str) -> str:
+    """Classify a Chinese H1 title into one of the 7 section_intents.
+
+    Used by :func:`_derive_default_chrome_plan` (in pipeline.py) to
+    pick a semantically-meaningful topbar / body_cards label pair
+    instead of the old position-cycled hardcoded mapping.
+
+    Returns the intent name (``"principles"`` / ``"scope"`` / etc.) or
+    ``"default"`` when no pattern matches. Pure function — no LLM,
+    no file I/O, fully deterministic.
+    """
+    if not title:
+        return "default"
+    for intent, pattern in _SECTION_INTENT_PATTERNS:
+        if pattern.search(title):
+            return intent
+    return "default"
+
+
+def intent_label_pair(title: str) -> tuple[str, str]:
+    """Return ``(topbar_label, body_label)`` for an H1 title.
+
+    Convenience wrapper around :func:`detect_section_intent` and
+    :data:`_INTENT_LABELS`. Falls back to ``("CHAPTER", "CHAPTER")``
+    for empty / unmatched titles.
+    """
+    return _INTENT_LABELS.get(
+        detect_section_intent(title), _INTENT_LABELS["default"]
+    )
+
+
+# Backward-compat shim: the old ``_EN_LABELS`` was a 1..7 → label
+# hardcoded mapping. We preserve the SHAPE (dict-like with ``.get``)
+# so the one existing import in pipeline.py keeps working, but mark
+# it as legacy and recommend :func:`intent_label_pair` for new code.
+# The legacy dict cycles through PREFACE/OBJECTIVE/SCOPE/PRINCIPLE/
+# WORKFLOW/ATTACHMENT/REFERENCE in 1-based index order — i.e. the
+# broken behaviour documented in Phase 19 plan §3.2.
+class _LegacyEnLabels:
+    __slots__ = ()
+
+    def get(self, idx, default="CHAPTER"):
+        legacy = {
+            1: "PREFACE", 2: "OBJECTIVE", 3: "SCOPE", 4: "PRINCIPLE",
+            5: "WORKFLOW", 6: "ATTACHMENT", 7: "REFERENCE",
+        }
+        return legacy.get(idx, default)
+
+    def __getitem__(self, idx):
+        legacy = {
+            1: "PREFACE", 2: "OBJECTIVE", 3: "SCOPE", 4: "PRINCIPLE",
+            5: "WORKFLOW", 6: "ATTACHMENT", 7: "REFERENCE",
+        }
+        if idx not in legacy:
+            raise KeyError(idx)
+        return legacy[idx]
+
+
+_EN_LABELS = _LegacyEnLabels()
 
 
 def _chapter_index_for_title(title: str, idx: int) -> int:
