@@ -6925,6 +6925,75 @@ class TestLayoutRule(unittest.TestCase):
         self.assertEqual(r["layout"], "merge-to-divider")
 
 
+class TestArchetypeRouterRulePrecheck(unittest.TestCase):
+    """Phase 20 P0-B (2026-09-20): archetype_router.route_archetype
+    must run ``layout_rules.select_layout_for_section`` first; if
+    the rule fires, the heuristic + LLM path is skipped.
+
+    Pin: rule hits override LLM choice; rule misses fall through
+    to the existing heuristic unchanged.
+    """
+
+    def test_rule_hit_overrides_llm_choice(self):
+        """A numbered list body triggers Rule 2 (bullet-list,
+        short list). The function must return 'bullet-list' even
+        when the LLM's choice was something different (e.g.
+        'hero_statement')."""
+        from mcp_ppt_native_fill.archetype_router import route_archetype
+        body = "\n".join(f"{i}. 第{i}步操作说明。" for i in range(1, 4))
+        result = route_archetype(body, llm_choice="hero_statement")
+        self.assertEqual(result["archetype"], "bullet-list")
+        self.assertEqual(result["confidence"], 0.95)
+        # Reason must mention which rule fired for debuggability.
+        self.assertIn("rule-based", result["reason"])
+        self.assertIn("numbered-list-short", result["reason"])
+
+    def test_rule_miss_falls_through_to_heuristic(self):
+        """A medium paragraph body that matches no layout rule
+        must fall through to the existing heuristic. The
+        heuristic will pick something (we don't pin which — just
+        that it returns a non-rule RouteResult)."""
+        from mcp_ppt_native_fill.archetype_router import route_archetype
+        # 90 chars, single line, no list/table/KPI/contrast/arrow.
+        body = (
+            "本节介绍公司商务部的整体组织架构与人员配置情况，"
+            "涵盖各岗位的职责分工与协作流程。"
+            "各部门之间通过标准化的沟通机制实现信息共享。"
+        )
+        result = route_archetype(body, llm_choice="hero_statement")
+        # Rule must have missed (reason does NOT contain
+        # 'rule-based').
+        self.assertNotIn("rule-based", result["reason"])
+        # Heuristic picks something. We don't pin which archetype
+        # the heuristic chooses (it depends on _line_metrics);
+        # we only confirm the archetype is a valid one from
+        # VALID_ARCHETYPES (heuristic path always returns one).
+        from mcp_ppt_native_fill.archetype_router import VALID_ARCHETYPES
+        self.assertIn(result["archetype"], VALID_ARCHETYPES)
+
+    def test_pipe_table_body_uses_revision_table(self):
+        """A markdown pipe table body triggers Rule 3."""
+        from mcp_ppt_native_fill.archetype_router import route_archetype
+        body = (
+            "| 列A | 列B |\n"
+            "|---|---|\n"
+            "| 值1 | 值2 |\n"
+            "| 值3 | 值4 |"
+        )
+        result = route_archetype(body, llm_choice="3-column-cards")
+        self.assertEqual(result["archetype"], "revision-table")
+        self.assertEqual(result["confidence"], 0.95)
+
+    def test_short_body_signals_merge_to_divider(self):
+        """Rule 1 returns 'merge-to-divider' which is NOT a
+        VALID_ARCHETYPES name. route_archetype surfaces it
+        verbatim so workspace_expand can branch on it (P0-C)."""
+        from mcp_ppt_native_fill.archetype_router import route_archetype
+        result = route_archetype("短文本。", llm_choice="hero_statement")
+        self.assertEqual(result["archetype"], "merge-to-divider")
+        self.assertEqual(result["confidence"], 1.0)
+
+
 class TestEmptyBodyFallback(unittest.TestCase):
     """Phase 19 P0-B-3 (2026-09-20): _fill_missing_content_blocks
     must synthesize placeholder cards for EVERY content SVG in the

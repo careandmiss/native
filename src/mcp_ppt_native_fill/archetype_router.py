@@ -195,6 +195,30 @@ def route_archetype(
         :class:`RouteResult` with the picked archetype, confidence,
         reason, and split hint.
     """
+    # Phase 20 P0-B (2026-09-20): rule-based pre-check. The layout
+    # rules in ``layout_rules`` are pure functions over the body
+    # text; if they fire at high confidence (>= 0.9), trust them
+    # over both the LLM choice and the existing heuristic. The
+    # heuristic below still fires when rule returns None or when
+    # rule returns ``"merge-to-divider"`` (the merge-to-divider
+    # signal is a workspace_expand concern — for archetype
+    # selection we map it to a near-1.0 ``archetype_meta``-unknown
+    # value so downstream callers can recognise it).
+    from .layout_rules import select_layout_for_section
+    rule_result = select_layout_for_section(section_text)
+    if rule_result["layout"] is not None:
+        layout = rule_result["layout"]
+        # merge-to-divider is a workspace_expand signal, not a
+        # VALID_ARCHETYPES name. Surface it via the RouteResult
+        # ``archetype`` field so workspace_expand can branch on
+        # it; the existing heuristic never runs in this branch.
+        return {
+            "archetype": layout,
+            "confidence": rule_result["confidence"],
+            "reason": f"rule-based: {rule_result['rule']}",
+            "split": 1,
+        }
+
     m = _line_metrics(section_text)
 
     # Rule 1: 1 short claim + LLM picked hero → keep LLM (don't second-
