@@ -6757,6 +6757,174 @@ class TestChromeTopbarPosition(unittest.TestCase):
         self.assertIn(">PART 07 · PROCEDURE<", svg_fragment)
 
 
+class TestLayoutRule(unittest.TestCase):
+    """Phase 20 (2026-09-20): rule-based layout selection in
+    ``layout_rules.select_layout_for_section``.
+
+    Each rule is pinned with one positive + one negative case where
+    applicable. Rule priority is first-match-wins, so a section
+    that matches Rule 1 (short-body) must NOT also match Rule 2
+    (numbered list) — pin this too.
+    """
+
+    # ---- Rule 0: empty body ----
+
+    def test_empty_body_returns_simple_text(self):
+        from mcp_ppt_native_fill.layout_rules import select_layout_for_section
+        r = select_layout_for_section({"body": ""})
+        self.assertEqual(r["layout"], "simple-text")
+        self.assertEqual(r["rule"], "empty-body")
+
+    def test_whitespace_only_body_treated_as_empty(self):
+        from mcp_ppt_native_fill.layout_rules import select_layout_for_section
+        r = select_layout_for_section({"body": "   \n  \t  "})
+        self.assertEqual(r["layout"], "simple-text")
+
+    # ---- Rule 1: short body → merge-to-divider ----
+
+    def test_short_body_returns_merge_to_divider(self):
+        """< 60 chars and < 2 lines merges into divider footer."""
+        from mcp_ppt_native_fill.layout_rules import select_layout_for_section
+        r = select_layout_for_section({"body": "为了规范公司商务行为管理。"})
+        self.assertEqual(r["layout"], "merge-to-divider")
+        self.assertEqual(r["rule"], "short-body")
+
+    def test_short_body_with_newline_still_short(self):
+        """< 60 chars but has 1 newline (2 lines) — still merges."""
+        from mcp_ppt_native_fill.layout_rules import select_layout_for_section
+        r = select_layout_for_section({"body": "前言：\n公司商务行为管理。"})
+        # Body length 18 chars, 2 lines (1 newline + 1) — within
+        # SHORT_BODY_CHARS=60 and SHORT_BODY_LINES=2 bounds.
+        self.assertEqual(r["layout"], "merge-to-divider")
+
+    def test_short_body_priority_over_numbered_list(self):
+        """Rule 1 fires before Rule 2: a short body with a stray
+        '1.' still resolves to merge-to-divider, NOT procedural-steps.
+        This pins the rule priority."""
+        from mcp_ppt_native_fill.layout_rules import select_layout_for_section
+        r = select_layout_for_section({"body": "1. 简短条目。"})
+        self.assertEqual(r["layout"], "merge-to-divider")
+
+    # ---- Rule 2: numbered ordered list ----
+
+    def test_numbered_list_short_returns_bullet_list(self):
+        """≤ 5 numbered items → bullet-list (compact)."""
+        from mcp_ppt_native_fill.layout_rules import select_layout_for_section
+        body = "\n".join(f"{i}. 第{i}步操作说明。" for i in range(1, 4))
+        r = select_layout_for_section({"body": body})
+        self.assertEqual(r["layout"], "bullet-list")
+        self.assertEqual(r["rule"], "numbered-list-short")
+
+    def test_numbered_list_long_returns_procedural_steps(self):
+        """> 5 numbered items → procedural-steps (flow)."""
+        from mcp_ppt_native_fill.layout_rules import select_layout_for_section
+        body = "\n".join(f"{i}. 步骤{i}详细说明。" for i in range(1, 8))
+        r = select_layout_for_section({"body": body})
+        self.assertEqual(r["layout"], "procedural-steps")
+        self.assertEqual(r["rule"], "numbered-list-long")
+
+    def test_step_prefix_also_triggers_numbered_list(self):
+        """'步骤 N' / 'Step N' patterns trigger Rule 2."""
+        from mcp_ppt_native_fill.layout_rules import select_layout_for_section
+        body = "步骤1：准备。\n步骤2：执行。\n步骤3：检查。"
+        r = select_layout_for_section({"body": body})
+        self.assertEqual(r["layout"], "bullet-list")
+
+    # ---- Rule 3: pipe table ----
+
+    def test_pipe_table_returns_revision_table(self):
+        from mcp_ppt_native_fill.layout_rules import select_layout_for_section
+        body = (
+            "| 列A | 列B |\n"
+            "|---|---|\n"
+            "| 值1 | 值2 |\n"
+            "| 值3 | 值4 |"
+        )
+        r = select_layout_for_section({"body": body})
+        self.assertEqual(r["layout"], "revision-table")
+        self.assertEqual(r["rule"], "pipe-table")
+
+    # ---- Rule 4: long paragraph ----
+
+    def test_long_single_paragraph_returns_simple_text(self):
+        """> 200 chars, single line → simple-text (flowing body)."""
+        from mcp_ppt_native_fill.layout_rules import select_layout_for_section
+        body = "为了规范公司商务行为管理，" + "提高效率。" * 50  # ~ 263 chars
+        r = select_layout_for_section({"body": body})
+        self.assertEqual(r["layout"], "simple-text")
+        self.assertEqual(r["rule"], "long-paragraph")
+
+    # ---- Rule 5: KPI pattern ----
+
+    def test_kpi_pattern_returns_kpi_row(self):
+        """Single-line number+unit rows trigger kpi_row.
+        _KPI_RE matches ``^\\d+(.\\d+)?\\s*[unit]?\\s*$`` — each line
+        must be just a number (with optional unit)."""
+        from mcp_ppt_native_fill.layout_rules import select_layout_for_section
+        body = "5\n200万\n10个"
+        r = select_layout_for_section({"body": body})
+        self.assertEqual(r["layout"], "kpi_row")
+        self.assertEqual(r["rule"], "kpi-pattern")
+
+    # ---- Rule 6: contrast words ----
+
+    def test_contrast_words_returns_two_column_compare(self):
+        from mcp_ppt_native_fill.layout_rules import select_layout_for_section
+        body = (
+            "新制度与旧制度的对比：\n"
+            "新方法强调灵活性、响应速度更快、决策链路短。\n"
+            "旧方法强调流程规范、风险控制严、文档沉淀完整。\n"
+            "两套方法各有适用场景，建议根据业务规模与风险偏好选择。"
+        )
+        r = select_layout_for_section({"body": body})
+        self.assertEqual(r["layout"], "two-column-compare")
+        self.assertEqual(r["rule"], "contrast-words")
+
+    # ---- Rule 7: arrow flow ----
+
+    def test_arrow_flow_returns_flow_steps(self):
+        """Multi-line body with → triggers flow-steps."""
+        from mcp_ppt_native_fill.layout_rules import select_layout_for_section
+        body = (
+            "第一步：准备资料 → 提交申请\n"
+            "审批 → 发放许可证\n"
+            "备案 → 归档\n"
+            "通知 → 完成"
+        )
+        r = select_layout_for_section({"body": body})
+        self.assertEqual(r["layout"], "flow-steps")
+        self.assertEqual(r["rule"], "arrow-flow")
+
+    # ---- default: no rule matched ----
+
+    def test_unrecognized_returns_none_for_llm_fallback(self):
+        """Body that matches no rule → layout=None so caller falls
+        back to LLM-driven archetype_router.
+
+        Must be > SHORT_BODY_CHARS (60) and < LONG_PARAGRAPH_CHARS
+        (200) so it bypasses Rules 1 and 4, and must contain no
+        list / table / KPI / contrast / arrow patterns."""
+        from mcp_ppt_native_fill.layout_rules import select_layout_for_section
+        body = (
+            "本节介绍公司商务部的整体组织架构与人员配置情况，"
+            "涵盖各岗位的职责分工与协作流程。"
+            "各部门之间通过标准化的沟通机制实现信息共享与业务协同，"
+            "确保商务活动的高效开展与持续改进。"
+        )  # ~ 90 chars, single line, no special patterns
+        r = select_layout_for_section({"body": body})
+        self.assertIsNone(r["layout"])
+        self.assertEqual(r["rule"], "")
+
+    # ---- input flexibility ----
+
+    def test_accepts_raw_string_input(self):
+        """For test convenience, the function accepts a raw string
+        as well as a dict (some callers pass text directly)."""
+        from mcp_ppt_native_fill.layout_rules import select_layout_for_section
+        r = select_layout_for_section("只是为了单元测试的简短文本。")
+        self.assertEqual(r["layout"], "merge-to-divider")
+
+
 class TestEmptyBodyFallback(unittest.TestCase):
     """Phase 19 P0-B-3 (2026-09-20): _fill_missing_content_blocks
     must synthesize placeholder cards for EVERY content SVG in the
