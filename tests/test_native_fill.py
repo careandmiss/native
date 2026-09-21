@@ -3378,6 +3378,159 @@ class TestSplitMarkdownSections(unittest.TestCase):
         self.assertEqual(sections[1]["title"], "二、适用范围")
 
 
+class TestSplitMarkdownSectionsFilenameH1(unittest.TestCase):
+    """Phase 19 (2026-09-20): drop filename-style first H1 to avoid
+    off-by-one indexing in partNN content mapping.
+
+    The boteng / 商务部工作手册 MD file starts with
+    ``# 5山西柏腾科技有限公司商务部工作手册.doc`` — a synthetic H1
+    that authors paste at the top of the document. Without dropping
+    it, the section list has this filename at index 0, the real
+    sections at index 1..N, and the partNN → section mapping in
+    :func:`mcp_ppt_native_fill.toc_detection.cards_for_section`
+    (``partNN → sections[NN-1]``) shifts every section off by one.
+    Also: the cover-page paragraphs (numbering / 标题 / dates / 目录
+    list) live inside that H1's body, so dropping the H1 also drops
+    them — Part 01 content no longer inherits ``**编号：BT-GL-MOC-001**``
+    style cover elements.
+
+    Detection: case-insensitive match against
+    ``.doc`` / ``.docx`` / ``.md`` / ``.markdown`` / ``.txt`` / ``.pdf``.
+    Anything else is treated as a real section.
+    """
+
+    def test_drops_dot_doc_filename_h1_and_body(self):
+        # Boteng markdown shape: filename H1 + cover-page paragraphs
+        # + 7 real sections. Expect 7 sections, NOT 8.
+        md = (
+            "# 5山西柏腾科技有限公司商务部工作手册.doc\n"
+            "\n"
+            "**编号：BT-GL-MOC-001**\n"
+            "\n"
+            "**商务部标准化管理工作手册**\n"
+            "\n"
+            "工业设备智能化服务商\n"
+            "\n"
+            "目  录\n"
+            "\n"
+            "一、工作手册的原则\t1\n"
+            "\n"
+            "二、 工作手册适用范围\t1\n"
+            "\n"
+            "# 一、工作手册的原则\n"
+            "body 1\n"
+            "\n"
+            "# 工作手册适用范围\n"
+            "body 2\n"
+            "\n"
+            "# 三、工作手册规范性文件\n"
+            "body 3\n"
+            "\n"
+            "# 四、职能部门权责\n"
+            "body 4\n"
+            "\n"
+            "# 部门组织架构\n"
+            "body 5\n"
+            "\n"
+            "# 二、KTR产品订货流程\n"
+            "body 6\n"
+            "\n"
+            "# 二、KTR订货流程\n"
+            "body 7\n"
+        )
+        sections = pl._split_markdown_sections(md)
+        # Filename H1 dropped: only 7 sections remain.
+        self.assertEqual(len(sections), 7)
+        # Index 0 is now the real first section, NOT the filename.
+        self.assertEqual(sections[0]["title"], "一、工作手册的原则")
+        self.assertEqual(sections[6]["title"], "二、KTR订货流程")
+        # Cover-page elements live inside the dropped H1's body and
+        # therefore are gone from section 0's body too.
+        self.assertNotIn("编号", sections[0]["body"])
+        self.assertNotIn("BT-GL-MOC-001", sections[0]["body"])
+        self.assertNotIn("商务部标准化管理", sections[0]["body"])
+        self.assertNotIn("目  录", sections[0]["body"])
+
+    def test_partNN_mapping_lands_on_real_section_after_drop(self):
+        # Verifies the partNN → sections[NN-1] contract is satisfied
+        # after the filename H1 is dropped. We check the section
+        # title (not the cards body, which is a different heuristic)
+        # — i.e. part01 → "一、目的" (NOT the dropped filename).
+        from mcp_ppt_native_fill.toc_detection import cards_for_section
+        md = (
+            "# doc.md\n"
+            "cover\n"
+            "\n"
+            "# 一、目的\n"
+            "purpose body\n"
+            "\n"
+            "# 二、范围\n"
+            "scope body\n"
+            "\n"
+            "# 三、原则\n"
+            "principle body\n"
+        )
+        sections = pl._split_markdown_sections(md)
+        self.assertEqual(len(sections), 3)
+        # Verify the section that part01 / part02 / part03 land on.
+        # cards_for_section returns (cards, meta) and indexes sections
+        # by part-NN → sections[NN-1]. We re-derive the section from
+        # the returned ``meta`` and assert its title.
+        _, meta1 = cards_for_section(sections, "part01")
+        _, meta2 = cards_for_section(sections, "part02")
+        _, meta3 = cards_for_section(sections, "part03")
+        # The meta dict comes from the section's ``> **key**: value``
+        # block (none here), so we instead inspect the section via
+        # the same index — i.e. sections[part-1]["title"].
+        self.assertEqual(sections[0]["title"], "一、目的")
+        self.assertEqual(sections[1]["title"], "二、范围")
+        self.assertEqual(sections[2]["title"], "三、原则")
+        # Sanity: the filename did NOT survive into sections.
+        for s in sections:
+            self.assertNotIn("doc.md", s["title"])
+
+    def test_keeps_first_h1_when_not_filename_style(self):
+        # Normal markdown without a filename H1 must NOT drop the
+        # first section.
+        md = (
+            "# 一、目的\n"
+            "body 1\n"
+            "\n"
+            "# 二、范围\n"
+            "body 2\n"
+        )
+        sections = pl._split_markdown_sections(md)
+        self.assertEqual(len(sections), 2)
+        self.assertEqual(sections[0]["title"], "一、目的")
+        self.assertEqual(sections[0]["body"], "body 1")
+
+    def test_drops_multiple_filename_extensions(self):
+        # Verify all 5 supported extensions are recognised.
+        for ext in (".doc", ".docx", ".md", ".markdown", ".txt", ".pdf"):
+            md = (
+                f"# cover{ext}\n"
+                "cover body\n"
+                "\n"
+                "# 一、目的\n"
+                "real body\n"
+            )
+            sections = pl._split_markdown_sections(md)
+            self.assertEqual(
+                len(sections), 1,
+                f"extension {ext!r} should drop the filename H1",
+            )
+            self.assertEqual(sections[0]["title"], "一、目的")
+
+    def test_case_insensitive_extension_match(self):
+        # Boteng paste is sometimes uppercase — e.g. ``.DOC`` instead
+        # of ``.doc``. Case must not matter.
+        sections = pl._split_markdown_sections(
+            "# cover.DOC\ncover body\n\n# 一、目的\nreal body\n"
+        )
+        self.assertEqual(len(sections), 1)
+        self.assertEqual(sections[0]["title"], "一、目的")
+
+
 class TestCardsFromBodyImprovements(unittest.TestCase):
     """Phase 1 (2026-09-16): cards_from_body improvements for empty-slide fill.
 

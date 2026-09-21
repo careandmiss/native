@@ -554,6 +554,15 @@ _META_RE = re.compile(
 )
 
 
+# Phase 19 (2026-09-20): filename-style H1 detector. Used by
+# :func:`split_markdown_sections` to drop the cover-page H1 that authors
+# sometimes paste as the markdown's first line (e.g.
+# ``# 5山西柏腾科技有限公司商务部工作手册.doc``). Five extensions cover the
+# file types we see in boteng / archetype_demo / structured_demo; case
+# insensitive.
+_FILENAME_H1_RE = re.compile(r"\.(doc|docx|md|markdown|txt|pdf)\s*$", re.IGNORECASE)
+
+
 def _extract_section_meta(body: str) -> tuple[dict[str, str], str]:
     """Pull ``> **key**: value`` lines out of ``body``.
 
@@ -590,6 +599,20 @@ def split_markdown_sections(md_text: str) -> list[dict[str, Any]]:
     Phase 2 (2026-09-16): also extracts ``> **key**: value`` meta lines
     into the ``meta`` dict. See :func:`_extract_section_meta` for the
     syntax. Sections without any meta lines get ``meta={}``.
+
+    Phase 19 (2026-09-20): drops the FIRST H1 when its title is
+    filename-style (ends with ``.doc`` / ``.docx`` / ``.md`` / ``.txt``
+    / ``.pdf``). This skips the synthetic cover-page H1 that authors
+    sometimes paste as the markdown's first line, which would
+    otherwise steal index 0 and shift every subsequent section title /
+    body off by one. The cover-page paragraphs (numbering / 标题 /
+    dates / 目录 list) live inside that H1's body, so dropping the H1
+    also drops them — Part 01 content no longer inherits cover-page
+    items like ``**编号：BT-GL-MOC-001**``.
+
+    Detection: case-insensitive match against a 5-extension list
+    (``_FILENAME_H1_RE``). Anything else (e.g. ``一、目的`` without an
+    extension) is treated as a real section and kept.
     """
     sections: list[dict[str, Any]] = []
     head_re = re.compile(r"^#\s+(.+)$", re.MULTILINE)
@@ -601,6 +624,9 @@ def split_markdown_sections(md_text: str) -> list[dict[str, Any]]:
         meta, body = _extract_section_meta(body)
         title = strip_inline_markdown(m.group(1).strip())
         sections.append({"title": title, "body": body, "meta": meta})
+    # Phase 19: drop filename-style first H1 (and its cover-page body).
+    if sections and _FILENAME_H1_RE.search(sections[0]["title"]):
+        sections = sections[1:]
     return sections
 
 
