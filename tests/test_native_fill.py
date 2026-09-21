@@ -6664,5 +6664,98 @@ class TestSectionIntentMapping(unittest.TestCase):
         )
 
 
+class TestPart01NoDuplicateBody(unittest.TestCase):
+    """Phase 19 P0-B-2 (2026-09-20): writing either ``content-body``
+    or ``body_cards`` to a slide must drop the OTHER sibling body
+    group, so the slide can never end up with two visible body
+    blocks. boteng symptom: slide_part01_content.svg showed the
+    same paragraph twice because LLM output ``shape_id="body_cards"``
+    on a slide where ``_fill_missing_content_blocks`` had already
+    emitted a ``content-body`` group, and Phase 18 cleanup only
+    fired in the content-body → body_cards direction.
+
+    Tested via ``_remove_existing_new_content_group`` + the
+    sibling-set computation used in pipeline.py:851. If either
+    the helper regex or the set expression changes, these tests
+    must be updated.
+    """
+
+    def test_dedup_body_cards_when_writing_content_body(self):
+        """Writing content-body must drop pre-existing body_cards."""
+        from mcp_ppt_native_fill.pipeline import (
+            _remove_existing_new_content_group,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            svg = Path(td) / "slide.svg"
+            svg.write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg">'
+                '<g id="body_cards"><text>old content</text></g>'
+                "</svg>",
+                encoding="utf-8",
+            )
+            # Mirror pipeline.py:851 sibling-set logic for the
+            # case shape_id == "content-body".
+            sibling_ids = {"content-body", "body_cards"} - {"content-body"}
+            for sib in sibling_ids:
+                _remove_existing_new_content_group(svg, sib)
+            after = svg.read_text(encoding="utf-8")
+            self.assertNotIn('id="body_cards"', after)
+            self.assertNotIn("old content", after)
+
+    def test_dedup_content_body_when_writing_body_cards(self):
+        """Writing body_cards must drop pre-existing content-body."""
+        from mcp_ppt_native_fill.pipeline import (
+            _remove_existing_new_content_group,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            svg = Path(td) / "slide.svg"
+            svg.write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg">'
+                '<g id="content-body"><text>old content</text></g>'
+                "</svg>",
+                encoding="utf-8",
+            )
+            # Mirror pipeline.py:851 sibling-set logic for the
+            # case shape_id == "body_cards".
+            sibling_ids = {"content-body", "body_cards"} - {"body_cards"}
+            for sib in sibling_ids:
+                _remove_existing_new_content_group(svg, sib)
+            after = svg.read_text(encoding="utf-8")
+            self.assertNotIn('id="content-body"', after)
+            self.assertNotIn("old content", after)
+
+
+class TestChromeTopbarPosition(unittest.TestCase):
+    """Regression for the Phase 19 topbar-overlap-fix (commit 8b9800f).
+
+    render_chrome_topbar must right-anchor its label so the label
+    string never collides with the boteng template's shape-17 hero
+    title on content slides. Without the anchor, ``PART 05 ·
+    PROCEDURE`` (12px bold at x=64) sat on top of the 37.33px Chinese
+    hero title (shape-17 at x=104 y=25).
+    """
+
+    def test_topbar_label_right_anchored(self):
+        from mcp_ppt_native_fill.chrome import render_chrome_topbar
+        svg_fragment = render_chrome_topbar(chapter_label="PART 05 · PROCEDURE")
+        self.assertIn('x="1216"', svg_fragment)
+        self.assertIn('text-anchor="end"', svg_fragment)
+        self.assertNotIn('x="64"', svg_fragment)
+
+    def test_topbar_accent_line_stays_left(self):
+        from mcp_ppt_native_fill.chrome import render_chrome_topbar
+        svg_fragment = render_chrome_topbar(chapter_label="PART 01 · PREFACE")
+        self.assertIn('x1="64"', svg_fragment)
+        self.assertIn('x2="160"', svg_fragment)
+        self.assertIn('y1="56"', svg_fragment)
+        self.assertIn('y2="56"', svg_fragment)
+        self.assertIn('stroke="#D4A24C"', svg_fragment)
+
+    def test_topbar_label_renders_chapter_label_verbatim(self):
+        from mcp_ppt_native_fill.chrome import render_chrome_topbar
+        svg_fragment = render_chrome_topbar(chapter_label="PART 07 · PROCEDURE")
+        self.assertIn(">PART 07 · PROCEDURE<", svg_fragment)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -830,7 +830,17 @@ def phase3_author(
                 )
                 continue  # skip writing; existing group stays
             # Render succeeded → now safe to drop the existing same-id
-            # group (idempotency) and any body_cards anti-stack.
+            # group (idempotency) and any sibling body group.
+            # Phase 19 P0-B-2 (2026-09-20): regardless of which
+            # shape_id we are about to write, also drop the OTHER
+            # body group (content-body ↔ body_cards). Phase 18
+            # cleanup was one-directional (content-body write →
+            # body_cards drop) and let duplicate body groups slip
+            # through whenever the LLM produced shape_id="body_cards"
+            # on a slide where _fill_missing_content_blocks had
+            # already emitted a content-body group. Visible symptom
+            # on boteng: slide_part01_content.svg had two `<g
+            # id="body_cards">` rendering the same paragraph twice.
             try:
                 _remove_existing_new_content_group(svg_path, shape_id)
             except Exception as exc:
@@ -838,16 +848,15 @@ def phase3_author(
                     "phase3: remove_existing group failed svg=%s shape=%s: %s",
                     svg_name, shape_id, exc,
                 )
-            if shape_id == "content-body":
+            sibling_ids = {"content-body", "body_cards"} - {shape_id}
+            for sibling_id in sibling_ids:
                 try:
-                    _remove_existing_new_content_group(
-                        svg_path, "body_cards"
-                    )
+                    _remove_existing_new_content_group(svg_path, sibling_id)
                 except Exception as exc:
                     log.warning(
-                        "phase3: remove caller body_cards failed "
-                        "svg=%s: %s",
-                        svg_name, exc,
+                        "phase3: remove sibling body group failed "
+                        "svg=%s shape=%s sibling=%s: %s",
+                        svg_name, shape_id, sibling_id, exc,
                     )
             try:
                 svg_edits.write_new_content_block(
