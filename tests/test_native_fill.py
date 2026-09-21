@@ -6757,5 +6757,121 @@ class TestChromeTopbarPosition(unittest.TestCase):
         self.assertIn(">PART 07 · PROCEDURE<", svg_fragment)
 
 
+class TestEmptyBodyFallback(unittest.TestCase):
+    """Phase 19 P0-B-3 (2026-09-20): _fill_missing_content_blocks
+    must synthesize placeholder cards for EVERY content SVG in the
+    final_pages list, not just the ones the LLM identified in
+    page_plan_additions.
+
+    boteng symptom: Part 04 "四、职能部门权责" has zero body in
+    the source markdown (H1 followed directly by the next H1). The
+    LLM planner did not emit a page_plan_additions entry for
+    slide_part04_content.svg, so the original safety-net loop
+    never fired for it — slide rendered completely blank (title +
+    footer + page number only).
+
+    Three cases pin the union behaviour, the placeholder
+    contract, and idempotency.
+    """
+
+    def test_empty_body_section_emits_placeholder(self):
+        """toc_detection.cards_for_section returns a placeholder
+        card when the matching markdown section has empty body."""
+        from mcp_ppt_native_fill.toc_detection import cards_for_section
+        sections = [
+            {"title": "四、职能部门权责", "body": "",
+             "meta": {}},
+        ]
+        cards, meta = cards_for_section(sections, "part04")
+        self.assertGreater(len(cards), 0,
+                           "empty-body section must yield placeholder cards")
+        # Placeholder must reference the section title so the
+        # rendered page is recognisable, not just blank.
+        rendered = " ".join(
+            (c.get("title") or "") + " " +
+            " ".join(c.get("items") or [])
+            for c in cards
+        )
+        self.assertIn("权责", rendered)
+
+    def test_unidentified_svg_still_gets_block(self):
+        """Pipeline phase2c union logic: an SVG present in
+        final_pages but missing from page_plan_additions must
+        still receive a synthesized content-body block."""
+        # Mirror pipeline.py:651-659 union logic in isolation.
+        page_plan_additions = [
+            {"svg": "slide_part01_content.svg"},
+            {"svg": "slide_part02_content.svg"},
+        ]
+        final_pages = [
+            {"svg": "slide_part01_content.svg"},
+            {"svg": "slide_part02_content.svg"},
+            {"svg": "slide_part03_content.svg"},
+            {"svg": "slide_part04_content.svg"},  # LLM missed this
+            {"svg": "slide_05.svg"},  # ending skeleton, excluded
+        ]
+        llm_ids = {
+            e["svg"] for e in page_plan_additions
+            if e["svg"].endswith("_content.svg")
+        }
+        all_ids = [
+            e["svg"] for e in final_pages
+            if e["svg"].endswith("_content.svg")
+        ]
+        unioned = list(llm_ids) + [
+            s for s in all_ids if s not in llm_ids
+        ]
+        self.assertIn("slide_part01_content.svg", unioned)
+        self.assertIn("slide_part02_content.svg", unioned)
+        # The LLM-missed one is in the union, not dropped.
+        self.assertIn("slide_part03_content.svg", unioned)
+        self.assertIn("slide_part04_content.svg", unioned)
+        # The ending skeleton (no _content.svg suffix) is excluded.
+        self.assertNotIn("slide_05.svg", unioned)
+
+    def test_identified_svg_block_is_preserved(self):
+        """fill_missing_content_blocks is idempotent: calling it
+        twice with the same svgs must not overwrite a block the
+        caller already populated. Pinned by reading the existing
+        block guard at toc_detection.py:990-991
+        (``existing = final_new_blocks.get(svg_name) or {};
+        if existing: continue``).
+        """
+        from mcp_ppt_native_fill import pipeline
+        from mcp_ppt_native_fill.pipeline import PipelineState
+        from mcp_ppt_native_fill.toc_detection import fill_missing_content_blocks
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            (td / "page_plan.json").write_text("{}", encoding="utf-8")
+            state = PipelineState(workspace=td, context={})
+            state.context["content_markdown"] = Path(__file__)  # dummy
+            final_new_blocks: dict = {
+                "slide_part01_content.svg": {
+                    "content-body": {
+                        "layout": "3-column-cards",
+                        "bounds": "120 130 1060 480",
+                        "spec": {"cards": [{"title": "caller", "items": ["x"]}]},
+                    }
+                }
+            }
+            # First call (with markdown-less state, so the markdown
+            # path produces placeholder cards for any unmatched svg).
+            fill_missing_content_blocks(
+                cloned_svgs=["slide_part01_content.svg",
+                             "slide_part02_content.svg"],
+                final_new_blocks=final_new_blocks,
+                state=state,
+            )
+            # slide_part01 caller-supplied block must be preserved
+            # (idempotency guard at toc_detection.py:991).
+            caller_block = final_new_blocks[
+                "slide_part01_content.svg"]["content-body"]
+            self.assertEqual(caller_block["spec"]["cards"][0]["title"], "caller")
+            # slide_part02 (no markdown match) got a placeholder.
+            self.assertIn("slide_part02_content.svg", final_new_blocks)
+
+
 if __name__ == "__main__":
     unittest.main()

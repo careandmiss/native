@@ -648,12 +648,35 @@ def realize_plan(
     # 3-column-cards block from the markdown text. Without this, the cloned
     # content page renders as a giant blank rectangle (shape-3 in slide_04
     # skeleton, 1124×530) because the skeleton only ships a title bar.
+    # Phase 19 P0-B-3 (2026-09-20): union the LLM-identified content
+    # SVGs (from page_plan_additions) with EVERY content SVG in
+    # final_pages so an LLM-missed section (e.g. boteng Part 04
+    # "四、职能部门权责" which has empty body) still gets a
+    # synthesized placeholder. Without this union, slide_part04_content
+    # rendered completely blank because the LLM did not list it in
+    # page_plan_additions, so the original safety net never fired
+    # for it. _fill_missing_content_blocks (toc_detection.py:952) is
+    # idempotent: existing blocks are preserved, so calling twice is
+    # safe. NOTE: at this point final_pages is built (line 508-686)
+    # but state.context["page_plan_pages"] is only set on line 688,
+    # so we read from the local variable, not the context.
+    llm_identified_content_svgs = {
+        entry.get("svg", "")
+        for entry in planner_result.page_plan_additions
+        if entry.get("svg", "").endswith("_content.svg")
+    }
+    all_content_svgs = [
+        entry.get("svg", "")
+        for entry in final_pages
+        if entry.get("svg", "").endswith("_content.svg")
+    ]
+    # Union (preserves insertion order: LLM-identified first, then
+    # any final_pages-identified svgs the LLM missed).
+    unioned_cloned_svgs = list(llm_identified_content_svgs) + [
+        s for s in all_content_svgs if s not in llm_identified_content_svgs
+    ]
     _fill_missing_content_blocks(
-        cloned_svgs=[
-            entry.get("svg", "")
-            for entry in planner_result.page_plan_additions
-            if entry.get("svg", "").endswith("_content.svg")
-        ],
+        cloned_svgs=unioned_cloned_svgs,
         final_new_blocks=final_new_blocks,
         state=state,
     )
