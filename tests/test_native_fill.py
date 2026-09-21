@@ -6316,8 +6316,15 @@ class TestPhase12SvgEditsStrip(unittest.TestCase):
 class TestPhase12ChromeLabel(unittest.TestCase):
     """Phase 12 (2026-09-17): chrome topbar label drops the literal
     "第N章 XXX" redundancy (shape-17 already paints the chapter
-    title). New format is "PART NN · EN_LABEL" derived from
-    workspace_expand._EN_LABELS.
+    title). Format is "PART NN · EN_LABEL".
+
+    Phase 19 P0-B-1 (2026-09-20): EN_LABEL source switched from the
+    position-cycled ``_EN_LABELS`` dict to the section_intent-driven
+    ``intent_label_pair(titles_by_index[idx])``. Phase 12 test
+    expectations updated to match the new behavior contract:
+
+      - titles_by_index[2] = "目的"       → no intent match → "CHAPTER"
+      - titles_by_index[3] = "适用范围"   → scope intent       → "APPLICATION SCOPE"
     """
 
     def test_topbar_label_uses_en_label(self):
@@ -6337,13 +6344,17 @@ class TestPhase12ChromeLabel(unittest.TestCase):
             state = PipelineState(workspace=ws, context={})
             plan = _derive_default_chrome_plan(state)
             by_idx = {entry["svg"]: entry for entry in plan}
+            # Part 02 → titles_by_index[2] = "目的" → no intent keyword
+            # in the 7-section patterns → default CHAPTER fallback.
             self.assertEqual(
                 by_idx["slide_part02_content.svg"]["chapter_label"],
-                "PART 02 · OBJECTIVE",
+                "PART 02 · CHAPTER",
             )
+            # Part 03 → titles_by_index[3] = "适用范围" → matches the
+            # ``scope`` intent (re.compile(r"范围|适用|应用")).
             self.assertEqual(
                 by_idx["slide_part03_content.svg"]["chapter_label"],
-                "PART 03 · SCOPE",
+                "PART 03 · APPLICATION SCOPE",
             )
 
 
@@ -6564,6 +6575,92 @@ class TestPhase14PhaseKeywords(unittest.TestCase):
         self.assertEqual(
             _classify_h2_to_phase("采购付款方式"),
             "实施付款规范",
+        )
+
+
+class TestSectionIntentMapping(unittest.TestCase):
+    """Phase 19 P0-B-1 (2026-09-20): section_intent → (en_label,
+    body_label) mapping. Drives the chrome topbar / body_cards
+    labels in ``_derive_default_chrome_plan`` (pipeline.py:1194+)
+    so they reflect section semantics instead of the legacy
+    position-cycled ``_EN_LABELS`` dict.
+
+    Implementation lives in
+    :func:`mcp_ppt_native_fill.workspace_expand.intent_label_pair`.
+    These tests pin the regex priority order and the
+    CHAPTER-fallback contract; if anyone reorders the patterns
+    or weakens the default, these should fail loudly.
+    """
+
+    def test_intent_principles_matches_原则(self):
+        from mcp_ppt_native_fill.workspace_expand import intent_label_pair
+        self.assertEqual(
+            intent_label_pair("一、工作手册的原则"),
+            ("PRINCIPLES", "PRINCIPLE"),
+        )
+
+    def test_intent_scope_matches_范围(self):
+        from mcp_ppt_native_fill.workspace_expand import intent_label_pair
+        self.assertEqual(
+            intent_label_pair("工作手册适用范围"),
+            ("APPLICATION SCOPE", "SCOPE"),
+        )
+
+    def test_intent_specification_matches_规范性文件(self):
+        from mcp_ppt_native_fill.workspace_expand import intent_label_pair
+        self.assertEqual(
+            intent_label_pair("三、工作手册规范性文件"),
+            ("SPECIFICATIONS", "SPECIFICATION"),
+        )
+
+    def test_intent_authority_matches_权责(self):
+        from mcp_ppt_native_fill.workspace_expand import intent_label_pair
+        self.assertEqual(
+            intent_label_pair("四、职能部门权责"),
+            ("AUTHORITY", "AUTHORITY"),
+        )
+
+    def test_intent_procedure_matches_订货流程(self):
+        from mcp_ppt_native_fill.workspace_expand import intent_label_pair
+        self.assertEqual(
+            intent_label_pair("二、KTR产品订货流程"),
+            ("PROCEDURE", "PROCEDURE"),
+        )
+
+    def test_intent_organization_matches_组织架构(self):
+        from mcp_ppt_native_fill.workspace_expand import intent_label_pair
+        self.assertEqual(
+            intent_label_pair("部门组织架构"),
+            ("ORGANIZATION", "ORG CHART"),
+        )
+
+    def test_intent_unknown_falls_back_to_default(self):
+        """Titles with no matching keyword must use the CHAPTER
+        fallback so chrome never reads empty."""
+        from mcp_ppt_native_fill.workspace_expand import intent_label_pair
+        self.assertEqual(
+            intent_label_pair("随机未匹配标题"),
+            ("CHAPTER", "CHAPTER"),
+        )
+
+    def test_intent_empty_falls_back_to_default(self):
+        """Empty titles (no H1 text in markdown section) must not
+        crash and must produce the CHAPTER fallback."""
+        from mcp_ppt_native_fill.workspace_expand import intent_label_pair
+        self.assertEqual(
+            intent_label_pair(""),
+            ("CHAPTER", "CHAPTER"),
+        )
+
+    def test_intent_compound_matches_first_priority(self):
+        """When two keywords appear (e.g. "原则与目的"), the
+        first-matching pattern in the priority list wins.
+        principles is ordered before scope, so "原则与目的"
+        resolves to PRINCIPLES."""
+        from mcp_ppt_native_fill.workspace_expand import intent_label_pair
+        self.assertEqual(
+            intent_label_pair("目的与原则的关系"),
+            ("PRINCIPLES", "PRINCIPLE"),
         )
 
 

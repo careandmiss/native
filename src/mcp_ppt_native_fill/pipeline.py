@@ -288,7 +288,11 @@ from .workspace_expand import (  # noqa: F401  (re-export for back-compat)
     toc_deletion_marker_path as _toc_deletion_marker_path,
     toc_slide_number as _toc_slide_number,
 )
-from .workspace_expand import _EN_LABELS  # noqa: F401  (Phase 12 chrome topbar)
+from .workspace_expand import (  # noqa: F401  (Phase 12 chrome topbar; legacy shim)
+    _EN_LABELS,
+    detect_section_intent,
+    intent_label_pair,
+)
 
 
 def _merge_new_blocks(
@@ -1195,7 +1199,14 @@ def _derive_default_chrome_plan(state: PipelineState) -> list[dict]:
         # the Chinese suffix and let the topbar carry a "PART NN ·
         # EN_LABEL" header instead. shape-17 stays the single source
         # of truth for the Chinese chapter name.
-        en_label = _EN_LABELS.get(idx, "CHAPTER")
+        # Phase 19 P0-B-1 (2026-09-20): use section_title-driven intent
+        # instead of position-cycled _EN_LABELS.get(idx, "CHAPTER").
+        # detect_section_intent + intent_label_pair live in
+        # workspace_expand.py:1072 / :1091 (landed in commit 4847a67
+        # as P0-B-0). The legacy _EN_LABELS shim is retained (see
+        # workspace_expand.py:1110-1130) only for any future import-
+        # level callers; nothing else reads it now.
+        en_label, _body_label = intent_label_pair(title)
         # Phase 14+: pull archetype meta fields from the planner's
         # matching page_plan_additions entry (if any). Layout
         # resolution order matches realize_plan so chrome suppression
