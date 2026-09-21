@@ -2264,16 +2264,70 @@ def run_with_mapping(
         strip_report = autofix.repair_nested_picture_attrs(auth)
 
     # Markdown → page_plan expansion (only when caller supplied the
-    # four required template params)
+    # four required template params). Phase 21 P0-B (2026-09-20):
+    # when caller omits expand_divider_edits_template /
+    # expand_content_edits_template, auto-inspect the template to
+    # fill skeleton indices + TOC grid. text-slots stay empty (the
+    # archetype_router / LLM path fills body content directly).
     expansions: dict[str, Any] = {"cloned_svgs": [], "n_parts": 0}
     if (
         content_markdown is not None
         and content_markdown.is_file()
         and expand_skeleton_divider is not None
         and expand_skeleton_content is not None
-        and expand_divider_edits_template is not None
-        and expand_content_edits_template is not None
     ):
+        # Auto-inspect when caller didn't supply edits_template.
+        # Caller-supplied edits_template still wins (preserves
+        # existing demo scripts like boteng_demo.py).
+        if (
+            expand_divider_edits_template is None
+            or expand_content_edits_template is None
+        ):
+            try:
+                from .template_adapter import (
+                    inspect_template,
+                    ensure_ascii_path,
+                )
+                pptx_for_inspect = ensure_ascii_path(source_pptx)
+                profile = inspect_template(pptx_for_inspect)
+                if expand_skeleton_divider is None and profile.divider_skeleton:
+                    expand_skeleton_divider = profile.divider_skeleton
+                if expand_skeleton_content is None and profile.content_skeleton:
+                    expand_skeleton_content = profile.content_skeleton
+                if expand_ending_svg is None and profile.ending_slide:
+                    expand_ending_svg = f"slide_{profile.ending_slide:02d}.svg"
+                if expand_toc_slot_grid is None and profile.toc_grid:
+                    expand_toc_slot_grid = profile.toc_grid
+                if expand_divider_edits_template is None:
+                    expand_divider_edits_template = {
+                        # Minimal fallback: boteng-like template. Real
+                        # templates vary; archetype_router will still
+                        # pick a sensible body layout regardless.
+                        "shape-4": "PART {nn}",
+                        "shape-5": "{title}",
+                    }
+                if expand_content_edits_template is None:
+                    expand_content_edits_template = {
+                        "shape-17": "{title}",
+                    }
+                if expand_body_bounds == "0 0 1280 720" and profile.body_bounds:
+                    expand_body_bounds = profile.body_bounds
+                log.info(
+                    "phase21: auto-inspected template %s → divider=%s "
+                    "content=%s ending=%s toc_grid=%s body_bounds=%s",
+                    pptx_for_inspect.name,
+                    expand_skeleton_divider,
+                    expand_skeleton_content,
+                    expand_ending_svg,
+                    expand_toc_slot_grid,
+                    expand_body_bounds,
+                )
+            except Exception as exc:
+                log.warning(
+                    "phase21: inspect_template failed for %s: %s: %s; "
+                    "falling back to caller options",
+                    source_pptx, type(exc).__name__, exc,
+                )
         expansions = workspace_expand.expand_workspace_from_markdown(
             workspace, content_markdown,
             skeleton_divider=expand_skeleton_divider,

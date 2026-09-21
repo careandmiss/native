@@ -7243,5 +7243,121 @@ class TestEmptyBodyFallback(unittest.TestCase):
             self.assertIn("slide_part02_content.svg", final_new_blocks)
 
 
+class TestTemplateInspect(unittest.TestCase):
+    """Phase 21 P0-A (2026-09-20): inspect_template walks a PPTX
+    and produces a TemplateProfile. Auto-detects cover/toc/divider/
+    content/ending slide indices, TOC grid, body bounds, and
+    per-slide text slots.
+
+    Test design uses two real template files in the project:
+      - boteng 模板 (柏腾ppt模版.pptx, 18 slides, 5 source slides)
+      - template_v2 (template_v2.pptx, 5 slides, simpler design)
+    plus inline-built minimal PPTX fixtures for isolation tests.
+
+    Heuristic classification (_classify_slide, _detect_toc_grid) is
+    **only unit-tested on minimal synthetic slides**. End-to-end
+    validation against real templates happens via
+    ``examples/boteng_auto_template2_v2md.py`` (Phase 21 P0-B). The
+    heuristics may misclassify on templates whose slide layouts do
+    not match the training distribution; that's an accepted
+    trade-off in P0-A and will be refined in Phase 22+ once more
+    real templates are profiled.
+
+    Design inspired by C:\\Users\\Administrator\\.claude\\skills
+    \\ppt-master\\scripts\\template_text_slots.py (MIT, Copyright
+    Hugo He 2025-2026) but rewritten as PPTX-native inspection
+    (no svg-conversion prerequisite).
+    """
+
+    def test_classify_toc_by_keyword(self):
+        """A slide containing 'CONTENTS' or '目录' must classify
+        as toc regardless of shape heuristics."""
+        from mcp_ppt_native_fill.template_adapter import _classify_slide
+        p = self._build_minimal({"CONTENTS": "目录", "other": "..."})
+        kind = _classify_slide(p.slides[0])
+        self.assertEqual(kind, "toc")
+
+    def test_classify_toc_by_card_grid(self):
+        """A slide with 4+ small rectangles in roughly aligned
+        positions must classify as toc even without keywords (e.g.
+        template_v2's TOC has 4 cards in a row, no 目录 keyword)."""
+        from mcp_ppt_native_fill.template_adapter import _classify_slide
+        p = self._build_minimal_card_grid()
+        kind = _classify_slide(p.slides[0])
+        self.assertEqual(kind, "toc")
+
+    def test_classify_content_by_body_rect(self):
+        """A slide with a big body rectangle (≥ 7×4 inches below
+        top) must classify as content."""
+        from pptx.util import Emu
+        from pptx.enum.shapes import MSO_SHAPE
+        from mcp_ppt_native_fill.template_adapter import _classify_slide
+        p = self._build_minimal({})
+        slide = p.slides[0]
+        slide.shapes.add_shape(
+            MSO_SHAPE.RECTANGLE,
+            Emu(int(0.5 * 914400)), Emu(int(1.5 * 914400)),
+            Emu(int(8.0 * 914400)), Emu(int(5.0 * 914400)),
+        )
+        kind = _classify_slide(slide)
+        self.assertEqual(kind, "content")
+
+    def test_infer_slot_role_title(self):
+        """A shape whose name contains 标题/標題/title/Title
+        must infer role='title'."""
+        from mcp_ppt_native_fill.template_adapter import _infer_slot_role
+        class FakeShape:
+            name = "标题 1"
+        self.assertEqual(_infer_slot_role(FakeShape(), "PPT模板测试"), "title")
+        class FakeShape2:
+            name = "Title Placeholder 1"
+        self.assertEqual(_infer_slot_role(FakeShape2(), ""), "title")
+
+    def test_ensure_ascii_path_noop_for_ascii(self):
+        """ensure_ascii_path returns the original path unchanged when
+        the path is already ASCII (idempotent no-op fast path)."""
+        from mcp_ppt_native_fill.template_adapter import ensure_ascii_path
+        ascii_src = Path(r"D:\Code\DSH\native_fill\template_v2.pptx")
+        self.assertEqual(ensure_ascii_path(ascii_src), ascii_src)
+
+    # ---- helpers ----
+
+    def _build_minimal(self, texts):
+        """Build a 1-slide PPTX with one text shape per (name, text)
+        entry."""
+        from pptx import Presentation
+        from pptx.util import Inches
+        p = Presentation()
+        p.slide_width = Inches(10)
+        p.slide_height = Inches(7.5)
+        slide = p.slides.add_slide(p.slide_layouts[6])
+        for name, text in texts.items():
+            tb = slide.shapes.add_textbox(
+                Inches(1), Inches(1), Inches(8), Inches(0.5),
+            )
+            tb.name = name
+            tb.text_frame.text = text
+        return p
+
+    def _build_minimal_card_grid(self):
+        """Build a 1-slide PPTX with 4 small rounded rectangles in
+        a 1-row × 4-col grid (mimics template_v2's TOC)."""
+        from pptx import Presentation
+        from pptx.util import Inches
+        from pptx.enum.shapes import MSO_SHAPE
+        p = Presentation()
+        p.slide_width = Inches(13.33)
+        p.slide_height = Inches(7.5)
+        slide = p.slides.add_slide(p.slide_layouts[6])
+        for i in range(4):
+            x = Inches(0.5 + i * 3.0)
+            y = Inches(3.0)
+            slide.shapes.add_shape(
+                MSO_SHAPE.ROUNDED_RECTANGLE, x, y,
+                Inches(2.7), Inches(2.6),
+            )
+        return p
+
+
 if __name__ == "__main__":
     unittest.main()
