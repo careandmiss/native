@@ -705,10 +705,12 @@ def expand_workspace_from_markdown(
     # ``source_slide = skeleton_divider`` behaviour — there is no
     # per-section archetype for them and the heuristic detector
     # doesn't apply.
+    div_source = skeleton_divider if skeleton_divider is not None else 3
+    cont_source = skeleton_content if skeleton_content is not None else 4
     for n in cloned:
         if n.endswith("_div.svg"):
             additions_dicts.append({
-                "source_slide": skeleton_divider,
+                "source_slide": div_source,
                 "svg": n,
             })
             continue
@@ -726,7 +728,7 @@ def expand_workspace_from_markdown(
         entry: dict[str, Any] = {
             "svg": n,
             "source_slide": meta_entry.get(
-                "source_slide", skeleton_content,
+                "source_slide", cont_source,
             ),
         }
         additions_dicts.append(entry)

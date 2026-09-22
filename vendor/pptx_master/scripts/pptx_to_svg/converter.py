@@ -1208,6 +1208,11 @@ def _remove_managed_paths(candidate_dir: Path, relative_paths: set[Path]) -> Non
 
 def _overlay_staged_tree(staged_dir: Path, candidate_dir: Path) -> None:
     """Overlay generated artifacts without overwriting unmanaged user files."""
+    sources = list(staged_dir.rglob("*"))
+    log.warning(
+        "_overlay_staged_tree: rglob found %d items in %s",
+        len(sources), staged_dir,
+    )
     for source in sorted(staged_dir.rglob("*")):
         relative = source.relative_to(staged_dir)
         target = candidate_dir / relative
@@ -1359,6 +1364,10 @@ class AtomicPublish:
         # cleanup, the next mkdtemp gives a fresh hash but stale dirs
         # under the workspace parent can hold file locks that race
         # with shutil.copytree in _copy_to_candidate below.
+        # We do NOT clean up .convert-* dirs — those belong to the
+        # vendor process's own staging_root that _write_artifacts is
+        # actively writing to. Cleaning them would destroy the very
+        # artifacts the vendor just generated.
         for stale in self.output_dir.parent.glob(
             f".{self.output_dir.name}.publish-*"
         ):
@@ -1366,10 +1375,6 @@ class AtomicPublish:
                 "AtomicPublish._prepare_transaction: cleaning stale %s",
                 stale,
             )
-            shutil.rmtree(stale, ignore_errors=True)
-        for stale in self.output_dir.parent.glob(
-            f".{self.output_dir.name}.convert-*"
-        ):
             shutil.rmtree(stale, ignore_errors=True)
 
         self.output_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -1391,6 +1396,13 @@ class AtomicPublish:
 
     @retry_on_permission_error()
     def _copy_to_candidate(self) -> None:
+        # Phase 23+ commit 4 debug: trace staged_dir at function entry
+        log.warning(
+            "_copy_to_candidate: entry, staged_dir=%s has %d entries: %s",
+            self.staged_dir,
+            len(list(self.staged_dir.iterdir())) if self.staged_dir.exists() else -1,
+            [f.name for f in self.staged_dir.iterdir()] if self.staged_dir.exists() else "(missing)",
+        )
         # Defensive cleanup: shutil.copytree errors on existing dst;
         # remove any stale candidate before populating. Belt-and-suspenders
         # against prior-run cleanup failures.
@@ -1435,6 +1447,11 @@ class AtomicPublish:
         )
         _remove_managed_paths(self._candidate_dir, relative_paths)
         _overlay_staged_tree(self.staged_dir, self._candidate_dir)
+        log.warning(
+            "_copy_to_candidate: post-overlay, candidate %s has %d entries: %s",
+            self._candidate_dir, len(list(self._candidate_dir.iterdir())),
+            [f.name for f in self._candidate_dir.iterdir()],
+        )
 
     def _overlay_staged(self) -> None:
         # _copy_to_candidate already overlays via _overlay_staged_tree.
@@ -1446,6 +1463,21 @@ class AtomicPublish:
 
     def _promote(self) -> None:
         if not self.output_dir.is_dir():
+            # First-run path: output_dir doesn't exist yet. Just rename
+            # the populated candidate in place. Phase 23+ commit 4 fix:
+            # the previous early-return left output_dir empty and the
+            # caller saw a missing workspace. Rename is atomic on the
+            # same filesystem.
+            log.warning(
+                "_promote: first-run path, output_dir=%s does not exist, "
+                "rename candidate %s -> output_dir",
+                self.output_dir, self._candidate_dir,
+            )
+            os.replace(self._candidate_dir, self.output_dir)
+            log.warning(
+                "_promote: post-rename, output_dir.is_dir()=%s, candidate.exists()=%s",
+                self.output_dir.is_dir(), self._candidate_dir.exists(),
+            )
             return
         os.replace(self.output_dir, self._backup_dir)
         os.replace(self._candidate_dir, self.output_dir)
@@ -1525,12 +1557,26 @@ def publish_staged_workspace(
     :func:`retry_on_permission_error` and automatic rollback on
     failure.
     """
-    AtomicPublish(
-        output_dir=output_dir,
-        staged_dir=staged_dir,
-        managed_root_files=managed_root_files,
-        managed_relative_paths=managed_relative_paths,
-    ).execute()
+    log.warning(
+        "publish_staged_workspace called: output_dir=%s staged_dir=%s",
+        output_dir, staged_dir,
+    )
+    log.warning(
+        "publish_staged_workspace: staged_dir has %d entries: %s",
+        len(list(staged_dir.iterdir())) if staged_dir.exists() else -1,
+        [f.name for f in staged_dir.iterdir()] if staged_dir.exists() else "(missing)",
+    )
+    try:
+        AtomicPublish(
+            output_dir=output_dir,
+            staged_dir=staged_dir,
+            managed_root_files=managed_root_files,
+            managed_relative_paths=managed_relative_paths,
+        ).execute()
+        log.warning("publish_staged_workspace COMPLETED")
+    except Exception as exc:
+        log.warning("publish_staged_workspace FAILED: %s", exc)
+        raise
 
 
 def _write_artifact_tree(
@@ -1553,6 +1599,10 @@ def _write_artifact_tree(
         ROUNDTRIP_LAYERED_SVG_DIR if options.roundtrip else Path("svg")
     )
     svg_dir.mkdir(parents=True, exist_ok=True)
+    log.warning(
+        "_write_artifact_tree: staged_dir=%s svg_dir=%s",
+        output_dir, svg_dir,
+    )
     media_dir = output_dir / options.images_subdir
     sound_dir = output_dir / options.sound_subdir
     media_written: dict[str, bytes] = {}
@@ -1613,13 +1663,16 @@ def _write_artifact_tree(
         _collect_media(art.media_files)
 
     # Slides (primary view).
+    slide_count = 0
     for art in result.slides:
         target = svg_dir / f"slide_{art.index:02d}.svg"
         target.write_text(
             _svg_for_target(art.svg, target.parent),
             encoding="utf-8",
         )
+        slide_count += 1
         _collect_media(art.media_files)
+    log.warning("_write_artifact_tree: wrote %d slides to %s", slide_count, svg_dir)
     for filename, blob in result.animation_media_files.items():
         _validate_media_filename(filename)
         existing = sounds_written.get(filename)
@@ -1633,6 +1686,11 @@ def _write_artifact_tree(
     # actually emitted a layered view).
     if options.inheritance_mode in {"layered", "both"}:
         _write_inheritance_json(svg_dir, result)
+    log.warning("_write_artifact_tree: post-inheritance staged_dir has %d entries: %s",
+                len(list(output_dir.iterdir())),
+                [f.name for f in output_dir.iterdir()])
+    log.warning("  result.flat_slides count: %d", len(result.flat_slides))
+    log.warning("  result.native_structure is not None: %s", result.native_structure is not None)
 
     # Flat companion view (only when result.flat_slides is populated).
     if result.flat_slides:
@@ -1640,6 +1698,10 @@ def _write_artifact_tree(
             ROUNDTRIP_FLAT_SVG_DIR if options.roundtrip else Path("svg-flat")
         )
         flat_dir.mkdir(parents=True, exist_ok=True)
+        log.warning(
+            "_write_artifact_tree: writing %d flat slides to %s",
+            len(result.flat_slides), flat_dir,
+        )
         for art in result.flat_slides:
             target = flat_dir / f"slide_{art.index:02d}.svg"
             target.write_text(
@@ -1647,6 +1709,11 @@ def _write_artifact_tree(
                 encoding="utf-8",
             )
             _collect_media(art.media_files)
+        log.warning(
+            "_write_artifact_tree: flat_dir %s has %d files: %s",
+            flat_dir, len(list(flat_dir.iterdir())),
+            [f.name for f in flat_dir.iterdir()],
+        )
 
     _write_animation_config(output_dir, result)
     _write_speaker_notes(output_dir, result)
@@ -1721,6 +1788,13 @@ def _write_artifact_tree(
         flat_dir = output_dir / ROUNDTRIP_FLAT_SVG_DIR
         authoring_dir = output_dir / AUTHORING_SVG_FLAT_DIR
         source_proxy_dir = media_dir / "source-object-previews"
+        log.warning(
+            "_write_artifact_tree: pre-flat-loop: flat_dir=%s "
+            "flat_dir.exists()=%s flat_dir files=%s authoring_dir=%s",
+            flat_dir, flat_dir.is_dir(),
+            [f.name for f in flat_dir.iterdir()] if flat_dir.is_dir() else "(missing)",
+            authoring_dir,
+        )
         mapping = [
             (source, authoring_dir / source.name)
             for source in sorted(flat_dir.glob("slide_*.svg"))
@@ -1966,6 +2040,16 @@ def _write_artifacts(
         _write_artifact_tree(staged_dir, result, options)
         publish_staged_workspace(output_dir, staged_dir)
     finally:
+        # Phase 23+ commit 4 debug: log staged_dir contents before cleanup
+        try:
+            files = list(staged_dir.iterdir())
+            log.warning(
+                "_write_artifacts: staged_dir %s had %d entries: %s",
+                staged_dir, len(files),
+                [f.name for f in files[:8]],
+            )
+        except Exception as e:
+            log.warning("_write_artifacts: staged_dir inspection failed: %s", e)
         shutil.rmtree(staging_root, ignore_errors=True)
 
 

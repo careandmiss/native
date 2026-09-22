@@ -2572,6 +2572,7 @@ def project_svg_batch(
             for target, _ in staged
         )
         if not output_dir.exists() and not has_external_targets:
+            log.warning("project_svg_batch: output_dir=%s does NOT exist, will create", output_dir)
             created: list[Path] = []
             try:
                 _ensure_directory(output_dir.parent, created)
@@ -2583,6 +2584,8 @@ def project_svg_batch(
                     raise OSError(
                         f"Cannot atomically publish across filesystems: {output_dir}"
                     )
+                log.warning("project_svg_batch: rename new_root=%s -> output_dir=%s",
+                            new_root, output_dir)
                 new_root.replace(output_dir)
             except OSError as exc:
                 cleanup_errors = _remove_created_directories(created)
@@ -2807,6 +2810,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
+
+
+import logging
+
+log = logging.getLogger(__name__)
 
 
 if __name__ == "__main__":

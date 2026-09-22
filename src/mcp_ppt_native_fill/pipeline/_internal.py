@@ -75,7 +75,14 @@ def write_page_plan(workspace: Path, pages: list[dict]) -> Path:
         raise ValueError("page_plan.pages must not be empty")
     seen_svg: set[str] = set()
     for entry in pages:
-        svg = entry.get("svg") or f"slide_{int(entry['source_slide']):02d}.svg"
+        svg = entry.get("svg")
+        source_slide_raw = entry.get("source_slide")
+        if svg is None:
+            if source_slide_raw is None:
+                raise ValueError(
+                    "page_plan entry has neither 'svg' nor 'source_slide'"
+                )
+            svg = f"slide_{int(source_slide_raw):02d}.svg"
         if svg in seen_svg:
             raise ValueError(f"duplicate svg filename in page_plan: {svg}")
         seen_svg.add(svg)
@@ -84,11 +91,12 @@ def write_page_plan(workspace: Path, pages: list[dict]) -> Path:
                 f"page_plan references missing svg: "
                 f"authoring-svg-flat/{svg}"
             )
-        source_slide = int(entry["source_slide"])
-        if source_slide < 1:
-            raise ValueError(
-                f"page_plan.source_slide must be >= 1, got {source_slide}"
-            )
+        if source_slide_raw is not None:
+            source_slide = int(source_slide_raw)
+            if source_slide < 1:
+                raise ValueError(
+                    f"page_plan.source_slide must be >= 1, got {source_slide}"
+                )
 
     payload = {"schema": PAGE_PLAN_SCHEMA, "pages": pages}
     path = workspace / "page_plan.json"
