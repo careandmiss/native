@@ -438,28 +438,34 @@ def _resize_png_to_dim(
 def _is_vision_capable(model: str) -> bool:
     """Heuristic check for vision capability.
 
-    Assumes vision-capable unless the model name suggests otherwise.
-    Local models without an explicit "vision" marker default to False.
+    Defaults to True (most modern LLMs are multimodal). Returns False
+    only for known text-only models or empty model name. Override via
+    the ``MCP_LLM_MODEL`` env var pointing at a vision-capable model
+    for the workspace.
+
+    Conservative denylist of small local text-only models:
     """
-    name = (model or "").lower()
+    name = (model or "").strip().lower()
     if not name:
         return False
-    # Explicit vision markers
+    # Explicit vision markers (always allow)
     if "vision" in name or "-v-" in name or "-vl" in name:
         return True
-    # OpenAI: gpt-4o, gpt-4-turbo, gpt-5* are vision-capable
-    if any(x in name for x in ("gpt-4o", "gpt-5", "gpt-4-turbo")):
-        return True
-    # Anthropic: sonnet / opus / haiku (3.5+, 4+) are vision-capable
-    if "claude" in name and any(
-        x in name for x in ("haiku", "sonnet", "opus")
-    ):
-        return True
-    # Gemini family
-    if "gemini" in name and "vision" not in name:
-        return True  # most gemini variants are multimodal
-    # Local open-source without explicit vision marker → assume not
-    return False
+    # Known text-only small models — likely won't accept images.
+    text_only_hints = (
+        "llama-3-8b",
+        "mistral-7b",
+        "qwen-7b",
+        "gpt-3.5",
+        "babbage",
+        "ada",
+    )
+    for hint in text_only_hints:
+        if hint in name:
+            return False
+    # Default: assume multimodal (GPT-4o / GPT-5 / Claude 3.5+ /
+    # MiniMax-M3 / Gemini / most commercial APIs all support images).
+    return True
 
 
 def _anthropic_complete_vision(
