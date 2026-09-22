@@ -16,8 +16,10 @@ from __future__ import annotations
 # Re-export every concrete handler so callers can write
 # ``from mcp_ppt_native_fill.pipeline.handlers import Phase2ImportHandler``
 # rather than reaching into the submodule.
+from .markdown_expand import MarkdownExpandHandler
 from .phase2_import import Phase2ImportHandler
 
 __all__ = [
+    "MarkdownExpandHandler",
     "Phase2ImportHandler",
 ]

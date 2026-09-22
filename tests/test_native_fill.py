@@ -7677,6 +7677,148 @@ class TestPhase2ImportHandler(unittest.TestCase):
         self.assertEqual(ctx.get("vendor_result"), {"slides_converted": 7})
 
 
+class TestMarkdownExpandHandler(unittest.TestCase):
+    """Phase 22 commit 4 (2026-09-20): MarkdownExpandHandler.
+
+    Wraps the legacy markdown-expansion + smart-TOC section.
+    skip() returns True when no content_markdown path supplied.
+    On success, populates ctx.handler_outputs['expansions'] and
+    ['content_mapping'] (with TOC edits merged in).
+    """
+
+    def _make_ctx(self, content_markdown=None):
+        from mcp_ppt_native_fill.pipeline import (
+            PipelineContext, PipelineState,
+        )
+        return PipelineContext(
+            state=PipelineState(),
+            source_pptx=Path("/tmp/test.pptx"),
+            workspace=Path("/tmp/ws"),
+            output_pptx=Path("/tmp/out.pptx"),
+            skill_dir=Path("/tmp/skill"),
+            options={"content_markdown": content_markdown},
+        )
+
+    def test_handler_skips_when_no_content_markdown(self):
+        """skip() returns True when options['content_markdown'] is
+        None. The Pipeline orchestrator must not call run() at all.
+        """
+        from mcp_ppt_native_fill.pipeline import Pipeline
+        from mcp_ppt_native_fill.pipeline.handlers import (
+            MarkdownExpandHandler,
+        )
+        ctx = self._make_ctx(content_markdown=None)
+        h = MarkdownExpandHandler()
+        self.assertTrue(h.skip(ctx))
+
+    def test_handler_runs_when_content_markdown_exists(self):
+        """skip() returns False when content_markdown is a real path.
+        (We use a non-existent path so run()'s first check ``not
+        Path(md).is_file()`` makes it skip inside run() — but the
+        skip() method itself only checks for None.)"""
+        from mcp_ppt_native_fill.pipeline import Pipeline
+        from mcp_ppt_native_fill.pipeline.handlers import (
+            MarkdownExpandHandler,
+        )
+        ctx = self._make_ctx(content_markdown="/tmp/nonexistent.md")
+        h = MarkdownExpandHandler()
+        # skip() only checks for None / is_file() check is inside run()
+        self.assertFalse(h.skip(ctx))
+
+    def test_handler_uses_phase21_inspect_when_caller_omits_edits(self):
+        """When caller omits expand_divider_edits_template and
+        expand_content_edits_template, the handler must invoke
+        template_adapter.inspect_template to auto-fill.
+
+        We monkey-patch both workspace_expand.expand_workspace_from_markdown
+        and template_adapter.inspect_template to verify the call chain.
+        """
+        from mcp_ppt_native_fill.pipeline import Pipeline, PipelineContext
+        from mcp_ppt_native_fill.pipeline.handlers import (
+            MarkdownExpandHandler,
+        )
+
+        # Build a real markdown file in a temp dir so is_file() passes.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            md_path = td_path / "doc.md"
+            md_path.write_text(
+                "# 一、目的\n\n段落\n# 二、范围\n\n段落2\n",
+                encoding="utf-8",
+            )
+            ws = td_path / "ws"
+            ws.mkdir()
+
+            ctx = PipelineContext(
+                state=__import__(
+                    "mcp_ppt_native_fill.pipeline", fromlist=["PipelineState"],
+                ).PipelineState(),
+                source_pptx=Path("/tmp/x.pptx"),
+                workspace=ws,
+                output_pptx=Path("/tmp/o.pptx"),
+                skill_dir=Path("/tmp/sk"),
+                options={
+                    "content_markdown": str(md_path),
+                    # Deliberately omit expand_divider_edits_template
+                    # and expand_content_edits_template — handler must
+                    # call inspect_template to fill them.
+                },
+            )
+
+            # Monkeypatch inspect_template + expand_workspace_from_markdown.
+            from mcp_ppt_native_fill import (
+                workspace_expand as real_workspace_expand,
+            )
+            from mcp_ppt_native_fill import template_adapter as real_adapter
+
+            calls = {"inspect": 0, "expand": 0}
+
+            def fake_inspect(pptx):
+                calls["inspect"] += 1
+                # Minimal valid TemplateProfile with skeleton indices set.
+                from mcp_ppt_native_fill.template_adapter import (
+                    TemplateProfile,
+                )
+                return TemplateProfile(
+                    cover_slide=1, divider_skeleton=3,
+                    content_skeleton=4, ending_slide=5,
+                    toc_grid={"rows": 1, "cols": 4},
+                    body_bounds="120 130 1060 480",
+                    text_slots={1: [], 2: [], 3: [], 4: [], 5: []},
+                    template_hash="test1234",
+                )
+
+            def fake_expand(*a, **kw):
+                calls["expand"] += 1
+                return {"cloned_svgs": [], "n_parts": 2, "new_blocks": {},
+                        "page_plan_path": None}
+
+            real_adapter.inspect_template = fake_inspect
+            real_workspace_expand.expand_workspace_from_markdown = fake_expand
+            try:
+                pipe = Pipeline([MarkdownExpandHandler()])
+                pipe.run(ctx)
+            finally:
+                real_adapter.inspect_template = real_adapter.inspect_template
+                real_workspace_expand.expand_workspace_from_markdown = (
+                    real_workspace_expand.expand_workspace_from_markdown
+                )
+
+            self.assertEqual(calls["inspect"], 1,
+                             "handler must call inspect_template when edits omitted")
+            self.assertEqual(calls["expand"], 1,
+                             "handler must call expand_workspace_from_markdown")
+            # Auto-fill: skeleton_divider / skeleton_content / toc_grid /
+            # body_bounds must now be populated.
+            self.assertEqual(ctx.options["expand_skeleton_divider"], 3)
+            self.assertEqual(ctx.options["expand_skeleton_content"], 4)
+            self.assertEqual(ctx.options["expand_toc_slot_grid"],
+                             {"rows": 1, "cols": 4})
+            self.assertEqual(ctx.options["expand_body_bounds"],
+                             "120 130 1060 480")
+
+
 if __name__ == "__main__":
     unittest.main()
 
