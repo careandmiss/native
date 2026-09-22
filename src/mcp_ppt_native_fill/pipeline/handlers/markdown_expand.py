@@ -66,9 +66,15 @@ class MarkdownExpandHandler(PipelineHandler):
 
         # 1. Phase 21 inspect_template auto-fill. Caller-supplied
         #    edits_template still wins (preserve boteng_demo compat).
-        opts = self._auto_fill_template_options(ctx, opts)
+        opts, injects = self._auto_fill_template_options(ctx, opts)
 
-        # 2. expand_workspace_from_markdown
+        # Phase 24 commit 3 (vision-inferred layouts). The auto-fill
+        # helper returned any vision-inferred placeholder lists in
+        # ``injects`` (cover_layouts, toc_layouts, divider_layouts,
+        # content_layouts, ending_layouts). Forward them to
+        # expand_workspace_from_markdown; that function injects text
+        # blocks at the LLM-inferred positions for graphic-only templates
+        # where the boteng default shape-4/5/17 path is a no-op.
         try:
             expansions = workspace_expand.expand_workspace_from_markdown(
                 ctx.workspace, content_markdown,
@@ -76,6 +82,14 @@ class MarkdownExpandHandler(PipelineHandler):
                 skeleton_content=opts.get("expand_skeleton_content"),
                 divider_edits_template=opts.get("expand_divider_edits_template"),
                 content_edits_template=opts.get("expand_content_edits_template"),
+                divider_inject_title=injects.get("divider_inject_title"),
+                divider_inject_part=injects.get("divider_inject_part"),
+                content_inject_title=injects.get("content_inject_title"),
+                cover_layouts=injects.get("cover_layouts"),
+                toc_layouts=injects.get("toc_layouts"),
+                divider_layouts=injects.get("divider_layouts"),
+                content_layouts=injects.get("content_layouts"),
+                ending_layouts=injects.get("ending_layouts"),
                 body_bounds=opts.get("expand_body_bounds", "0 0 1280 720"),
                 ending_svg=opts.get("expand_ending_svg"),
                 part_names=opts.get("expand_part_names"),
@@ -144,10 +158,20 @@ class MarkdownExpandHandler(PipelineHandler):
 
     def _auto_fill_template_options(
         self, ctx: PipelineContext, opts: dict,
-    ) -> dict:
+    ) -> tuple[dict, dict]:
         """Phase 21 P0-B integration: when caller omits edits_template
         / skeleton indices / ending_svg / TOC grid, inspect_template
         fills them in. Caller-supplied values always win.
+
+        Returns ``(opts, injects)`` — the second dict carries the
+        caller-supplied template-specific placeholder layouts
+        (Phase 23+ commit 6), passed directly to
+        :func:`expand_workspace_from_markdown` as kwargs. Keys:
+        ``divider_inject_title`` / ``divider_inject_part`` /
+        ``content_inject_title`` — each is a dict with ``shape_id``,
+        ``x``, ``y``, ``w``, ``h``, ``font_size``. The caller is
+        expected to derive these from vision over the template PNGs
+        (or by trial-and-error in their demo config).
         """
         if (
             opts.get("expand_divider_edits_template") is None
@@ -161,6 +185,15 @@ class MarkdownExpandHandler(PipelineHandler):
                 profile = template_adapter.inspect_template(
                     pptx_for_inspect,
                 )
+                # Phase 23+ commit 6: graphic-only templates (e.g.
+                # template_v2 slide_03/04 with no text shapes) need
+                # text-block INJECTION at the divider/content
+                # skeleton position — we capture these here and pass
+                # them directly to expand_workspace_from_markdown
+                # rather than via opts (server.py / run_with_pipeline
+                # don't yet propagate these kwargs).
+                injects: dict = {}  # always init so the trailing
+                                     # except branch can still mutate it
                 if (
                     opts.get("expand_skeleton_divider") is None
                     and profile.divider_skeleton
@@ -196,6 +229,24 @@ class MarkdownExpandHandler(PipelineHandler):
                     opts["expand_content_edits_template"] = {
                         "shape-17": "{title}",
                     }
+                # Phase 23+ commit 6 (2026-09-20): template-specific
+                # placeholder positions are NOT inferred here. Each
+                # template has different visual layouts and we don't
+                # want to hardcode coordinates (that would couple the
+                # pipeline to one specific template).
+                #
+                # Caller (typically after running vision over the
+                # template PNGs) passes a ``expand_divider_layouts`` /
+                # ``expand_content_layouts`` / ``expand_cover_layouts`` /
+                # ``expand_toc_layouts`` / ``expand_ending_layouts``
+                # dict to opt-in. See examples/ for the schema.
+                #
+                # We still auto-fill cover/toc/ending/divider/content
+                # edits_template using the existing text shapes (when
+                # available — boteng-style templates) via the *edits
+                # paths above. The layouts path is only used when the
+                # template has no usable text shapes (graphic-only
+                # templates like template_v2).
                 if (
                     opts.get("expand_body_bounds", "0 0 1280 720")
                     == "0 0 1280 720"
@@ -212,7 +263,80 @@ class MarkdownExpandHandler(PipelineHandler):
                     "falling back to caller options",
                     ctx.source_pptx, type(exc).__name__, exc,
                 )
-        return opts
+        # Pull any caller-supplied template-specific layouts from
+        # opts. These go into the second tuple element so they're
+        # passed directly to expand_workspace_from_markdown (they're
+        # not opts that need to round-trip through server.py).
+        for key in (
+            "divider_inject_title", "divider_inject_part",
+            "content_inject_title",
+        ):
+            val = opts.get("expand_" + key)
+            if val:
+                injects[key] = val
+
+        # Phase 24 commit 3 (vision-inferred layouts). When caller
+        # opts request it AND an LLM is configured + vision-capable,
+        # call vision_layout.infer_template_layout once per template
+        # (cached). On any failure (no LLM / not vision-capable / network
+        # error / malformed JSON) we fall back to the text-shape-only
+        # auto-fill already done above — no caller action required.
+        if opts.get("enable_vision_layout", True):
+            try:
+                from mcp_ppt_native_fill.vision_layout import (
+                    infer_template_layout,
+                )
+                profile_layout = infer_template_layout(
+                    ctx.source_pptx,
+                    cache_dir=Path(
+                        opts.get("vision_layout_cache_dir")
+                        or (Path.home() / ".mcp_ppt_native_fill" / "vision_cache")
+                    ),
+                    min_confidence=float(
+                        opts.get("vision_layout_min_confidence", 0.5)
+                    ),
+                    max_image_dim=int(
+                        opts.get("vision_layout_max_image_dim", 1568)
+                    ),
+                    dry_run=False,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "phase24: vision_layout inference failed (%s: %s); "
+                    "falling back to text-shape auto-fill",
+                    type(exc).__name__, exc,
+                )
+                profile_layout = None
+
+            if profile_layout is not None:
+                log.info(
+                    "phase24: vision_layout inferred %d slide(s) (avg conf %.2f)",
+                    len(profile_layout.slides),
+                    profile_layout.confidence_avg,
+                )
+                for slide_layout in profile_layout.slides:
+                    layouts_serialized = [
+                        {
+                            "role": ph.role,
+                            "text": ph.text,
+                            "x": ph.x, "y": ph.y,
+                            "w": ph.w, "h": ph.h,
+                            "font_size": ph.font_size,
+                            "font_weight": ph.font_weight,
+                            "shape_id": (
+                                f"_vision_{ph.role}"
+                            ),
+                        }
+                        for ph in slide_layout.placeholders
+                    ]
+                    key = f"{slide_layout.kind}_layouts"
+                    if key in (
+                        "cover_layouts", "toc_layouts",
+                        "divider_layouts", "content_layouts",
+                        "ending_layouts",
+                    ):
+                        injects[key] = layouts_serialized
+        return opts, injects
 
     def _smart_toc_fill(
         self, ctx: PipelineContext, expansions: dict,

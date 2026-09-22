@@ -271,6 +271,71 @@ def write_new_content_block(
     tmp.replace(svg_path)
 
 
+def add_text_block(
+    svg_path: Path,
+    *,
+    shape_id: str,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    text: str,
+    font_size: int = 48,
+    font_weight: str = "bold",
+    fill: str = "#000000",
+    anchor: str = "middle",
+    alignment_baseline: str = "middle",
+) -> None:
+    """Append a new ``<g>`` with a single ``<text>`` element inside.
+
+    Convenience wrapper around :func:`write_new_content_block` for the
+    common case of injecting one editable text shape into a template that
+    doesn't pre-define text placeholders (e.g. graphic-only divider /
+    content slides like ``template_v2``'s ``slide_03`` and ``slide_04``).
+
+    The new shape is appended to the SVG root and treated as editable by
+    the vendor's ``svg_to_pptx.py`` round-trip because it carries a
+    ``data-pptx-bounds`` attribute (recognised by the semantic-shape
+    machinery) and a single ``<text>`` child.
+
+    Parameters
+    ----------
+    svg_path:
+        Output canvas to append to (existing file is mutated).
+    shape_id:
+        Synthetic shape id (any non-conflicting id; must be unique within
+        the SVG).
+    x, y, w, h:
+        SVG-coordinate bounds in EMU. ``x``/``y`` are top-left, ``w``/``h``
+        are width/height. ``0 0 1280 720`` is the standard canvas; use
+        coordinates within that box.
+    text:
+        The visible text to inject. ``{nn}`` and ``{title}`` are templated
+        placeholders that ``workspace_expand`` substitutes per section;
+        pass the template string unchanged and the caller fills in values.
+    font_size, font_weight, fill, anchor, alignment_baseline:
+        Text rendering style. Defaults give a centered bold title.
+    """
+    # Use absolute coords (vendor svg_to_pptx rejects "%" units).
+    # text-anchor "middle" + x = cx (center of bounds); dominant-baseline
+    # "central" centers the glyph baseline vertically within y.
+    cx = x + w / 2
+    cy = y + h / 2
+    inner = (
+        f'<text x="{cx}" y="{cy}" text-anchor="{anchor}" '
+        f'dominant-baseline="{alignment_baseline}" '
+        f'font-size="{font_size}" font-weight="{font_weight}" '
+        f'fill="{fill}" '
+        f'data-pptx-edit-name="{shape_id}">'
+        f'<tspan xml:space="preserve">{text}</tspan>'
+        f"</text>"
+    )
+    bounds = f"{x} {y} {w} {h}"
+    write_new_content_block(
+        svg_path, group_id=shape_id, bounds=bounds, inner_svg=inner,
+    )
+
+
 def strip_template_chrome_shapes(
     svg_path: Path,
     shape_ids: Iterable[str],

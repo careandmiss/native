@@ -37,6 +37,7 @@ The API key is read once at module import and cached. Never logged.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -44,6 +45,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -388,6 +390,228 @@ def _openai_compat_complete(
         return raw["choices"][0]["message"]["content"]
     except (KeyError, TypeError, IndexError) as exc:
         raise LLMError(f"openai_compat: malformed response: {exc}; raw={raw!r}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Vision helpers (Phase 24 commit 1, 2026-09-22).
+# ---------------------------------------------------------------------------
+
+# Maximum longest-side dimension for any image attachment. Anthropic
+# recommends 1568 to balance fidelity vs token cost. Vision cost is
+# ~1000× text-token cost so resizing aggressively is essential.
+_VISION_MAX_IMAGE_DIM_DEFAULT = 1568
+
+
+def _resize_png_to_dim(
+    png_bytes: bytes,
+    max_dim: int = _VISION_MAX_IMAGE_DIM_DEFAULT,
+) -> bytes:
+    """Resize PNG to fit ``max_dim`` on the longest side.
+
+    Uses vendored cairosvg + PIL fallback chain. Returns the original
+    bytes unchanged if neither decoder is available or the image is
+    already small enough.
+    """
+    if not png_bytes:
+        return png_bytes
+    try:
+        from PIL import Image  # type: ignore[import-not-found]
+    except ImportError:
+        return png_bytes
+    try:
+        with Image.open(BytesIO(png_bytes)) as img:
+            w, h = img.size
+            longest = max(w, h)
+            if longest <= max_dim:
+                return png_bytes
+            scale = max_dim / float(longest)
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+            buf = BytesIO()
+            img.save(buf, format="PNG", optimize=True)
+            return buf.getvalue()
+    except Exception:  # noqa: BLE001
+        return png_bytes
+
+
+def _is_vision_capable(model: str) -> bool:
+    """Heuristic check for vision capability.
+
+    Assumes vision-capable unless the model name suggests otherwise.
+    Local models without an explicit "vision" marker default to False.
+    """
+    name = (model or "").lower()
+    if not name:
+        return False
+    # Explicit vision markers
+    if "vision" in name or "-v-" in name or "-vl" in name:
+        return True
+    # OpenAI: gpt-4o, gpt-4-turbo, gpt-5* are vision-capable
+    if any(x in name for x in ("gpt-4o", "gpt-5", "gpt-4-turbo")):
+        return True
+    # Anthropic: sonnet / opus / haiku (3.5+, 4+) are vision-capable
+    if "claude" in name and any(
+        x in name for x in ("haiku", "sonnet", "opus")
+    ):
+        return True
+    # Gemini family
+    if "gemini" in name and "vision" not in name:
+        return True  # most gemini variants are multimodal
+    # Local open-source without explicit vision marker → assume not
+    return False
+
+
+def _anthropic_complete_vision(
+    *,
+    system: str,
+    user: str,
+    images: list[tuple[bytes, str]],
+    config: LLMConfig,
+    max_image_dim: int,
+) -> str:
+    """Anthropic Messages API with image content blocks.
+
+    Each ``(png_bytes, media_type)`` in ``images`` becomes a base64-encoded
+    image source block in the user message. Images are resized to
+    ``max_image_dim`` before encoding to keep vision-token cost bounded.
+    """
+    content_blocks: list[dict[str, Any]] = [{"type": "text", "text": user}]
+    for png_bytes, media_type in images:
+        resized = _resize_png_to_dim(png_bytes, max_image_dim)
+        b64 = base64.standard_b64encode(resized).decode("ascii")
+        content_blocks.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": b64,
+            },
+        })
+    url = f"{config.base_url}/v1/messages"
+    body = {
+        "model": config.model,
+        "max_tokens": config.max_tokens,
+        "system": system,
+        "messages": [{"role": "user", "content": content_blocks}],
+    }
+    headers = {
+        "content-type": "application/json",
+        "x-api-key": config.api_key,
+        "anthropic-version": _ANTHROPIC_VERSION,
+    }
+    raw = _http_post_json(url, body, headers, config.timeout_s)
+    try:
+        blocks = raw["content"]
+        text_blocks = [b for b in blocks if b.get("type") == "text"]
+        if not text_blocks:
+            raise LLMError(
+                f"anthropic vision: no text blocks in response: {raw}"
+            )
+        return text_blocks[0]["text"]
+    except (KeyError, TypeError, IndexError) as exc:
+        raise LLMError(
+            f"anthropic vision: malformed response: {exc}; raw={raw!r}"
+        ) from exc
+
+
+def _openai_compat_complete_vision(
+    *,
+    system: str,
+    user: str,
+    images: list[tuple[bytes, str]],
+    config: LLMConfig,
+    max_image_dim: int,
+) -> str:
+    """OpenAI Chat Completions API with image_url content blocks."""
+    content_blocks: list[dict[str, Any]] = [{"type": "text", "text": user}]
+    for png_bytes, media_type in images:
+        resized = _resize_png_to_dim(png_bytes, max_image_dim)
+        b64 = base64.standard_b64encode(resized).decode("ascii")
+        content_blocks.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{media_type};base64,{b64}"},
+        })
+    base = config.base_url
+    if not base.endswith("/v1"):
+        base = base + "/v1"
+    url = f"{base}/chat/completions"
+    body = {
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": content_blocks},
+        ],
+        "response_format": {"type": "json_object"},
+        "max_tokens": config.max_tokens,
+    }
+    headers = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {config.api_key}",
+    }
+    raw = _http_post_json(url, body, headers, config.timeout_s)
+    try:
+        return raw["choices"][0]["message"]["content"]
+    except (KeyError, TypeError, IndexError) as exc:
+        raise LLMError(
+            f"openai_compat vision: malformed response: {exc}; raw={raw!r}"
+        ) from exc
+
+
+def llm_complete_vision_json(
+    *,
+    system: str,
+    user: str,
+    images: list[tuple[bytes, str]],
+    config: LLMConfig | None = None,
+    max_image_dim: int = _VISION_MAX_IMAGE_DIM_DEFAULT,
+) -> dict[str, Any]:
+    """Vision-capable variant of :func:`llm_complete_json`.
+
+    ``images`` is a list of ``(png_bytes, media_type)`` tuples
+    (e.g. ``(png_bytes, "image/png")``). Each image is resized to fit
+    ``max_image_dim`` on the longest side before encoding.
+
+    Raises ``LLMError`` on any failure (network, HTTP, JSON parse, missing
+    content). Same JSON-extraction pipeline as the text-only variant.
+    """
+    if not images:
+        raise LLMError("llm_complete_vision_json called with no images")
+    cfg = config or LLMConfig.from_env()
+    log.info(
+        "llm_complete_vision_json provider=%s model=%s images=%d timeout=%ds",
+        cfg.provider, cfg.model, len(images), cfg.timeout_s,
+    )
+    t0 = time.time()
+    if cfg.provider == PROVIDER_ANTHROPIC:
+        text = _anthropic_complete_vision(
+            system=system, user=user, images=images,
+            config=cfg, max_image_dim=max_image_dim,
+        )
+    elif cfg.provider == PROVIDER_OPENAI_COMPAT:
+        text = _openai_compat_complete_vision(
+            system=system, user=user, images=images,
+            config=cfg, max_image_dim=max_image_dim,
+        )
+    else:
+        raise LLMError(f"unknown provider: {cfg.provider}")
+    elapsed_ms = int((time.time() - t0) * 1000)
+    log.info(
+        "llm_complete_vision_json done in %d ms (response %d chars)",
+        elapsed_ms, len(text),
+    )
+
+    text = _strip_code_fence(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        candidate = _extract_first_json_object(text)
+        if candidate is not None:
+            return candidate
+        raise LLMError(
+            f"vision response is not valid JSON; "
+            f"first 200 chars: {text[:200]!r}"
+        )
 
 
 # ---------------------------------------------------------------------------

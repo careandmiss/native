@@ -1,4 +1,4 @@
-﻿"""Phase 22 commit 2 (2026-09-20): Pipeline orchestrator.
+"""Phase 22 commit 2 (2026-09-20): Pipeline orchestrator.
 
 Provides the :class:`Pipeline` class that runs a list of
 :class:`PipelineHandler` instances in order. Replaces the legacy
@@ -161,6 +161,15 @@ def run_with_pipeline(
     expand_toc_slot_grid=None,
     fix_nested_picture=False,
     clean_workspace=False,
+    # Phase 24 commit 3 (vision-layout inference). These mirror the
+    # keys read by ``markdown_expand._auto_fill_template_options``.
+    # They are passed through to ``ctx.options`` and consumed by
+    # ``vision_layout.infer_template_layout`` (called from
+    # markdown_expand when LLM is configured and vision-capable).
+    enable_vision_layout: bool = True,
+    vision_layout_cache_dir: str | None = None,
+    vision_layout_max_image_dim: int = 1568,
+    vision_layout_min_confidence: float = 0.5,
 ) -> dict[str, Any]:
     """Top-level Pipeline entry point. Construct PipelineContext
     from input kwargs, run the default handler chain, return the
@@ -211,6 +220,11 @@ def run_with_pipeline(
         "expand_exclude_source_slides": expand_exclude_source_slides,
         "expand_toc_from_markdown": expand_toc_from_markdown,
         "expand_toc_slot_grid": expand_toc_slot_grid,
+        # Phase 24 commit 3: vision-layout inference opts.
+        "enable_vision_layout": enable_vision_layout,
+        "vision_layout_cache_dir": vision_layout_cache_dir,
+        "vision_layout_max_image_dim": vision_layout_max_image_dim,
+        "vision_layout_min_confidence": vision_layout_min_confidence,
         "new_content_blocks": new_content_blocks,
     }
     ctx = PipelineContext(

@@ -494,6 +494,21 @@ def _execute_native_fill(arguments: dict) -> dict:
     )
     expand_toc_slot_grid = options.get("expand_toc_slot_grid")
 
+    # Phase 24 commit 3: vision-layout inference opts. These all pass
+    # through ``options`` into ``ctx.options`` so ``markdown_expand``
+    # can read them when calling ``vision_layout.infer_template_layout``.
+    # Default ``enable_vision_layout=True`` means: if MCP_LLM_API_KEY
+    # is configured and the model is vision-capable, auto-infer.
+    # Set False in production demos that don't want the latency / cost.
+    enable_vision_layout = bool(options.get("enable_vision_layout", True))
+    vision_layout_cache_dir = options.get("vision_layout_cache_dir")
+    vision_layout_max_image_dim = int(
+        options.get("vision_layout_max_image_dim", 1568)
+    )
+    vision_layout_min_confidence = float(
+        options.get("vision_layout_min_confidence", 0.5)
+    )
+
     content_markdown_raw = arguments.get("content_markdown")
     content_markdown: Path | None = (
         Path(content_markdown_raw) if content_markdown_raw else None
@@ -575,6 +590,11 @@ def _execute_native_fill(arguments: dict) -> dict:
             expand_exclude_source_slides=expand_exclude_source_slides,
             expand_toc_from_markdown=expand_toc_from_markdown,
             expand_toc_slot_grid=expand_toc_slot_grid,
+            # Phase 24 commit 3: vision-layout inference opts.
+            enable_vision_layout=enable_vision_layout,
+            vision_layout_cache_dir=vision_layout_cache_dir,
+            vision_layout_max_image_dim=vision_layout_max_image_dim,
+            vision_layout_min_confidence=vision_layout_min_confidence,
             fix_nested_picture=fix_nested_picture,
             skip_phase3_5=skip_phase3_5,
             disabled_autofixes=tuple(disabled_autofixes),

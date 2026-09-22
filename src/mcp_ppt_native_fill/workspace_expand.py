@@ -42,6 +42,53 @@ from .toc_detection import (
 log = logging.getLogger(__name__)
 
 
+def _apply_vision_layouts(
+    svg_path: Path,
+    layouts: list[dict],
+    *,
+    nn: int,
+    title: str,
+    title_en: str = "",
+) -> None:
+    """Apply one or more vision-inferred placeholder layouts to ``svg_path``.
+
+    Each layout dict comes from :class:`vision_layout.PlaceholderLayout`
+    via :func:`vision_layout.infer_template_layout`. The dict keys we
+    accept:
+      role, text (template string with ``{title}`` / ``{nn}`` placeholders
+      substituted from caller kwargs), x, y, w, h, font_size, font_weight.
+
+    The ``{title}`` / ``{nn}`` / ``{title_en}`` substitutions use the
+    current section's H1 title and the loop index — not the LLM's
+    confidence-derived template. This keeps the role / position
+    inference separate from the runtime text content.
+    """
+    if not layouts:
+        return
+    from . import svg_edits
+    fmt_vars = {"title": title, "nn": nn, "title_en": title_en}
+    for layout in layouts:
+        try:
+            text_tpl = str(layout.get("text", ""))
+            text = text_tpl.format(**fmt_vars)
+            x = float(layout["x"]); y = float(layout["y"])
+            w = float(layout["w"]); h = float(layout["h"])
+        except (KeyError, TypeError, ValueError):
+            log.warning(
+                "_apply_vision_layouts: skipping malformed layout entry %r",
+                layout,
+            )
+            continue
+        svg_edits.add_text_block(
+            svg_path,
+            shape_id=str(layout.get("shape_id", f"_vision_{layout.get('role', 'text')}")) + f"_{nn}",
+            x=x, y=y, w=w, h=h,
+            text=text,
+            font_size=int(layout.get("font_size", 32)),
+            font_weight=str(layout.get("font_weight", "normal")),
+        )
+
+
 def expand_workspace_from_markdown(
     workspace: Path,
     md_path: Path,
@@ -51,6 +98,14 @@ def expand_workspace_from_markdown(
     content_skeleton_pool: list[int] | None = None,  # NEW (Phase 14+)
     divider_edits_template: dict[str, str],
     content_edits_template: dict[str, str],
+    divider_inject_title: dict | None = None,  # Phase 23+ commit 6
+    divider_inject_part: dict | None = None,   # Phase 23+ commit 6
+    content_inject_title: dict | None = None,  # Phase 23+ commit 6
+    cover_layouts: list[dict] | None = None,    # Phase 24 commit 3 (vision)
+    toc_layouts: list[dict] | None = None,      # Phase 24 commit 3
+    divider_layouts: list[dict] | None = None,  # Phase 24 commit 3
+    content_layouts: list[dict] | None = None,  # Phase 24 commit 3
+    ending_layouts: list[dict] | None = None,   # Phase 24 commit 3
     body_bounds: str = "0 0 1280 720",
     layout: str = "3-column-cards",
     ending_svg: str | None = None,
@@ -262,6 +317,56 @@ def expand_workspace_from_markdown(
                                     nn=nn, n=i, title=title,
                                     title_en=title_en)
                 svg_edits.apply_text_edits(auth / div_svg_name, sub_edits)
+            # Phase 23+ commit 6 (2026-09-20): graphic-only templates
+            # (e.g. template_v2) have NO text shapes on the divider
+            # skeleton — the boteng defaults "shape-4"/"shape-5"
+            # above silently no-op. Inject the {title} and PART {nn}
+            # text blocks at the configured positions so the cloned
+            # divider isn't empty.
+            if divider_inject_title:
+                svg_edits.add_text_block(
+                    auth / div_svg_name,
+                    shape_id=(
+                        f"{divider_inject_title['shape_id']}_{nn}"
+                    ),
+                    x=divider_inject_title["x"],
+                    y=divider_inject_title["y"],
+                    w=divider_inject_title["w"],
+                    h=divider_inject_title["h"],
+                    text=title,
+                    font_size=divider_inject_title.get(
+                        "font_size", 60
+                    ),
+                )
+            if divider_inject_part:
+                svg_edits.add_text_block(
+                    auth / div_svg_name,
+                    shape_id=(
+                        f"{divider_inject_part['shape_id']}_{nn}"
+                    ),
+                    x=divider_inject_part["x"],
+                    y=divider_inject_part["y"],
+                    w=divider_inject_part["w"],
+                    h=divider_inject_part["h"],
+                    text=f"PART {nn}",
+                    font_size=divider_inject_part.get(
+                        "font_size", 96
+                    ),
+                )
+            # Phase 24 commit 3 (vision-inferred layouts). If the caller
+            # passed divider_layouts (a list of placeholder dicts from
+            # vision_layout.infer_template_layout), apply each one. This
+            # supersedes the legacy divider_inject_title / divider_inject_part
+            # single-placeholder helpers above; both paths are kept for
+            # backward compat.
+            if divider_layouts:
+                _apply_vision_layouts(
+                    auth / div_svg_name,
+                    divider_layouts,
+                    nn=nn,
+                    title=title,
+                    title_en=title_en,
+                )
             cloned.append(div_svg_name)
         else:
             log.warning(
@@ -283,6 +388,35 @@ def expand_workspace_from_markdown(
             cont_edits = _format(content_edits_template,
                                  nn=nn, n=i, title=title)
             svg_edits.apply_text_edits(auth / cont_svg_name, cont_edits)
+            # Phase 23+ commit 6: graphic-only content slides
+            # (e.g. template_v2 slide_04) have no text shapes; inject
+            # the section {title} so the cloned content page isn't
+            # empty.
+            if content_inject_title:
+                svg_edits.add_text_block(
+                    auth / cont_svg_name,
+                    shape_id=(
+                        f"{content_inject_title['shape_id']}_{nn}"
+                    ),
+                    x=content_inject_title["x"],
+                    y=content_inject_title["y"],
+                    w=content_inject_title["w"],
+                    h=content_inject_title["h"],
+                    text=title,
+                    font_size=content_inject_title.get(
+                        "font_size", 36
+                    ),
+                )
+            # Phase 24 commit 3 (vision-inferred layouts). Same pattern
+            # as divider_layouts above but for content slides.
+            if content_layouts:
+                _apply_vision_layouts(
+                    auth / cont_svg_name,
+                    content_layouts,
+                    nn=nn,
+                    title=title,
+                    title_en=title_en,
+                )
             # Embed auto-generated cards block
             stem = f"part{nn}"
             cards, meta = _cards_for_section(sections, stem)
