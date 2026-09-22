@@ -140,3 +140,51 @@
   - Phase 23+ 修 PowerShell stdio 子进程 race(让 template_v2 demo 跑通)
   - 实施 layer 3 layout choice(用 archetype_dedup loop heuristic,不再基于 pp_rule)
   - 写后即记 + 设计模式文档已 push (ee0dc53)
+
+
+## [2026-09-22 13:16:46] - Phase 24 Vision-LLM Template Inference (2026-09-22)
+
+- **新增文件**:
+  - docs/PHASE24_VISION_LAYOUT_INFERENCE_PLAN.md — 完整 plan (~370 行, 三层架构 + 4 commit 拆分 + 失败模式 + 风险表)
+  - src/mcp_ppt_native_fill/vision_layout.py — 新模块 (~500 行, dataclasses + cache + render + parse + validate)
+
+- **改动文件**:
+  - src/mcp_ppt_native_fill/llm_client.py — 加 llm_complete_vision_json() + _anthropic_complete_vision() + _openai_compat_complete_vision() + _is_vision_capable() + _resize_png_to_dim()
+  - src/mcp_ppt_native_fill/pipeline/handlers/markdown_expand.py — _auto_fill_template_options 加 vision 推断 + 4 个 layouts kwargs (cover_layouts, toc_layouts, divider_layouts, content_layouts, ending_layouts)
+  - src/mcp_ppt_native_fill/pipeline/orchestrator.py — un_with_pipeline 加 4 个 vision kwargs
+  - src/mcp_ppt_native_fill/server.py — 加 enable_vision_layout 等 4 个 options 暴露
+  - src/mcp_ppt_native_fill/workspace_expand.py — _apply_vision_layouts() helper + cover_layouts 等 5 个 kwargs 传给 _apply_vision_layouts
+
+- **设计模式**:
+  - **Three-Layer Stack** (Layer 1 vision client → Layer 2 vision_layout module → Layer 3 pipeline integration)
+  - **Strategy Pattern** — vision_layout 输出的 layouts 是 list[dict] (strategy), workspace_expand._apply_vision_layouts 是 consumer
+  - **Template Method** — vision_layout.infer_template_layout 固定流程 (cache → render → call → parse → save)
+  - **Decorator** — _apply_vision_layouts 包装 text substitution + svg_edits.add_text_block 调用
+
+- **借鉴 ppt-master**:
+  - data-pptx-placeholder attribute convention (ppt-master 是 selector-based)
+  - classify_slide(index, total, texts, image_count, shape_count) 不依赖 vision — 仅 metadata
+  - 但用户**拒绝 hardcode** —— 改为 vision 推断 (LLM 看 PNG 输出 layout)
+
+- **用户关键反馈**:
+  - "vender如果混乱 可以设计模式优化一下" — 接受 Phase 23+ commit 1 (AtomicPublish + decorator)
+  - "不能硬编码吧？" — 接受 caller-driven config 设计
+  - "我需要的灵活性的 而不是硬编码" — 重构 vision_layout 用 caller/auto-fill
+  - "我们可以mcp内置llm" — 决定用 m3 vision API
+  - "肯定会有llm 没有llm编排处理的效果不好" — 强调完整 LLM orchestration chain (vision → content mapping → polish)
+
+- **决策**:
+  - 默认 _is_vision_capable=True — MiniMax-M3 默认 multimodal
+  - 缓存基于 pptx content hash (16 字符 SHA256 前缀)
+  - vision prompt 严格 JSON schema + role enum + 单位规范 (no %, no px)
+  - Phase 24 commit 5+ (vision 反馈循环) 留作 Phase 25
+
+- **验证**:
+  - llm_client vision extensions: 6 个测试 (import, capability detection, resize fallback, empty/error paths)
+  - vision_layout dataclass + PNG decoder: 全部 OK
+  - E2E demo baseline: ok=True, stage=done (vision skip 因无 API key, fallback to text-shape auto-fill)
+
+- **后续**:
+  - Phase 25: vision 反馈循环 (LLM 调优 layout based on P2 lint violations)
+  - Phase 26: 端到端真实 vision 测试 (需要 LLM API key 配置)
+  - Phase 27: vendor 加 data-pptx-placeholder attribute (避免每次 vision 推断)
