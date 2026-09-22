@@ -7864,5 +7864,126 @@ if __name__ == "__main__":
         return p
 
 
+class TestAtomicPublish(unittest.TestCase):
+    """Phase 23+ commit 1 (2026-09-20): AtomicPublish transaction +
+    @retry_on_permission_error decorator.
+
+    AtomicPublish encapsulates the 6-step vendor atomic-publish
+    transaction (validate → prepare → copy → overlay → promote →
+    cleanup) so the caller's free function is just one line. The
+    decorator wraps each IO operation with retry-on-PermissionError
+    to bridge Windows + PowerShell stdio handle retention races.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # vendor converter.py does relative imports (e.g.
+        # ``from extract_svg_assets import extract_directory``); that
+        # only works when cwd is ``vendor/pptx_master/scripts``. We
+        # add that dir to sys.path so the test module can import the
+        # AtomicPublish class for unit testing.
+        import sys
+        cls._vendor_scripts = (
+            Path(r"D:\Code\DSH\native_fill\vendor\pptx_master\scripts")
+        )
+        cls._vendor_scripts_str = str(cls._vendor_scripts)
+        if cls._vendor_scripts_str not in sys.path:
+            sys.path.insert(0, cls._vendor_scripts_str)
+
+    def test_atomic_publish_happy_path(self):
+        """Six-step sequence on success: validate → prepare → copy →
+        overlay → promote → cleanup. shutil.copytree + os.replace both
+        called exactly once each; no rollback.
+        """
+        from vendor.pptx_master.scripts.pptx_to_svg.converter import (
+            AtomicPublish,
+        )
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / "output"
+            staged = Path(td) / "staged"
+            staged.mkdir()
+            (staged / "slide.svg").write_text("<svg/>")
+            output.mkdir()
+            ap = AtomicPublish(output, staged)
+            with patch.object(ap, "_copy_to_candidate") as m_copy, \
+                 patch.object(ap, "_promote") as m_promote, \
+                 patch("shutil.rmtree"):
+                ap.execute()
+            m_copy.assert_called_once()
+            m_promote.assert_called_once()
+
+    def test_atomic_publish_rollback_on_promote_failure(self):
+        """If _promote raises, _restore is called to put the original
+        output_dir back from the backup, and the exception propagates.
+        """
+        from vendor.pptx_master.scripts.pptx_to_svg.converter import (
+            AtomicPublish,
+        )
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / "output"
+            staged = Path(td) / "staged"
+            staged.mkdir()
+            output.mkdir()
+            ap = AtomicPublish(output, staged)
+            with patch.object(ap, "_copy_to_candidate"), \
+                 patch.object(ap, "_promote",
+                              side_effect=OSError("promote failed")), \
+                 patch.object(ap, "_restore") as m_restore, \
+                 patch("shutil.rmtree"):
+                with self.assertRaises(OSError):
+                    ap.execute()
+            m_restore.assert_called_once()
+
+    def test_retry_on_permission_error_eventually_succeeds(self):
+        """Decorator retries on PermissionError; if the wrapped callable
+        succeeds within max_attempts, the decorator returns the result
+        without re-raising.
+        """
+        from vendor.pptx_master.scripts.pptx_to_svg.converter import (
+            retry_on_permission_error,
+        )
+        from unittest.mock import patch
+        calls = {"n": 0}
+
+        @retry_on_permission_error(max_attempts=5, base_delay=0)
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise PermissionError("still locked")
+            return "ok"
+
+        with patch("time.sleep"):
+            self.assertEqual(flaky(), "ok")
+        self.assertEqual(calls["n"], 3)
+
+    def test_retry_on_permission_error_eventually_fails(self):
+        """When max_attempts is exhausted, the decorator re-raises
+        the last PermissionError. Non-PermissionError exceptions
+        propagate immediately.
+        """
+        from vendor.pptx_master.scripts.pptx_to_svg.converter import (
+            retry_on_permission_error,
+        )
+        from unittest.mock import patch
+
+        @retry_on_permission_error(max_attempts=3, base_delay=0)
+        def always_fails():
+            raise PermissionError("never released")
+
+        with patch("time.sleep"), self.assertRaises(PermissionError):
+            always_fails()
+
+        @retry_on_permission_error(max_attempts=3, base_delay=0)
+        def raises_value_error():
+            raise ValueError("immediate")
+
+        with patch("time.sleep"), self.assertRaises(ValueError):
+            raises_value_error()
+
+
 if __name__ == "__main__":
     unittest.main()

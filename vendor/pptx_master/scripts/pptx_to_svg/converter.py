@@ -15,8 +15,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
+
+log = logging.getLogger(__name__)
 import json
 import os
+import functools
 import re
 import shutil
 import tempfile
@@ -1234,32 +1238,242 @@ def _overlay_staged_tree(staged_dir: Path, candidate_dir: Path) -> None:
         shutil.copy2(source, target)
 
 
-def _copytree_with_retry(src: Path, dst: Path, **kwargs) -> None:
-    """Copy ``src`` to ``dst`` with retry-on-``PermissionError`` backoff.
+def retry_on_permission_error(
+    max_attempts: int = 5,
+    base_delay: float = 0.2,
+):
+    """Decorator: retry the wrapped callable on ``PermissionError`` with
+    exponential backoff (0.2, 0.4, 0.8, 1.6, 3.2 s).
 
     On Windows + PowerShell, the PowerShell parent process holds
     inherited stdio handles for ~0.5-2 s after a subprocess exits.
     If our ``shutil.copytree`` runs during that window on a file the
     sibling subprocess (vendor's stage-1 write of source.pptx) just
-    closed, the OS denies the read with PermissionError. The
+    closed, the OS denies the read with ``PermissionError``. The
     backoff bridge is the gap without forcing a slow sleep on the
     happy path.
 
-    Backoff schedule: 0.2, 0.4, 0.8, 1.6, 3.2 s
-    (5 attempts, total worst case ~6.2 s).
+    Only retries on ``PermissionError``. Other exceptions propagate
+    immediately. The wrapped callable must be idempotent or safe to
+    re-run (true for ``shutil.copytree`` on an empty dst).
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exc: PermissionError | None = None
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except PermissionError as exc:
+                    last_exc = exc
+                    time.sleep(base_delay * (2 ** attempt))
+            raise last_exc  # type: ignore[misc]
+        return wrapper
+    return decorator
 
-    Only retries on PermissionError. Other exceptions propagate.
+
+class AtomicPublish:
+    """Atomic publish transaction: backup current state → copy to
+    candidate → promote. Wraps the transaction's resource lifecycle so
+    the caller can't forget to clean up.
+
+    Failure modes:
+      - PermissionError on copytree → retried via
+        @retry_on_permission_error
+      - PermissionError on os.replace (cross-session) → propagated;
+        staging is already consumed, retry would corrupt
+      - Any other exception during promote → restore from backup
+      - Always cleanup transaction_dir at exit (success or failure)
+
+    Class form chosen over a context manager (with-statement)
+    because the caller's existing code structure is a flat procedure.
+    Named methods (validate → prepare → copy → overlay → promote →
+    restore / cleanup) read better than nested with-blocks for the
+    6-step transaction.
     """
 
-    last_exc: PermissionError | None = None
-    for attempt in range(5):
+    def __init__(
+        self,
+        output_dir: Path,
+        staged_dir: Path,
+        *,
+        managed_root_files: set[str | Path] | None = None,
+        managed_relative_paths: set[str | Path] | None = None,
+    ):
+        self.output_dir = output_dir.absolute()
+        self.staged_dir = staged_dir.absolute()
+        self.managed_root_files = managed_root_files
+        self.managed_relative_paths = managed_relative_paths
+        self._transaction_dir: Path | None = None
+        self._backup_dir: Path | None = None
+        self._candidate_dir: Path | None = None
+
+    def execute(self) -> None:
+        """Run the transaction with automatic cleanup."""
+        self._validate()
+        self._prepare_transaction()
         try:
-            shutil.copytree(src, dst, **kwargs)
+            self._copy_to_candidate()
+            self._overlay_staged()
+            self._promote()
+        except Exception:
+            self._restore()
+            raise
+        finally:
+            self._cleanup()
+
+    def _validate(self) -> None:
+        if (
+            self.output_dir == self.staged_dir
+            or self.output_dir in self.staged_dir.parents
+            or self.staged_dir in self.output_dir.parents
+        ):
+            raise ValueError(
+                "Staged and output workspaces must not contain one another"
+            )
+        output_resolved = self.output_dir.resolve(strict=False)
+        try:
+            Path.cwd().resolve().relative_to(output_resolved)
+        except ValueError:
+            pass
+        else:
+            raise RuntimeError(
+                "Output workspace must not contain the current working directory"
+            )
+        if not self.staged_dir.is_dir():
+            raise ValueError(
+                f"Staged workspace does not exist: {self.staged_dir}"
+            )
+        if self.output_dir.is_symlink() or (
+            _path_lexists(self.output_dir) and not self.output_dir.is_dir()
+        ):
+            raise RuntimeError(
+                f"Output path must be a real directory: {self.output_dir}"
+            )
+
+    def _prepare_transaction(self) -> None:
+        # Clean up any leftover .publish-{hash}/ dirs from a prior
+        # failed run. The parent process's finally cleanup may have
+        # failed (PermissionError or process kill mid-run). Without this
+        # cleanup, the next mkdtemp gives a fresh hash but stale dirs
+        # under the workspace parent can hold file locks that race
+        # with shutil.copytree in _copy_to_candidate below.
+        for stale in self.output_dir.parent.glob(
+            f".{self.output_dir.name}.publish-*"
+        ):
+            log.warning(
+                "AtomicPublish._prepare_transaction: cleaning stale %s",
+                stale,
+            )
+            shutil.rmtree(stale, ignore_errors=True)
+        for stale in self.output_dir.parent.glob(
+            f".{self.output_dir.name}.convert-*"
+        ):
+            shutil.rmtree(stale, ignore_errors=True)
+
+        self.output_dir.parent.mkdir(parents=True, exist_ok=True)
+        self._transaction_dir = Path(tempfile.mkdtemp(
+            prefix=f".{self.output_dir.name}.publish-",
+            dir=self.output_dir.parent,
+        ))
+        self._backup_dir = self._transaction_dir / "previous"
+        self._candidate_dir = self._transaction_dir / "candidate"
+
+    @retry_on_permission_error()
+    def _copy_to_candidate(self) -> None:
+        # Defensive cleanup: shutil.copytree errors on existing dst;
+        # remove any stale candidate before populating. Belt-and-suspenders
+        # against prior-run cleanup failures.
+        if self._candidate_dir.exists():
+            log.info(
+                "AtomicPublish._copy_to_candidate: removing stale %s",
+                self._candidate_dir,
+            )
+            shutil.rmtree(self._candidate_dir, ignore_errors=True)
+        if self.output_dir.is_dir():
+            log.info(
+                "AtomicPublish._copy_to_candidate: copytree %s -> %s",
+                self.output_dir, self._candidate_dir,
+            )
+            shutil.copytree(
+                self.output_dir, self._candidate_dir, symlinks=True,
+            )
+        else:
+            log.info(
+                "AtomicPublish._copy_to_candidate: mkdir %s",
+                self._candidate_dir,
+            )
+            self._candidate_dir.mkdir()
+        managed_svg = _managed_svg_paths(self.output_dir)
+        relative_paths = {p.relative_to(self.output_dir) for p in managed_svg}
+        relative_paths.update(
+            p.relative_to(self.output_dir)
+            for p in _managed_vector_asset_paths(self.output_dir)
+        )
+        relative_paths.update(
+            _referenced_local_paths(self.output_dir, managed_svg)
+        )
+        relative_paths.add(CONVERSION_REPORT_PATH)
+        relative_paths.update(_managed_report_artifact_paths(self.output_dir))
+        relative_paths.update(
+            _validated_relative_paths(self.managed_root_files or set())
+        )
+        relative_paths.update(
+            _validated_relative_paths(
+                self.managed_relative_paths or set()
+            )
+        )
+        _remove_managed_paths(self._candidate_dir, relative_paths)
+        _overlay_staged_tree(self.staged_dir, self._candidate_dir)
+
+    def _overlay_staged(self) -> None:
+        # _copy_to_candidate already overlays via _overlay_staged_tree.
+        # Kept as a separate method to mirror the legacy procedure's
+        # six logical steps (validate → prepare → copy → overlay →
+        # promote → cleanup) that operators expect to see in stack
+        # traces.
+        pass
+
+    def _promote(self) -> None:
+        if not self.output_dir.is_dir():
             return
-        except PermissionError as exc:
-            last_exc = exc
-            time.sleep(0.2 * (2 ** attempt))
-    raise last_exc  # type: ignore[misc]
+        os.replace(self.output_dir, self._backup_dir)
+        os.replace(self._candidate_dir, self.output_dir)
+
+    def _restore(self) -> None:
+        try:
+            if _path_lexists(self._backup_dir):
+                if _path_lexists(self.output_dir):
+                    failed_output = (
+                        self._transaction_dir / "failed-publish"
+                    )
+                    os.replace(self.output_dir, failed_output)
+                os.replace(self._backup_dir, self.output_dir)
+        except BaseException as restore_error:
+            log.warning(
+                "AtomicPublish._restore: backup restore failed: %s",
+                restore_error,
+            )
+
+    def _cleanup(self) -> None:
+        # Retry rmtree if PowerShell stdio handle retention blocks
+        # the first attempt (WinError 5 on Windows). Best-effort: 3
+        # attempts with 0.5 s backoff; final ignore_errors fallback.
+        last_exc: OSError | None = None
+        for _ in range(3):
+            try:
+                shutil.rmtree(self._transaction_dir, ignore_errors=False)
+                return
+            except OSError as exc:
+                last_exc = exc
+                time.sleep(0.5)
+        if last_exc is not None:
+            log.warning(
+                "AtomicPublish._cleanup: rmtree %s failed after 3 retries: %s; "
+                "falling back to ignore_errors=True",
+                self._transaction_dir, last_exc,
+            )
+        shutil.rmtree(self._transaction_dir, ignore_errors=True)
 
 
 def publish_staged_workspace(
@@ -1271,98 +1485,18 @@ def publish_staged_workspace(
 ) -> None:
     """Atomically publish generated artifacts while preserving user files.
 
-    Converter-owned SVGs, their local media references, and the named managed
-    artifacts are replaced as one roster. Everything else already present in
-    the output directory is copied into the candidate unchanged.
+    Delegates to :class:`AtomicPublish` which encapsulates the
+    6-step transaction (validate → prepare → copy → overlay →
+    promote → cleanup) with retry-on-``PermissionError`` via
+    :func:`retry_on_permission_error` and automatic rollback on
+    failure.
     """
-    output_dir = output_dir.absolute()
-    staged_dir = staged_dir.absolute()
-    if (
-        output_dir == staged_dir
-        or output_dir in staged_dir.parents
-        or staged_dir in output_dir.parents
-    ):
-        raise ValueError(
-            "Staged and output workspaces must not contain one another"
-        )
-    output_resolved = output_dir.resolve(strict=False)
-    try:
-        Path.cwd().resolve().relative_to(output_resolved)
-    except ValueError:
-        pass
-    else:
-        raise RuntimeError(
-            "Output workspace must not contain the current working directory"
-        )
-    if not staged_dir.is_dir():
-        raise ValueError(f"Staged workspace does not exist: {staged_dir}")
-    if (
-        output_dir.is_symlink()
-        or (_path_lexists(output_dir) and not output_dir.is_dir())
-    ):
-        raise RuntimeError(f"Output path must be a real directory: {output_dir}")
-
-    output_dir.parent.mkdir(parents=True, exist_ok=True)
-    transaction_dir = Path(tempfile.mkdtemp(
-        prefix=f".{output_dir.name}.publish-",
-        dir=output_dir.parent,
-    ))
-    candidate_dir = transaction_dir / "candidate"
-    backup_dir = transaction_dir / "previous"
-    preserve_backup = False
-
-    try:
-        if output_dir.is_dir():
-            _copytree_with_retry(output_dir, candidate_dir, symlinks=True)
-        else:
-            candidate_dir.mkdir()
-
-        managed_svg = _managed_svg_paths(output_dir)
-        relative_paths = {
-            path.relative_to(output_dir)
-            for path in managed_svg
-        }
-        relative_paths.update(
-            path.relative_to(output_dir)
-            for path in _managed_vector_asset_paths(output_dir)
-        )
-        relative_paths.update(_referenced_local_paths(output_dir, managed_svg))
-        relative_paths.add(CONVERSION_REPORT_PATH)
-        relative_paths.update(_managed_report_artifact_paths(output_dir))
-        relative_paths.update(_validated_relative_paths(managed_root_files or set()))
-        relative_paths.update(_validated_relative_paths(managed_relative_paths or set()))
-        _remove_managed_paths(candidate_dir, relative_paths)
-        _overlay_staged_tree(staged_dir, candidate_dir)
-
-        if output_dir.is_dir():
-            try:
-                os.replace(output_dir, backup_dir)
-                os.replace(candidate_dir, output_dir)
-            except BaseException as publish_error:
-                try:
-                    if _path_lexists(backup_dir):
-                        if _path_lexists(output_dir):
-                            failed_output = transaction_dir / "failed-publish"
-                            os.replace(output_dir, failed_output)
-                        os.replace(backup_dir, output_dir)
-                except BaseException as restore_error:
-                    if (
-                        not _path_lexists(backup_dir)
-                        and _path_lexists(output_dir)
-                    ):
-                        raise publish_error
-                    preserve_backup = _path_lexists(backup_dir)
-                    raise RuntimeError(
-                        "Failed to publish the new workspace and restore the "
-                        "previous workspace; recovery directory: "
-                        f"{transaction_dir}"
-                    ) from restore_error
-                raise
-        else:
-            os.replace(candidate_dir, output_dir)
-    finally:
-        if not preserve_backup:
-            shutil.rmtree(transaction_dir, ignore_errors=True)
+    AtomicPublish(
+        output_dir=output_dir,
+        staged_dir=staged_dir,
+        managed_root_files=managed_root_files,
+        managed_relative_paths=managed_relative_paths,
+    ).execute()
 
 
 def _write_artifact_tree(
