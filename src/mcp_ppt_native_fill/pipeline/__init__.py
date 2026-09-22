@@ -30,8 +30,8 @@ from .context import (
     PipelineError,
     PipelineHandler,
 )
-# Pipeline orchestrator (commit 2).
-from .orchestrator import Pipeline
+# Pipeline orchestrator (commit 2) + run_with_pipeline entry (commit 5).
+from .orchestrator import Pipeline, run_with_pipeline
 
 # Legacy re-exports (commits 5-6 will delete). Existing call sites
 # that import ``mcp_ppt_native_fill.pipeline.run_with_mapping`` etc.
@@ -51,6 +51,7 @@ __all__ = [
     "PipelineContext",
     "PipelineError",
     "PipelineHandler",
+    "run_with_pipeline",
     # Legacy (public)
     "PipelineState",
     "run_native_fill",

@@ -551,7 +551,7 @@ def _execute_native_fill(arguments: dict) -> dict:
                     "/ expand_content_edits_template."
                 ),
             }
-        response = pipeline.run_with_mapping(
+        response = pipeline.run_with_pipeline(
             skill_dir=skill_dir,
             source_pptx=source_pptx,
             workspace=workspace,

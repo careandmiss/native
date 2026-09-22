@@ -18,8 +18,14 @@ from __future__ import annotations
 # rather than reaching into the submodule.
 from .markdown_expand import MarkdownExpandHandler
 from .phase2_import import Phase2ImportHandler
+from .phase3_author import Phase3AuthorHandler
+from .phase4_quality import Phase4QualityHandler
+from .phase5_export import Phase5ExportHandler
 
 __all__ = [
     "MarkdownExpandHandler",
     "Phase2ImportHandler",
+    "Phase3AuthorHandler",
+    "Phase4QualityHandler",
+    "Phase5ExportHandler",
 ]

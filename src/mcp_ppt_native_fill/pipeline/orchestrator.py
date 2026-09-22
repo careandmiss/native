@@ -31,6 +31,13 @@ import logging
 from typing import ClassVar
 
 from .context import PipelineContext, PipelineError, PipelineHandler
+from .handlers import (
+    MarkdownExpandHandler,
+    Phase2ImportHandler,
+    Phase3AuthorHandler,
+    Phase4QualityHandler,
+    Phase5ExportHandler,
+)
 
 log = logging.getLogger("mcp_ppt_native_fill.pipeline.orchestrator")
 
@@ -38,11 +45,9 @@ log = logging.getLogger("mcp_ppt_native_fill.pipeline.orchestrator")
 class Pipeline:
     """Runs a list of PipelineHandlers in sequence.
 
-    Default handler chain is empty; the actual handlers
-    (Phase2Import, MarkdownExpand, Phase3Author, Phase4Quality,
-    Phase5Export) are added in commit 5. Until then, callers must
-    pass an explicit ``handlers`` list to construct a working
-    Pipeline.
+    Default handler chain is the canonical phase 1-5 sequence
+    (registered in commit 5). Callers may override with a custom
+    list for testing or partial pipelines.
 
     Example::
 
@@ -56,7 +61,13 @@ class Pipeline:
             ...
     """
 
-    DEFAULT_HANDLERS: ClassVar[list[type[PipelineHandler]]] = []
+    DEFAULT_HANDLERS: ClassVar[list[type[PipelineHandler]]] = [
+        Phase2ImportHandler,
+        MarkdownExpandHandler,
+        Phase3AuthorHandler,
+        Phase4QualityHandler,
+        Phase5ExportHandler,
+    ]
 
     def __init__(self, handlers: list[PipelineHandler] | None = None):
         if handlers is None:
@@ -109,4 +120,110 @@ class Pipeline:
         return ctx
 
 
-__all__ = ["Pipeline"]
+__all__ = ["Pipeline", "run_with_pipeline"]
+
+
+def run_with_pipeline(
+    *,
+    skill_dir,
+    source_pptx,
+    workspace,
+    output_pptx,
+    content_mapping,
+    new_content_blocks=None,
+    page_plan=None,
+    content_markdown=None,
+    enable_llm_planner=False,
+    inheritance_mode="both",
+    skip_phase3_5=False,
+    disabled_autofixes=(),
+    auto_fix=True,
+    max_fix_iterations=3,
+    validate_strict=True,
+    quality_strict=False,
+    preflight_strict=None,
+    render_previews=False,
+    llm_layout_hints=None,
+    enable_chrome_topbar=True,
+    enable_chrome_footer=True,
+    enable_ppt_master_archetypes=True,
+    expand_skeleton_divider=None,
+    expand_skeleton_content=None,
+    expand_divider_edits_template=None,
+    expand_content_edits_template=None,
+    expand_body_bounds="0 0 1280 720",
+    expand_ending_svg=None,
+    expand_part_names=None,
+    expand_divider_subtitle_template=None,
+    expand_section_title_en_map=None,
+    expand_exclude_source_slides=None,
+    expand_toc_from_markdown=False,
+    expand_toc_slot_grid=None,
+    fix_nested_picture=False,
+    clean_workspace=False,
+) -> dict[str, Any]:
+    """Top-level Pipeline entry point. Construct PipelineContext
+    from input kwargs, run the default handler chain, return the
+    final response dict.
+
+    This is the Phase 22 Pipeline Pattern replacement for the
+    legacy ``pipeline.run_with_mapping`` (a 400-line function that
+    manually inlined phases 1-5). It runs vendor exactly once per
+    call (Phase2ImportHandler is the only handler that spawns
+    vendor), eliminating the Phase 21 ``.publish-{hash}/`` file-lock
+    bug.
+
+    server.py will switch to this entry point at commit 6
+    (``run_with_pipeline`` replaces ``run_with_mapping`` in the
+    ``_execute_native_fill`` dispatch).
+    """
+    from .context import PipelineContext
+    from ..pipeline import PipelineState  # parent package
+
+    state = PipelineState()
+    options = {
+        "inheritance_mode": inheritance_mode,
+        "enable_llm_planner": enable_llm_planner,
+        "skip_phase3_5": skip_phase3_5,
+        "disabled_autofixes": disabled_autofixes,
+        "auto_fix": auto_fix,
+        "max_fix_iterations": max_fix_iterations,
+        "validate_strict": validate_strict,
+        "quality_strict": quality_strict,
+        "preflight_strict": preflight_strict,
+        "render_previews": render_previews,
+        "llm_layout_hints": llm_layout_hints,
+        "enable_chrome_topbar": enable_chrome_topbar,
+        "enable_chrome_footer": enable_chrome_footer,
+        "enable_ppt_master_archetypes": enable_ppt_master_archetypes,
+        "fix_nested_picture": fix_nested_picture,
+        "clean_workspace": clean_workspace,
+        "content_markdown": str(content_markdown) if content_markdown else None,
+        "expand_skeleton_divider": expand_skeleton_divider,
+        "expand_skeleton_content": expand_skeleton_content,
+        "expand_divider_edits_template": expand_divider_edits_template,
+        "expand_content_edits_template": expand_content_edits_template,
+        "expand_body_bounds": expand_body_bounds,
+        "expand_ending_svg": expand_ending_svg,
+        "expand_part_names": expand_part_names,
+        "expand_divider_subtitle_template": expand_divider_subtitle_template,
+        "expand_section_title_en_map": expand_section_title_en_map,
+        "expand_exclude_source_slides": expand_exclude_source_slides,
+        "expand_toc_from_markdown": expand_toc_from_markdown,
+        "expand_toc_slot_grid": expand_toc_slot_grid,
+        "new_content_blocks": new_content_blocks,
+    }
+    ctx = PipelineContext(
+        state=state,
+        source_pptx=source_pptx,
+        workspace=workspace,
+        output_pptx=output_pptx,
+        skill_dir=skill_dir,
+        options=options,
+    )
+    pipeline = Pipeline()
+    ctx = pipeline.run(ctx)
+
+    # Map ctx → response dict (matches the legacy _finalize shape).
+    from ..pipeline import _finalize  # legacy helper for response shape
+    return _finalize(ctx.state)

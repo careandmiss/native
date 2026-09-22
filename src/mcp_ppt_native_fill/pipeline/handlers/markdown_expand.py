@@ -129,6 +129,13 @@ class MarkdownExpandHandler(PipelineHandler):
                 existing = content_mapping.get(toc_svg, {})
                 content_mapping[toc_svg] = {**existing, **toc_edits}
                 ctx.set("content_mapping", content_mapping)
+        # Surface the (possibly TOC-augmented) content_mapping so
+        # downstream handlers (Phase3Author) can read it. Without
+        # this, MarkdownExpandHandler's TOC edits never reach
+        # phase3_author.
+        if "content_mapping" not in ctx.handler_outputs:
+            ctx.set("content_mapping",
+                    dict(opts.get("content_mapping") or {}))
 
         ctx.state.stage = "plan_realize"
         return ctx
