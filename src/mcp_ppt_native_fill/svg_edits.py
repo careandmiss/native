@@ -284,7 +284,7 @@ def add_text_block(
     font_weight: str = "bold",
     fill: str = "#000000",
     anchor: str = "middle",
-    alignment_baseline: str = "middle",
+    alignment_baseline: str = "middle",  # kept for API compat; ignored
 ) -> None:
     """Append a new ``<g>`` with a single ``<text>`` element inside.
 
@@ -298,6 +298,14 @@ def add_text_block(
     ``data-pptx-bounds`` attribute (recognised by the semantic-shape
     machinery) and a single ``<text>`` child.
 
+    Vendor attribute compliance (Phase 25 commit 1, 2026-09-22):
+    ``ppt-master``'s ``svg_to_pptx`` preflight rejects a closed set of
+    text attributes — most importantly ``dominant-baseline``. We must
+    avoid that attribute and instead use absolute y-coordinates for
+    vertical centering (the vendor maps SVG ``<text y>`` to the PPTX
+    text-frame **baseline** position, not the top edge, so a baseline-
+    relative y is the correct way to vertically center).
+
     Parameters
     ----------
     svg_path:
@@ -306,24 +314,28 @@ def add_text_block(
         Synthetic shape id (any non-conflicting id; must be unique within
         the SVG).
     x, y, w, h:
-        SVG-coordinate bounds in EMU. ``x``/``y`` are top-left, ``w``/``h``
-        are width/height. ``0 0 1280 720`` is the standard canvas; use
-        coordinates within that box.
+        SVG-coordinate bounds. ``x``/``y`` are top-left, ``w``/``h`` are
+        width/height. ``0 0 1280 720`` is the standard canvas.
     text:
         The visible text to inject. ``{nn}`` and ``{title}`` are templated
         placeholders that ``workspace_expand`` substitutes per section;
         pass the template string unchanged and the caller fills in values.
-    font_size, font_weight, fill, anchor, alignment_baseline:
+    font_size, font_weight, fill, anchor:
         Text rendering style. Defaults give a centered bold title.
+    alignment_baseline:
+        DEPRECATED — kept for API compat but ignored. The vendor
+        ``svg_to_pptx`` rejects ``dominant-baseline``; vertical centering
+        is achieved by setting ``y`` to a baseline-shifted coordinate.
     """
-    # Use absolute coords (vendor svg_to_pptx rejects "%" units).
-    # text-anchor "middle" + x = cx (center of bounds); dominant-baseline
-    # "central" centers the glyph baseline vertically within y.
+    # Horizontal center via text-anchor="middle" + x = cx (center of bounds).
+    # Vertical center via y = baseline_y. The vendor maps <text y> to the
+    # PPTX text-frame baseline position, so to place the visual middle
+    # of the glyphs at the geometric center of the bounds we shift down
+    # by ~35% of font-size (empirical baseline-vs-cap-height ratio).
     cx = x + w / 2
-    cy = y + h / 2
+    baseline_y = y + h / 2 + font_size * 0.35
     inner = (
-        f'<text x="{cx}" y="{cy}" text-anchor="{anchor}" '
-        f'dominant-baseline="{alignment_baseline}" '
+        f'<text x="{cx}" y="{baseline_y}" text-anchor="{anchor}" '
         f'font-size="{font_size}" font-weight="{font_weight}" '
         f'fill="{fill}" '
         f'data-pptx-edit-name="{shape_id}">'

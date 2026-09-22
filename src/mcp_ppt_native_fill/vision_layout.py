@@ -195,11 +195,9 @@ def _load_cached(pptx_path: Path, cache_dir: Path) -> TemplateLayoutProfile | No
 
 def _save_cached(profile: TemplateLayoutProfile, cache_dir: Path) -> Path:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    p = cache_path = _cache_path(
-        # Re-derive path from profile.template_hash + .json suffix
-        Path(_cache_filename_for_hash(profile.template_hash)),
-        cache_dir,
-    )
+    # profile.template_hash is the SHA256[:16] of the pptx contents —
+    # match the same naming scheme as _cache_path / _load_cached.
+    p = cache_dir / f"{profile.template_hash}-{CACHE_VERSION}.json"
     payload = _serialize(profile)
     p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return p
@@ -234,13 +232,19 @@ def render_slide_pngs(
     svg_dir.mkdir(parents=True, exist_ok=True)
     png_dir.mkdir(parents=True, exist_ok=True)
 
+    # Resolve vendor pptx_to_svg.py relative to THIS module's path so we
+    # work no matter where the caller invokes us from. The module lives
+    # at ``src/mcp_ppt_native_fill/vision_layout.py`` so the project
+    # root is 3 ``.parent`` calls away.
+    _here = Path(__file__).resolve()
+    project_root = _here.parent.parent.parent
     vendor_pptx_to_svg = (
-        Path(pptx_path).parent.parent
-        / "vendor" / "pptx_master" / "scripts" / "pptx_to_svg.py"
+        project_root / "vendor" / "pptx_master" / "scripts" / "pptx_to_svg.py"
     )
     if not vendor_pptx_to_svg.exists():
         raise FileNotFoundError(
-            f"vendor pptx_to_svg not found at {vendor_pptx_to_svg}"
+            f"vendor pptx_to_svg not found at {vendor_pptx_to_svg} "
+            f"(project_root resolved to {project_root})"
         )
 
     # Vendor invocation uses cwd = scripts dir so relative imports work.

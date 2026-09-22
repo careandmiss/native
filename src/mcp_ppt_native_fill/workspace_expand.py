@@ -66,11 +66,34 @@ def _apply_vision_layouts(
     if not layouts:
         return
     from . import svg_edits
-    fmt_vars = {"title": title, "nn": nn, "title_en": title_en}
-    for layout in layouts:
+    fmt_vars = {
+        "title": title, "nn": nn, "title_en": title_en,
+        # Common vision-inferred placeholders the LLM may emit. We map
+        # these to the section title or empty string so ``str.format``
+        # never raises KeyError — even if the LLM emits a template
+        # token we don't have a value for.
+        "doc_title": title,
+        "doc_subtitle": "",
+        "body": "",
+        "section_NN_title": title,
+        "section_NN": title,
+        "section_NN_en": title_en,
+        "closing": "",
+    }
+    # Track shape_ids emitted in this SVG so the LLM's occasionally
+    # duplicated role names don't collide. We suffix with a per-call
+    # counter so the final id is always unique within a single SVG.
+    used_ids: set[str] = set()
+    for layout_idx, layout in enumerate(layouts):
         try:
             text_tpl = str(layout.get("text", ""))
-            text = text_tpl.format(**fmt_vars)
+            # ``format_map`` with a default-dict lets unknown tokens
+            # pass through literally (e.g. ``{section_3_title}`` becomes
+            # ``{section_3_title}`` if the section number doesn't match).
+            class _SafeDict(dict):
+                def __missing__(self, key):  # type: ignore[override]
+                    return "{" + key + "}"
+            text = text_tpl.format_map(_SafeDict(fmt_vars))
             x = float(layout["x"]); y = float(layout["y"])
             w = float(layout["w"]); h = float(layout["h"])
         except (KeyError, TypeError, ValueError):
@@ -79,9 +102,20 @@ def _apply_vision_layouts(
                 layout,
             )
             continue
+        role = str(layout.get("role", "text"))
+        base_id = str(layout.get("shape_id") or f"_vision_{role}")
+        # Disambiguate: if the LLM emitted two placeholders with the
+        # same role for the same slide, we still need unique top-level
+        # <g> ids in the resulting SVG (svg_to_pptx rejects duplicates).
+        shape_id = f"{base_id}_{nn}"
+        suffix = 0
+        while shape_id in used_ids:
+            suffix += 1
+            shape_id = f"{base_id}_{nn}_{suffix}"
+        used_ids.add(shape_id)
         svg_edits.add_text_block(
             svg_path,
-            shape_id=str(layout.get("shape_id", f"_vision_{layout.get('role', 'text')}")) + f"_{nn}",
+            shape_id=shape_id,
             x=x, y=y, w=w, h=h,
             text=text,
             font_size=int(layout.get("font_size", 32)),
