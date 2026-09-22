@@ -60,7 +60,7 @@ class Phase2ImportHandler(PipelineHandler):
         if not res.ok:
             raise PipelineError(
                 f"phase2 vendor failed exit={res.exit} "
-                f"stderr_tail={res.stderr[-400:]}"
+                f"stderr_tail={res.stderr[-2000:]}"
             )
 
         ctx.state.stage = "imported"

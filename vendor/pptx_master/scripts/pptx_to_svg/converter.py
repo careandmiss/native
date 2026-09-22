@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from html import unescape
@@ -1233,6 +1234,34 @@ def _overlay_staged_tree(staged_dir: Path, candidate_dir: Path) -> None:
         shutil.copy2(source, target)
 
 
+def _copytree_with_retry(src: Path, dst: Path, **kwargs) -> None:
+    """Copy ``src`` to ``dst`` with retry-on-``PermissionError`` backoff.
+
+    On Windows + PowerShell, the PowerShell parent process holds
+    inherited stdio handles for ~0.5-2 s after a subprocess exits.
+    If our ``shutil.copytree`` runs during that window on a file the
+    sibling subprocess (vendor's stage-1 write of source.pptx) just
+    closed, the OS denies the read with PermissionError. The
+    backoff bridge is the gap without forcing a slow sleep on the
+    happy path.
+
+    Backoff schedule: 0.2, 0.4, 0.8, 1.6, 3.2 s
+    (5 attempts, total worst case ~6.2 s).
+
+    Only retries on PermissionError. Other exceptions propagate.
+    """
+
+    last_exc: PermissionError | None = None
+    for attempt in range(5):
+        try:
+            shutil.copytree(src, dst, **kwargs)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            time.sleep(0.2 * (2 ** attempt))
+    raise last_exc  # type: ignore[misc]
+
+
 def publish_staged_workspace(
     output_dir: Path,
     staged_dir: Path,
@@ -1284,7 +1313,7 @@ def publish_staged_workspace(
 
     try:
         if output_dir.is_dir():
-            shutil.copytree(output_dir, candidate_dir, symlinks=True)
+            _copytree_with_retry(output_dir, candidate_dir, symlinks=True)
         else:
             candidate_dir.mkdir()
 

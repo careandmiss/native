@@ -18,10 +18,10 @@ SRC = HERE.parent / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-DEFAULT_TEMPLATE = Path(r"D:\Code\tst\native_fill\柏腾ppt模版.pptx")
-DEFAULT_MD = Path(r"D:\Code\tst\native_fill\3山西柏腾科技有限公司采购制度.md")
-DEFAULT_OUTPUT = HERE.parent / "projects" / "boteng_采购制度_v2_out.pptx"
-DEFAULT_WORKSPACE = HERE.parent / "projects" / "boteng_采购制度_v2_workspace"
+DEFAULT_TEMPLATE = Path(r"D:\Code\DSH\native_fill\柏腾ppt模版.pptx")
+DEFAULT_MD = Path(r"D:\Code\DSH\native_fill\5山西柏腾科技有限公司商务部工作手册2.md")
+DEFAULT_OUTPUT = HERE.parent / "projects" / "boteng_demo_out.pptx"
+DEFAULT_WORKSPACE = HERE.parent / "projects" / "boteng_demo_workspace"
 
 TOC_TOP = {"rows": 3, "cols": 2}
 DIVIDER_EDITS = {"shape-4": "PART {nn}", "shape-5": "{title}"}
@@ -30,12 +30,13 @@ DIVIDER_EDITS = {"shape-4": "PART {nn}", "shape-5": "{title}"}
 # template. We KEEP the template's original <g id="shape-70"> frame
 # (font / size / color / position) — only the <text> body changes.
 SECTION_TITLE_EN = {
-    "前言": "Preface",
-    "一、目的": "Purpose",
-    "二、适用范围": "Application Scope",
-    "三、基本原则": "Basic Principles",
-    "四、工作程序": "Working Procedure",
-    "附件：": "Appendix",
+    "一、工作手册的原则": "Working Manual Principles",
+    "工作手册适用范围": "Application Scope",
+    "三、工作手册规范性文件": "Specification Documents",
+    "四、职能部门权责": "Department Authority",
+    "部门组织架构": "Organization",
+    "二、KTR产品订货流程": "KTR Product Ordering",
+    "二、KTR订货流程": "KTR Ordering Procedure",
 }
 DIVIDER_SUBTITLE = {"shape-70": "{title_en}"}
 CONTENT_EDITS = {"shape-17": "{title}"}
