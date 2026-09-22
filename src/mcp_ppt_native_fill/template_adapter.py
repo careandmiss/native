@@ -233,13 +233,39 @@ def _detect_body_bounds(slide) -> str:
 
 
 def _infer_slot_role(shape, current_text: str) -> str:
-    """Infer a text slot's semantic role from its shape name + current
-    text. Mirrors the data-pptx-placeholder convention from
-    ppt-master/scripts/template_text_slots.py but uses PPTX-native
-    shape.name (since we don't require a prior svg conversion)."""
+    """Infer a text slot's semantic role. Combines four signals:
+
+      1. Placeholder type (authoritative when available)
+      2. Shape name keywords (legacy heuristic, robust for boteng)
+      3. Geometry (y ratio vs slide height, body area)
+      4. Text content heuristics ("PART " label vs long body text)
+
+    PPTX placeholder types (PP_PLACEHOLDER enum):
+      TITLE / CENTER_TITLE → "title"
+      SUBTITLE               → "subtitle"
+      BODY                   → "body"
+
+    Geometry fallback:
+      y_ratio < 0.15 (top of slide)    → "title"
+      y_ratio > 0.85 (bottom)         → "footer"
+      body area > 1.5 sq inches       → "body"
+    """
+    # 1. Placeholder type (authoritative)
+    if getattr(shape, "is_placeholder", False):
+        try:
+            from pptx.enum.shapes import PP_PLACEHOLDER  # type: ignore
+            ph_type = shape.placeholder_format.type
+            if ph_type in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE):
+                return "title"
+            if ph_type == PP_PLACEHOLDER.SUBTITLE:
+                return "subtitle"
+            if ph_type == PP_PLACEHOLDER.BODY:
+                return "body"
+        except Exception:
+            pass  # not all templates use real placeholders
+
+    # 2. Shape-name keyword heuristic (legacy)
     name_lower = (shape.name or "").lower()
-    text_lower = current_text.lower()
-    
     if any(kw.lower() in name_lower for kw in _TITLE_KEYWORDS):
         return "title"
     if any(kw.lower() in name_lower for kw in _PART_LABEL_KEYWORDS):
@@ -250,10 +276,32 @@ def _infer_slot_role(shape, current_text: str) -> str:
         return "footer"
     if any(kw.lower() in name_lower for kw in _BODY_KEYWORDS):
         return "body"
-    # Fall back to text content heuristics.
+
+    # 3. Geometry heuristic (no name keyword hit)
+    try:
+        slide_height = shape.part.slide.part_height / 914400  # inches
+    except Exception:
+        slide_height = 7.5
+    y_in = _emu_to_inches(getattr(shape, "top", 0) or 0)
+    y_ratio = y_in / slide_height if slide_height else 0
+
     if "PART " in current_text or "PART\n" in current_text:
         return "part_label"
-    if current_text and len(current_text) <= 30 and not any(c in current_text for c in "。.，,！!？?；;"):
+
+    if y_ratio < 0.15 and current_text:
+        return "title"
+    if y_ratio > 0.85:
+        return "footer"
+
+    w = _emu_to_inches(getattr(shape, "width", 0) or 0)
+    h = _emu_to_inches(getattr(shape, "height", 0) or 0)
+    if w * h > 1.5 and 0.2 < y_ratio < 0.7:
+        return "body"
+
+    # 4. Text-content heuristic (legacy)
+    if current_text and len(current_text) <= 30 and not any(
+        c in current_text for c in "。.，,！!？?；;"
+    ):
         return "title"
     return "text"
 
