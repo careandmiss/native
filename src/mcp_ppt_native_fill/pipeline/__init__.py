@@ -30,6 +30,8 @@ from .context import (
     PipelineError,
     PipelineHandler,
 )
+# Pipeline orchestrator (commit 2).
+from .orchestrator import Pipeline
 
 # Legacy re-exports (commits 5-6 will delete). Existing call sites
 # that import ``mcp_ppt_native_fill.pipeline.run_with_mapping`` etc.
@@ -45,6 +47,7 @@ from ._legacy import (  # noqa: F401
 
 __all__ = [
     # New
+    "Pipeline",
     "PipelineContext",
     "PipelineError",
     "PipelineHandler",

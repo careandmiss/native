@@ -7390,6 +7390,158 @@ class TestPipelineContext(unittest.TestCase):
         self.assertFalse(ctx2.has("foo"))
 
 
+class TestPipeline(unittest.TestCase):
+    """Phase 22 commit 2 (2026-09-20): Pipeline orchestrator.
+
+    The Pipeline class runs handlers in order, respecting skip
+    mechanisms and stop_after lifecycle. Tested with synthetic
+    handlers (no vendor / SVG I/O) — the real handlers come in
+    commits 3-5.
+    """
+
+    def _make_ctx(self):
+        from mcp_ppt_native_fill.pipeline import PipelineContext
+        from mcp_ppt_native_fill.pipeline import PipelineState
+        return PipelineContext(
+            state=PipelineState(),
+            source_pptx=Path("/tmp/test.pptx"),
+            workspace=Path("/tmp/ws"),
+            output_pptx=Path("/tmp/out.pptx"),
+            skill_dir=Path("/tmp/skill"),
+            options={},
+        )
+
+    def _record_handler(self, name: str, writes: dict[str, Any] | None = None,
+                         skip_returns: bool = False,
+                         shared_order: list[str] | None = None) -> Any:
+        """Build a synthetic handler that records run order and
+        writes to ctx.handler_outputs.
+
+        If ``shared_order`` is given, all handlers append to the
+        same list, so tests can assert the full chain order at once.
+        """
+        from mcp_ppt_native_fill.pipeline import PipelineHandler
+        if shared_order is None:
+            shared_order = []
+        name_ = name
+        skip_ = skip_returns
+        writes_ = writes or {}
+
+        class _H(PipelineHandler):
+            name = name_
+
+            def run(inner_self, ctx):
+                shared_order.append(name_)
+                for k, v in writes_.items():
+                    ctx.set(k, v)
+                return ctx
+
+            def skip(inner_self, ctx):
+                return skip_
+
+        return _H(), shared_order
+
+    def test_pipeline_runs_handlers_in_order(self):
+        """Handlers run in the order they appear in the list.
+        Each handler's output is visible to the next."""
+        from mcp_ppt_native_fill.pipeline import Pipeline
+        order: list[str] = []
+        h1, _ = self._record_handler("a", writes={"x": 1}, shared_order=order)
+        h2, _ = self._record_handler("b", writes={"y": "from-b"}, shared_order=order)
+        h3, _ = self._record_handler("c", shared_order=order)
+        pipe = Pipeline([h1, h2, h3])
+        ctx = self._make_ctx()
+        ctx = pipe.run(ctx)
+        self.assertEqual(order, ["a", "b", "c"])
+        # inter-handler outputs visible to next handler
+        self.assertEqual(ctx.get("x"), 1)
+        self.assertEqual(ctx.get("y"), "from-b")
+
+    def test_pipeline_stops_on_first_failure(self):
+        """PipelineError raised by handler N stops the chain at N.
+        Subsequent handlers do not run. state.stage = 'failed'.
+        on_failure is called on the failing handler."""
+        from mcp_ppt_native_fill.pipeline import (
+            Pipeline, PipelineError, PipelineHandler,
+        )
+        run_log: list[str] = []
+
+        class FailingHandler(PipelineHandler):
+            name = "fails"
+
+            def run(inner_self, ctx):
+                run_log.append("fails")
+                raise PipelineError("boom")
+
+            def on_failure(inner_self, ctx, exc):
+                run_log.append("on_failure")
+
+        class NeverRunsHandler(PipelineHandler):
+            name = "never"
+
+            def run(inner_self, ctx):
+                run_log.append("never")  # MUST NOT appear
+                return ctx
+
+        pipe = Pipeline([FailingHandler(), NeverRunsHandler()])
+        ctx = self._make_ctx()
+        ctx = pipe.run(ctx)
+        self.assertEqual(ctx.state.stage, "failed")
+        self.assertIn("fails: boom", ctx.state.errors)
+        # on_failure was called, but NeverRunsHandler.run() was not.
+        self.assertEqual(run_log, ["fails", "on_failure"])
+
+    def test_pipeline_respects_skip_handlers_set(self):
+        """Handlers listed in ctx.skip_handlers are skipped."""
+        from mcp_ppt_native_fill.pipeline import Pipeline
+        order: list[str] = []
+        h1, _ = self._record_handler("a", shared_order=order)
+        h2, _ = self._record_handler("b", shared_order=order)
+        h3, _ = self._record_handler("c", shared_order=order)
+        pipe = Pipeline([h1, h2, h3])
+        ctx = self._make_ctx()
+        ctx.skip_handlers = {"b"}
+        ctx = pipe.run(ctx)
+        self.assertEqual(order, ["a", "c"])  # b skipped
+
+    def test_pipeline_respects_handler_skip_method(self):
+        """A handler returning True from skip() is skipped."""
+        from mcp_ppt_native_fill.pipeline import Pipeline
+        order: list[str] = []
+        h1, _ = self._record_handler("a", shared_order=order)
+        h2, _ = self._record_handler("b", skip_returns=True, shared_order=order)
+        h3, _ = self._record_handler("c", shared_order=order)
+        pipe = Pipeline([h1, h2, h3])
+        ctx = self._make_ctx()
+        ctx = pipe.run(ctx)
+        self.assertEqual(order, ["a", "c"])
+
+    def test_pipeline_respects_stop_after(self):
+        """When a handler sets ctx.stop_after to its own name, the
+        chain stops AFTER it (so its outputs are visible)."""
+        from mcp_ppt_native_fill.pipeline import Pipeline, PipelineHandler
+        order: list[str] = []
+
+        class StopAfterSelf(PipelineHandler):
+            name = "b"
+
+            def run(inner_self, ctx):
+                order.append("b")
+                ctx.set("second", True)
+                ctx.stop_after = "b"
+                return ctx
+
+        h1, _ = self._record_handler("a", writes={"first": True}, shared_order=order)
+        h3, _ = self._record_handler("c", shared_order=order)
+        pipe = Pipeline([h1, StopAfterSelf(), h3])
+        ctx = self._make_ctx()
+        ctx = pipe.run(ctx)
+        self.assertEqual(order, ["a", "b"])  # c did not run
+        # Both handler outputs preserved.
+        self.assertEqual(ctx.get("first"), True)
+        self.assertEqual(ctx.get("second"), True)
+
+
 if __name__ == "__main__":
     unittest.main()
 
