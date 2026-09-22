@@ -7542,6 +7542,141 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual(ctx.get("second"), True)
 
 
+class TestPhase2ImportHandler(unittest.TestCase):
+    """Phase 22 commit 3 (2026-09-20): Phase2ImportHandler.
+
+    The single handler that spawns vendor/pptx_to_svg.py. Tests
+    use a monkeypatched ``runner.run_pptx_to_svg`` to verify
+    behavior without invoking the vendor subprocess (which is slow
+    and triggers the PowerShell file-lock bug on some templates).
+    """
+
+    def _make_ctx(self, workspace: Path | None = None):
+        from mcp_ppt_native_fill.pipeline import (
+            PipelineContext, PipelineState,
+        )
+        ws = workspace or Path("/tmp/ws")
+        return PipelineContext(
+            state=PipelineState(),
+            source_pptx=Path("/tmp/test.pptx"),
+            workspace=ws,
+            output_pptx=Path("/tmp/out.pptx"),
+            skill_dir=Path("/tmp/skill"),
+            options={"inheritance_mode": "both"},
+        )
+
+    def test_handler_runs_vendor_exactly_once(self):
+        """The handler must call runner.run_pptx_to_svg exactly
+        once per Pipeline.run(). This is the hard assertion that
+        prevents the Phase 21 vendor publish-{hash} file-lock bug:
+        the legacy code spawned vendor twice (run_with_mapping +
+        run_native_fill) which races on the temp publish dir.
+        """
+        from mcp_ppt_native_fill.pipeline import Pipeline, PipelineError
+        from mcp_ppt_native_fill.pipeline.handlers import (
+            Phase2ImportHandler,
+        )
+
+        call_count = {"n": 0}
+
+        class FakeScriptResult:
+            ok = True
+            exit = 0
+            warnings: list = []
+            parsed: dict = {"slides_converted": 5}
+            stderr = ""
+
+        def fake_run(*args, **kwargs):
+            call_count["n"] += 1
+            return FakeScriptResult()
+
+        from mcp_ppt_native_fill import runner as real_runner
+        original = real_runner.run_pptx_to_svg
+        real_runner.run_pptx_to_svg = fake_run
+        try:
+            pipe = Pipeline([Phase2ImportHandler()])
+            ctx = self._make_ctx()
+            pipe.run(ctx)
+        finally:
+            real_runner.run_pptx_to_svg = original
+
+        self.assertEqual(call_count["n"], 1,
+                         "vendor must spawn exactly once per pipeline.run()")
+
+    def test_handler_fails_cleanly_on_vendor_error(self):
+        """When vendor returns ok=False, the handler must raise
+        PipelineError and the chain must stop (no further handlers
+        run). state.stage must be 'failed' and state.errors populated.
+        """
+        from mcp_ppt_native_fill.pipeline import Pipeline, PipelineHandler, PipelineError
+        from mcp_ppt_native_fill.pipeline.handlers import (
+            Phase2ImportHandler,
+        )
+
+        class FakeScriptResult:
+            ok = False
+            exit = 1
+            warnings: list = []
+            parsed: dict = {}
+            stderr = "vendor error"
+
+        def fake_run(*a, **kw):
+            return FakeScriptResult()
+
+        from mcp_ppt_native_fill import runner as real_runner
+        original = real_runner.run_pptx_to_svg
+        real_runner.run_pptx_to_svg = fake_run
+        try:
+            class AfterHandler(PipelineHandler):
+                name = "after"
+
+                def run(inner_self, ctx):
+                    raise AssertionError("must not run after phase2 failure")
+
+            pipe = Pipeline([Phase2ImportHandler(), AfterHandler()])
+            ctx = self._make_ctx()
+            ctx = pipe.run(ctx)
+        finally:
+            real_runner.run_pptx_to_svg = original
+
+        self.assertEqual(ctx.state.stage, "failed")
+        self.assertTrue(
+            any("phase2 vendor failed" in e for e in ctx.state.errors),
+            f"expected phase2 error in {ctx.state.errors!r}",
+        )
+
+    def test_handler_emits_vendor_result_to_context(self):
+        """On success, the handler must populate ctx.handler_outputs
+        with 'vendor_result' for downstream handlers to read."""
+        from mcp_ppt_native_fill.pipeline import Pipeline
+        from mcp_ppt_native_fill.pipeline.handlers import (
+            Phase2ImportHandler,
+        )
+
+        class FakeScriptResult:
+            ok = True
+            exit = 0
+            warnings: list = []
+            parsed: dict = {"slides_converted": 7}
+            stderr = ""
+
+        def fake_run(*a, **kw):
+            return FakeScriptResult()
+
+        from mcp_ppt_native_fill import runner as real_runner
+        original = real_runner.run_pptx_to_svg
+        real_runner.run_pptx_to_svg = fake_run
+        try:
+            pipe = Pipeline([Phase2ImportHandler()])
+            ctx = self._make_ctx()
+            pipe.run(ctx)
+        finally:
+            real_runner.run_pptx_to_svg = original
+
+        self.assertEqual(ctx.state.stage, "imported")
+        self.assertEqual(ctx.get("vendor_result"), {"slides_converted": 7})
+
+
 if __name__ == "__main__":
     unittest.main()
 
