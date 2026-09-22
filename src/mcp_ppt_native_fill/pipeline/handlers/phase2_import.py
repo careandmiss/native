@@ -46,6 +46,16 @@ class Phase2ImportHandler(PipelineHandler):
         inheritance_mode = ctx.options.get("inheritance_mode", "both")
         timeout_ms = ctx.options.get("timeout_ms", 120_000)
 
+        # Phase 23+ Windows stdio handle retention: the parent
+        # subprocess (PowerShell or mcp_ppt_native_fill demo) holds a
+        # file handle on `output_dir/sources/source.pptx` for ~0.5-2 s
+        # after vendor exits. Adding 0.3 s before vendor spawn lets
+        # the prior OS-level handle release complete; this prevents
+        # Phase 23's `_copytree_with_retry` retry chain from
+        # exhausting on the second template_v2 demo run.
+        import time as _time
+        _time.sleep(0.3)
+
         # ★ The single vendor spawn per pipeline.run(). No other
         # handler calls runner.run_pptx_to_svg(); only MarkdownExpand
         # writes to the workspace, and it doesn't re-convert.
@@ -60,8 +70,25 @@ class Phase2ImportHandler(PipelineHandler):
         if not res.ok:
             raise PipelineError(
                 f"phase2 vendor failed exit={res.exit} "
-                f"stderr_tail={res.stderr[-2000:]}"
+                f"stderr_tail={res.stderr[-2000:]}\nstderr_full=\n{res.stderr}"
             )
+
+        # Phase 23+ commit 2 (on_success cleanup): PowerShell stdio
+        # handle retention can leave vendor's transaction_dir behind
+        # in a half-cleaned state (rmtree raised WinError 5 because
+        # candidate/sources/source.pptx was still held). Retry-rmtree
+        # inside _cleanup didn't fully recover. As a belt-and-suspenders
+        # fix: after a successful vendor run, aggressively clean any
+        # leftover .publish-* / .convert-* dirs. The next pipeline.run()
+        # gets a clean workspace and won't hit the same race.
+        for pattern in (".publish-*", ".convert-*"):
+            for stale in ctx.workspace.parent.glob(
+                f".{ctx.workspace.name}{pattern}"
+            ):
+                log.info(
+                    "phase2.on_success: cleaning stale %s", stale,
+                )
+                shutil.rmtree(stale, ignore_errors=True)
 
         ctx.state.stage = "imported"
         ctx.state.warnings.extend(getattr(res, "warnings", []))

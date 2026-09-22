@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 import json
 import os
 import functools
+import os
 import re
 import shutil
 import tempfile
@@ -1378,6 +1379,15 @@ class AtomicPublish:
         ))
         self._backup_dir = self._transaction_dir / "previous"
         self._candidate_dir = self._transaction_dir / "candidate"
+        # Defensive cleanup of stale candidate subdir from a previous
+        # half-cleaned run. Vendor's prior run may have left
+        # transaction_dir/candidate behind after rmtree failed.
+        if self._candidate_dir.exists():
+            log.warning(
+                "AtomicPublish._prepare_transaction: cleaning stale %s",
+                self._candidate_dir,
+            )
+            shutil.rmtree(self._candidate_dir, ignore_errors=True)
 
     @retry_on_permission_error()
     def _copy_to_candidate(self) -> None:
@@ -1403,7 +1413,7 @@ class AtomicPublish:
                 "AtomicPublish._copy_to_candidate: mkdir %s",
                 self._candidate_dir,
             )
-            self._candidate_dir.mkdir()
+            self._candidate_dir.mkdir(exist_ok=True)
         managed_svg = _managed_svg_paths(self.output_dir)
         relative_paths = {p.relative_to(self.output_dir) for p in managed_svg}
         relative_paths.update(
@@ -1457,23 +1467,47 @@ class AtomicPublish:
 
     def _cleanup(self) -> None:
         # Retry rmtree if PowerShell stdio handle retention blocks
-        # the first attempt (WinError 5 on Windows). Best-effort: 3
-        # attempts with 0.5 s backoff; final ignore_errors fallback.
+        # the first attempt (WinError 5 on Windows). We also try a
+        # second pass that retries each individual onerror callback
+        # so a single locked file doesn't abort the whole rmtree.
+        # Best-effort: 3 attempts × 0.5 s backoff + 1 onerror-retry pass.
+        def _rmtree_once(path: Path) -> None:
+            shutil.rmtree(path, ignore_errors=False, onerror=_force_remove)
+
+        def _force_remove(func, path, excinfo):
+            """onerror callback: chmod + retry. If still fails, ignore
+            so rmtree can continue with siblings.
+            """
+            try:
+                os.chmod(path, 0o777)
+                func(path)
+            except OSError:
+                pass
+
         last_exc: OSError | None = None
-        for _ in range(3):
+        for attempt in range(3):
             try:
                 shutil.rmtree(self._transaction_dir, ignore_errors=False)
                 return
             except OSError as exc:
                 last_exc = exc
                 time.sleep(0.5)
-        if last_exc is not None:
+
+        # Final attempt: aggressive rmtree with onerror handler that
+        # tries chmod + retry per file. This handles the common case
+        # where a single file in the candidate is still locked but the
+        # rest of the tree can be cleaned up. Stale tree fragments
+        # (a single locked file) are still removed via the ignore_errors
+        # fallback if chmod + retry fails.
+        try:
+            _rmtree_once(self._transaction_dir)
+        except OSError as exc:
             log.warning(
-                "AtomicPublish._cleanup: rmtree %s failed after 3 retries: %s; "
-                "falling back to ignore_errors=True",
-                self._transaction_dir, last_exc,
+                "AtomicPublish._cleanup: rmtree %s failed after 3 retries + "
+                "force_remove: %s; falling back to ignore_errors=True",
+                self._transaction_dir, exc,
             )
-        shutil.rmtree(self._transaction_dir, ignore_errors=True)
+            shutil.rmtree(self._transaction_dir, ignore_errors=True)
 
 
 def publish_staged_workspace(
