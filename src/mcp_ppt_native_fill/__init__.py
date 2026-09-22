@@ -17,8 +17,7 @@ from .autofix import (
     repair_nested_picture_attrs,
 )
 from .pipeline import (
-    run_with_mapping,
-    run_native_fill,
+    run_with_pipeline,
 )
 from .entry import (
     DEFAULT_TOC_GRID,
@@ -45,7 +44,7 @@ __all__ = [
     # autofix public surface
     "fix_nested_picture_data_attrs", "repair_nested_picture_attrs",
     # pipeline public surface
-    "expand_workspace_from_markdown", "run_with_mapping", "run_native_fill",
+    "expand_workspace_from_markdown", "run_with_pipeline",
     # entry public surface (PR-11 one-shot wrapper)
     "generate_pptx", "DEFAULT_TOC_GRID",
     # render_diff public surface (PR-13 cairosvg previews)

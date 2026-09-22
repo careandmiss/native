@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 
 from mcp_ppt_native_fill import autofix
-from mcp_ppt_native_fill.pipeline import _legacy
+from mcp_ppt_native_fill.pipeline import _internal
 
 from ..context import PipelineContext, PipelineHandler
 
@@ -39,7 +39,7 @@ class Phase3AuthorHandler(PipelineHandler):
         page_plan_pages = ctx.get("page_plan")
         new_content_blocks = ctx.get("new_blocks")
         content_mapping = ctx.get("content_mapping") or {}
-        _legacy.phase3_author(
+        _internal.phase3_author(
             ctx.state,
             page_plan_pages=page_plan_pages,
             content_mapping=content_mapping,

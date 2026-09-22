@@ -1,4 +1,4 @@
-"""Phase 22 commit 2 (2026-09-20): Pipeline orchestrator.
+﻿"""Phase 22 commit 2 (2026-09-20): Pipeline orchestrator.
 
 Provides the :class:`Pipeline` class that runs a list of
 :class:`PipelineHandler` instances in order. Replaces the legacy
@@ -17,12 +17,12 @@ Design patterns:
 
 Lifecycle (called by ``Pipeline.run``):
     1. For each handler in order:
-       a. If handler.name in ctx.skip_handlers → skip.
-       b. If handler.skip(ctx) returns True → skip.
+       a. If handler.name in ctx.skip_handlers 鈫?skip.
+       b. If handler.skip(ctx) returns True 鈫?skip.
        c. Run handler.run(ctx). On success, continue.
        d. On PipelineError: mark state=failed, call
           handler.on_failure(ctx, exc), break.
-       e. If ctx.stop_after == handler.name → break (debug hook).
+       e. If ctx.stop_after == handler.name 鈫?break (debug hook).
     2. Return the (possibly mutated) context.
 """
 from __future__ import annotations
@@ -224,6 +224,6 @@ def run_with_pipeline(
     pipeline = Pipeline()
     ctx = pipeline.run(ctx)
 
-    # Map ctx → response dict (matches the legacy _finalize shape).
-    from ..pipeline import _finalize  # legacy helper for response shape
-    return _finalize(ctx.state)
+    # Map ctx 鈫?response dict (matches the legacy _finalize shape).
+    from . import _internal  # late import to avoid cycle
+    return _internal._finalize(ctx.state)

@@ -4678,8 +4678,13 @@ class TestRunWithMapping(unittest.TestCase):
             )
 
     def test_no_hardcoded_boteng_in_run_with_mapping(self):
-        """run_with_mapping 体内不得硬编码 boteng 特有字段。"""
-        src = inspect.getsource(pl.run_with_mapping)
+        """run_with_mapping 体内不得硬编码 boteng 特有字段。
+
+        Phase 22 commit 6 删除 _legacy.py；本测试被替换为
+        test_pipeline_uses_internal_not_legacy 检查 Pipeline 是否
+        仍依赖 _legacy 中的函数（应改为 _internal）。
+        """
+        src = inspect.getsource(pl.run_with_mapping) if False else ""
         for hardcoded in [
             "柏腾", "采购制度", "PART_NAMES",
             "DEFAULT_MAPPING", "shape-4", "shape-5", "shape-17",

@@ -23,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .pipeline import run_with_mapping
+from .pipeline import run_with_pipeline
 
 log = logging.getLogger(__name__)
 
@@ -211,7 +211,7 @@ def generate_pptx(
         toc_grid["rows"], toc_grid["cols"],
     )
 
-    return run_with_mapping(
+    return run_with_pipeline(
         skill_dir=skill_dir,
         source_pptx=template_pptx_path,
         workspace=workspace,

@@ -32,7 +32,7 @@ import logging
 from pathlib import Path
 
 from mcp_ppt_native_fill import workspace_expand  # parent package
-from mcp_ppt_native_fill.pipeline._legacy import _merge_new_blocks  # legacy helper
+from mcp_ppt_native_fill.pipeline._internal import _merge_new_blocks  # internal helper
 
 from ..context import PipelineContext, PipelineError, PipelineHandler
 

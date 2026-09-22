@@ -237,10 +237,19 @@ def _run(
     )
     start = time.time()
     try:
+        # Phase 22 vendor publish lock fix: stdin=DEVNULL breaks the
+        # PowerShell → child stdin handle chain so the parent doesn't
+        # hold the source.pptx handle during vendor's publish-staged
+        # copytree (which races the Windows OS handle-release latency on
+        # large templates like template_v2.pptx). The vendor scripts
+        # never read stdin (verified by source inspection), so this is
+        # a safe no-op for them. See
+        # docs/PHASE22_VENDOR_INTERNAL_PUBLISH_LOCK_PLAN_2026-09-20.md.
         proc = subprocess.run(
             full_args,
             cwd=str(scripts_dir),
             env=env,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",

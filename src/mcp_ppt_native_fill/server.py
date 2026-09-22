@@ -591,10 +591,10 @@ def _execute_native_fill(arguments: dict) -> dict:
                 if w not in existing:
                     existing.append(w)
             response["warnings"] = existing
-        log.info("server: delegating to pipeline.run_with_mapping enable_llm_planner=%s", enable_llm_planner)
+        log.info("server: delegating to pipeline.run_with_pipeline enable_llm_planner=%s", enable_llm_planner)
         return response
 
-    response = pipeline.run_native_fill(
+    response = pipeline.run_with_pipeline(
         source_pptx=source_pptx,
         workspace=workspace,
         output_pptx=output_pptx,
