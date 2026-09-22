@@ -138,20 +138,28 @@ def _slide_text_blob(slide) -> str:
     return " ".join(parts).upper()
 
 
-def _classify_slide(slide) -> SlideKind:
+def _classify_slide(slide, slide_idx: int | None = None,
+                    n_slides: int | None = None) -> SlideKind:
     """Classify one slide into cover/toc/divider/content/ending.
-    
+
     Heuristic priority (first match wins):
       1. TOC: contains "CONTENTS" / "目录" keyword OR has 4+ small
          card-shape rectangles arranged in a grid.
       2. Ending: contains "THANK YOU" / "感谢" keyword AND few texts.
       3. Content: has a big body rectangle (≥ 7×4 inches below top).
       4. Divider: 2-4 large text shapes, no big body rect.
-      5. Cover: default for slide 1.
+      5. Position-based fallback (Phase 23+ commit 5): if no rule
+         applies (text_count=0 — graphic-only template like
+         template_v2), infer from slide position in the deck:
+           slide 1         -> cover
+           slide 2         -> toc
+           middle slides   -> divider
+           last 1-2 slides -> ending
+      6. Cover: default.
     """
     blob = _slide_text_blob(slide)
     text_count = sum(1 for sh in slide.shapes if _shape_texts(sh))
-    
+
     # Rule 1: TOC.
     if any(kw.upper() in blob for kw in _TOC_KEYWORDS):
         return "toc"
@@ -163,8 +171,14 @@ def _classify_slide(slide) -> SlideKind:
     if len(small_rects) >= 4:
         return "toc"
     
-    # Rule 2: Ending.
+    # Rule 2: Ending. Text keyword (THANK YOU / 感谢) OR last slide of
+    # the deck (closing slide position heuristic for templates that
+    # don't follow the conventional "thank you" closing text).
+    is_last_slide = slide_idx is not None and n_slides is not None \
+        and slide_idx == n_slides
     if any(kw.upper() in blob for kw in _ENDING_KEYWORDS) and text_count <= 3:
+        return "ending"
+    if is_last_slide and text_count <= 3:
         return "ending"
     
     # Rule 3: Content (has big body rect).
@@ -180,7 +194,31 @@ def _classify_slide(slide) -> SlideKind:
     # Rule 4: Divider (few text shapes, no big body).
     if 2 <= text_count <= 4:
         return "divider"
-    
+
+    # Rule 5: Position-based fallback for graphic-only templates
+    # (text_count == 0, all rules above failed). Phase 23+ commit 5:
+    # template_v2.pptx has decorative slides (slides 3/4/5) with only
+    # picture/shape geometry and no text shapes — the previous
+    # fallback "cover" was wrong because all 5 slides then looked
+    # like cover. Use the slide's position in the deck as a
+    # structural hint:
+    #   n_slides == 5 → slide 3=divider, 4=content, 5=ending
+    #   n_slides >= 4 → last slide = ending, middle = divider
+    if text_count == 0 and slide_idx is not None and n_slides is not None:
+        if slide_idx == 1:
+            return "cover"
+        if slide_idx == 2 and n_slides >= 3:
+            return "toc"
+        if slide_idx == n_slides:
+            return "ending"
+        # 5-slide templates: middle two are divider + content.
+        if n_slides == 5:
+            return "divider" if slide_idx == 3 else "content"
+        # Larger templates: middle slides alternate divider/content,
+        # but we can't disambiguate without more signal — default to
+        # divider (the most common middle ground-page role).
+        return "divider"
+
     return "cover"
 
 
@@ -352,9 +390,10 @@ def inspect_template(pptx_path: Path) -> TemplateProfile:
     """
     p = Presentation(str(pptx_path))
     profile = TemplateProfile(template_hash=_template_hash(pptx_path))
-    
+    n_slides = len(p.slides)
+
     for i, slide in enumerate(p.slides, 1):
-        kind = _classify_slide(slide)
+        kind = _classify_slide(slide, slide_idx=i, n_slides=n_slides)
         profile.text_slots[i] = _find_text_slots(slide, i)
         if kind == "cover" and profile.divider_skeleton is None and profile.content_skeleton is None:
             profile.cover_slide = i
