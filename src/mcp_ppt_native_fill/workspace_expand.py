@@ -49,6 +49,8 @@ def _apply_vision_layouts(
     nn: int,
     title: str,
     title_en: str = "",
+    body: str = "",
+    doc_titles: list[str] | None = None,
 ) -> None:
     """Apply one or more vision-inferred placeholder layouts to ``svg_path``.
 
@@ -58,28 +60,30 @@ def _apply_vision_layouts(
       role, text (template string with ``{title}`` / ``{nn}`` placeholders
       substituted from caller kwargs), x, y, w, h, font_size, font_weight.
 
-    The ``{title}`` / ``{nn}`` / ``{title_en}`` substitutions use the
-    current section's H1 title and the loop index — not the LLM's
+    The ``{title}`` / ``{nn}`` / ``{title_en}`` / ``{body}`` substitutions
+    use the current section's H1 title and loop index — not the LLM's
     confidence-derived template. This keeps the role / position
     inference separate from the runtime text content.
+
+    For TOC cards (Phase 26 commit 3), the LLM may emit placeholders
+    like ``{section_NN_title}`` where NN is the 1-based card index.
+    We resolve those against ``doc_titles`` (1-based).
     """
     if not layouts:
         return
     from . import svg_edits
     fmt_vars = {
-        "title": title, "nn": nn, "title_en": title_en,
-        # Common vision-inferred placeholders the LLM may emit. We map
-        # these to the section title or empty string so ``str.format``
-        # never raises KeyError — even if the LLM emits a template
-        # token we don't have a value for.
-        "doc_title": title,
-        "doc_subtitle": "",
-        "body": "",
-        "section_NN_title": title,
-        "section_NN": title,
-        "section_NN_en": title_en,
-        "closing": "",
+        "title": title, "nn": nn, "title_en": title_en, "body": body,
+        "doc_title": title, "doc_subtitle": "",
+        "section_NN_title": title, "section_NN": title,
+        "section_NN_en": title_en, "closing": "",
     }
+    # Pre-resolve {section_NN_title} via doc_titles so the SafeDict
+    # __missing__ doesn't kick in for those (which would leave them
+    # literally as "{section_3_title}" instead of the H1 text).
+    if doc_titles:
+        for idx, t in enumerate(doc_titles, start=1):
+            fmt_vars[f"section_{idx}_title"] = t
     # Track shape_ids emitted in this SVG so the LLM's occasionally
     # duplicated role names don't collide. We suffix with a per-call
     # counter so the final id is always unique within a single SVG.
@@ -400,6 +404,7 @@ def expand_workspace_from_markdown(
                     nn=nn,
                     title=title,
                     title_en=title_en,
+                    body=section_body,
                 )
             cloned.append(div_svg_name)
         else:
@@ -450,6 +455,7 @@ def expand_workspace_from_markdown(
                     nn=nn,
                     title=title,
                     title_en=title_en,
+                    body=section_body,
                 )
             # Embed auto-generated cards block
             stem = f"part{nn}"
@@ -904,6 +910,39 @@ def expand_workspace_from_markdown(
         auth, exclude=exclude_filenames,
     )
     pages = original_roster + additions_dicts
+    # Phase 26 commit 3 (cover / TOC vision injection). The cover slide
+    # (``slide_01.svg``) and TOC slide (``slide_02.svg``) are not cloned
+    # per-section — they're pre-existing template slides. Vision may
+    # still want to inject placeholder text on them (e.g. ``{doc_title}``
+    # on cover, ``{section_NN_title}`` on each TOC card). We apply the
+    # caller-supplied cover_layouts / toc_layouts right before writing
+    # the page plan.
+    doc_title = ""
+    if sections:
+        # Use the doc's first H1 or fall back to the filename stem.
+        doc_title = str(sections[0].get("title") or md_path.stem)
+    if cover_layouts:
+        _apply_vision_layouts(
+            auth / "slide_01.svg", cover_layouts,
+            nn=1, title=doc_title, title_en="", body="",
+        )
+    if toc_layouts:
+        # Each entry's role is "section_card" / "section_NN_title" — we
+        # substitute the title of the matching H1 (1-based) by mapping
+        # the section index encoded in the role / placeholder name.
+        for entry in toc_layouts:
+            entry.setdefault("_doc_titles", [
+                str(s.get("title") or "") for s in sections
+            ])
+        # Caller-format substitution: ``{section_NN_title}`` becomes
+        # sections[NN-1]['title']. We extend fmt_vars here.
+        _apply_vision_layouts(
+            auth / "slide_02.svg", toc_layouts,
+            nn=2, title=doc_title, title_en="", body="",
+            doc_titles=[
+                str(s.get("title") or "") for s in sections
+            ],
+        )
     if ending_svg:
         idx = next(
             (i for i, p in enumerate(pages)

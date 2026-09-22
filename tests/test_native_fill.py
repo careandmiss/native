@@ -7985,5 +7985,93 @@ class TestAtomicPublish(unittest.TestCase):
             raises_value_error()
 
 
+class TestSvgEditsVendorCompliance(unittest.TestCase):
+    """Phase 26 commit 2 (2026-09-22): guard against regression on the
+    vendor text-attribute whitelist.
+
+    Reference: ppt-master's
+    ``scripts/svg_to_pptx/drawingml/text_properties.py``:
+
+      _TEXT_DIRECT_ATTRIBUTES  = attributes ppt-master accepts on <text>
+                                  (font-weight, font-style, text-anchor,
+                                   letter-spacing, text-decoration, x, y,
+                                   fill, stroke, ...).
+      _UNSUPPORTED_TEXT_PROPERTIES  = attributes that trigger preflight
+                                        ``SvgNativeConversionError``:
+                                        alignment-baseline, direction,
+                                        dominant-baseline, font-kerning,
+                                        font-feature-settings,
+                                        font-size-adjust, font-stretch,
+                                        font-synthesis, font-variant,
+                                        font-variation-settings, font,
+                                        hyphens.
+
+    The Phase 25 fix dropped ``dominant-baseline`` from
+    ``add_text_block``. These tests prevent that (or similar) from
+    slipping back in.
+    """
+
+    FORBIDDEN_TEXT_ATTRS = frozenset({
+        "alignment-baseline", "direction", "dominant-baseline",
+        "font-kerning", "font-feature-settings", "font-size-adjust",
+        "font-stretch", "font-synthesis", "font-variant",
+        "font-variation-settings", "font", "hyphens",
+    })
+
+    def _build_minimal_svg(self, tmp_path) -> Path:
+        svg = tmp_path / "slide.svg"
+        svg.write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg">'
+            '<rect x="0" y="0" width="100" height="100"/></svg>'
+        )
+        return svg
+
+    def test_add_text_block_no_forbidden_text_attrs(self):
+        """add_text_block must not inject any text attribute in
+        _UNSUPPORTED_TEXT_PROPERTIES — those trigger SvgNativeConversionError
+        in vendor svg_to_pptx.
+        """
+        import re, tempfile
+        from mcp_ppt_native_fill.svg_edits import add_text_block
+        with tempfile.TemporaryDirectory() as td:
+            svg = self._build_minimal_svg(Path(td))
+            add_text_block(
+                svg, shape_id="t1", x=10, y=10, w=80, h=20,
+                text="hi", font_size=18,
+            )
+            raw = svg.read_text(encoding="utf-8")
+        # Extract every attribute name from every <text> tag.
+        attr_names: set[str] = set()
+        for tag in re.findall(r"<text\s+([^/>]+?)(?:/?>)", raw):
+            for m in re.findall(r"(\w[\w-]*)\s*=", tag):
+                attr_names.add(m)
+        forbidden_found = attr_names & self.FORBIDDEN_TEXT_ATTRS
+        self.assertEqual(
+            forbidden_found, set(),
+            f"forbidden attrs in injected <text>: {forbidden_found}",
+        )
+
+    def test_add_text_block_baseline_offset_centers_vertically(self):
+        """baseline_y = y + h/2 + font_size*0.35 — confirm the math
+        so vision-injected text is visually centered in bounds.
+        """
+        from mcp_ppt_native_fill.svg_edits import add_text_block
+        import tempfile, re
+        with tempfile.TemporaryDirectory() as td:
+            svg = self._build_minimal_svg(Path(td))
+            add_text_block(
+                svg, shape_id="t1",
+                x=10, y=20, w=80, h=40, text="hi", font_size=24,
+            )
+            raw = svg.read_text(encoding="utf-8")
+        m = re.search(r'<text\s+x="([\d.]+)"\s+y="([\d.]+)"', raw)
+        self.assertIsNotNone(m)
+        x, y = float(m.group(1)), float(m.group(2))
+        # cx = 10 + 80/2 = 50.0; cy = 20 + 40/2 = 40.0;
+        # baseline_y = cy + font_size * 0.35 = 40 + 8.4 = 48.4
+        self.assertAlmostEqual(x, 50.0)
+        self.assertAlmostEqual(y, 48.4)
+
+
 if __name__ == "__main__":
     unittest.main()
