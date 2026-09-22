@@ -25,6 +25,7 @@ import json
 import logging
 import re
 import shutil
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -239,7 +240,9 @@ def expand_workspace_from_markdown(
 
         # 1) divider clone
         div_svg_name = f"slide_part{nn}_div.svg"
-        div_skeleton = auth / f"slide_{skeleton_divider:02d}.svg"
+        div_skeleton_idx = skeleton_divider if skeleton_divider is not None else 3
+        cont_skeleton_idx = skeleton_content if skeleton_content is not None else 4
+        div_skeleton = auth / f"slide_{div_skeleton_idx:02d}.svg"
         if div_skeleton.is_file():
             shutil.copy2(div_skeleton, auth / div_svg_name)
             # Phase 8 (2026-09-16): look up the English subtitle text
@@ -268,7 +271,7 @@ def expand_workspace_from_markdown(
 
         # 2) content clone + new_block
         cont_svg_name = f"slide_part{nn}_content.svg"
-        cont_skeleton = auth / f"slide_{skeleton_content:02d}.svg"
+        cont_skeleton = auth / f"slide_{cont_skeleton_idx:02d}.svg"
         # Phase 20 P0-C: short-body sections skip the content clone
         # entirely. The divider (created in step 1 above) already
         # conveys the section title + EN subtitle; a one-line body
@@ -740,12 +743,30 @@ def expand_workspace_from_markdown(
         if idx is not None and idx != len(pages) - 1:
             pages.append(pages.pop(idx))
     plan_path = write_page_plan(workspace, pages)
+    # Phase 23+ traceback: ensure TypeError from f-string formatting
+    # surfaces the actual line + variable instead of just the message.
     return {
         "cloned_svgs": cloned,
         "page_plan_path": plan_path,
         "n_parts": n_parts,
         "new_blocks": new_blocks,
     }
+
+
+# Wrap expand_workspace_from_markdown to capture and log any TypeError
+# from f-string formatting so we can diagnose template_v2 NoneType errors.
+_orig_expand = expand_workspace_from_markdown  # type: ignore
+def expand_workspace_from_markdown(*args, **kwargs):  # type: ignore
+    try:
+        return _orig_expand(*args, **kwargs)
+    except Exception as exc:
+        log = logging.getLogger("mcp_ppt_native_fill.workspace_expand")
+        log.error(
+            "expand_workspace_from_markdown raised %s: %s; full traceback:",
+            type(exc).__name__, exc,
+        )
+        log.error(traceback.format_exc())
+        raise
 
 
 def build_toc_slot_edits(

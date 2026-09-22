@@ -177,7 +177,7 @@ class MarkdownExpandHandler(PipelineHandler):
                     )
                 if (
                     opts.get("expand_ending_svg") is None
-                    and profile.ending_slide
+                    and profile.ending_slide is not None
                 ):
                     opts["expand_ending_svg"] = (
                         f"slide_{profile.ending_slide:02d}.svg"
