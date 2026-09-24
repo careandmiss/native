@@ -286,12 +286,47 @@ class MarkdownExpandHandler(PipelineHandler):
                 from mcp_ppt_native_fill.vision_layout import (
                     infer_template_layout,
                 )
+                # Phase 27 commit 1: use inspect_template's rule-based
+                # slide classification as the authoritative kind map.
+                # The LLM frequently misclassifies content slides as
+                # toc / divider (vision alone sees similar visual
+                # layouts); inspect_template is structural and knows
+                # which slide_index is cover / toc / divider / content
+                # / ending. We rebuild that map here and pass it into
+                # vision_layout so its parsed SlideLayout.kind field
+                # reflects the rule-based truth rather than the LLM's
+                # hallucinated kind.
+                template_kind_map: dict[int, str] = {}
+                try:
+                    inspect_profile = template_adapter.inspect_template(
+                        template_adapter.ensure_ascii_path(ctx.source_pptx),
+                    )
+                    if inspect_profile.cover_slide is not None:
+                        template_kind_map[inspect_profile.cover_slide] = "cover"
+                    if inspect_profile.toc_slide is not None:
+                        template_kind_map[inspect_profile.toc_slide] = "toc"
+                    if inspect_profile.divider_skeleton is not None:
+                        template_kind_map[
+                            inspect_profile.divider_skeleton
+                        ] = "divider"
+                    if inspect_profile.content_skeleton is not None:
+                        template_kind_map[
+                            inspect_profile.content_skeleton
+                        ] = "content"
+                    if inspect_profile.ending_slide is not None:
+                        template_kind_map[inspect_profile.ending_slide] = "ending"
+                except Exception:  # noqa: BLE001
+                    # If inspect_template fails we still let vision_layout
+                    # run with its LLM-derived kind — best-effort.
+                    template_kind_map = None
+
                 profile_layout = infer_template_layout(
                     ctx.source_pptx,
                     cache_dir=Path(
                         opts.get("vision_layout_cache_dir")
                         or (Path.home() / ".mcp_ppt_native_fill" / "vision_cache")
                     ),
+                    template_kind_map=template_kind_map,
                     min_confidence=float(
                         opts.get("vision_layout_min_confidence", 0.5)
                     ),

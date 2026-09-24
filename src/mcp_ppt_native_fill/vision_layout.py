@@ -178,7 +178,20 @@ def _cache_path(pptx_path: Path, cache_dir: Path) -> Path:
     return cache_dir / f"{digest}-{CACHE_VERSION}.json"
 
 
-def _load_cached(pptx_path: Path, cache_dir: Path) -> TemplateLayoutProfile | None:
+def _load_cached(
+    pptx_path: Path,
+    cache_dir: Path,
+    template_kind_map: dict[int, str] | None = None,
+) -> TemplateLayoutProfile | None:
+    """Load and return a cached ``TemplateLayoutProfile``.
+
+    ``template_kind_map`` (Phase 27 commit 1) is applied at load time
+    so cached results that were originally produced with a hallucinated
+    LLM kind (e.g. ``slide_04`` classified as ``toc``) get re-routed to
+    the rule-based truth on every cache hit. Without this override, a
+    stale cache would keep feeding the wrong SVG even after the pipeline
+    is fixed.
+    """
     p = _cache_path(pptx_path, cache_dir)
     if not p.is_file():
         return None
@@ -187,10 +200,20 @@ def _load_cached(pptx_path: Path, cache_dir: Path) -> TemplateLayoutProfile | No
     except (json.JSONDecodeError, OSError):
         return None
     try:
-        return _deserialize(data)
+        profile = _deserialize(data)
     except (KeyError, TypeError, ValueError) as exc:
         log.warning("vision_layout cache invalid (%s): %s", p, exc)
         return None
+    # Re-apply the rule-based kind map so cached slide kinds always
+    # reflect the rule-based truth, not the LLM's hallucinated kind.
+    if template_kind_map and profile.slides:
+        from dataclasses import replace as _replace
+        new_slides = tuple(
+            _replace(s, kind=template_kind_map.get(s.slide_index, s.kind))
+            for s in profile.slides
+        )
+        profile = _replace(profile, slides=new_slides)
+    return profile
 
 
 def _save_cached(profile: TemplateLayoutProfile, cache_dir: Path) -> Path:
@@ -331,12 +354,21 @@ def _parse_response(
     expected_canvas_width: int,
     expected_canvas_height: int,
     min_confidence: float = 0.5,
+    template_kind_map: dict[int, str] | None = None,
 ) -> TemplateLayoutProfile | None:
     """Parse + validate the LLM JSON dict into TemplateLayoutProfile.
 
     Drops placeholders with confidence < min_confidence and clamps
     out-of-canvas coordinates. Returns None if the response is malformed
     beyond recovery.
+
+    ``template_kind_map`` (Phase 27 commit 1): authoritative slide
+    classification from ``inspect_template`` (rule-based, doesn't
+    hallucinate). When provided, override the LLM's ``kind`` field
+    for each slide. The LLM frequently misclassifies content slides
+    as ``toc`` or vice versa because it's inferring from pixels; the
+    rule-based inspector knows the template's structural skeleton and
+    is the source of truth for routing vision-injected placeholders.
     """
     if not isinstance(raw, dict):
         return None
@@ -351,6 +383,12 @@ def _parse_response(
         if not isinstance(slide_raw, dict):
             continue
         idx = int(slide_raw.get("index") or 0)
+        # Override the LLM's kind with the rule-based classifier's
+        # truth when available. Otherwise keep the LLM's classification.
+        if template_kind_map and idx in template_kind_map:
+            kind = template_kind_map[idx]
+        else:
+            kind = str(slide_raw.get("kind", ""))
         kind = str(slide_raw.get("kind") or "")
         phs_raw = slide_raw.get("placeholders") or []
         phs: list[PlaceholderLayout] = []
@@ -486,6 +524,7 @@ def infer_template_layout(
     render_dir: Path | None = None,
     cleanup_render: bool = True,
     dry_run: bool = False,
+    template_kind_map: dict[int, str] | None = None,
 ) -> TemplateLayoutProfile | None:
     """End-to-end vision layout inference for one PPTX template.
 
@@ -520,7 +559,10 @@ def infer_template_layout(
     profile_template_hash = pptx_hash
 
     if enable_cache:
-        cached = _load_cached(pptx_path, cache_dir)
+        cached = _load_cached(
+            pptx_path, cache_dir,
+            template_kind_map=template_kind_map,
+        )
         if cached is not None:
             log.info(
                 "vision_layout cache hit for %s (hash=%s, model=%s)",
@@ -583,7 +625,10 @@ def infer_template_layout(
 
     # --- Parse + validate ---
     cw, ch = (png_results[0][2], png_results[0][3])
-    profile = _parse_response(raw, cw, ch, min_confidence=min_confidence)
+    profile = _parse_response(
+        raw, cw, ch, min_confidence=min_confidence,
+        template_kind_map=template_kind_map,
+    )
     if profile is None:
         log.warning("vision_layout: response could not be parsed; skipping")
         if cleanup_render and render_dir is not None:
